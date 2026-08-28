@@ -1,0 +1,11 @@
+name = "sagitta-memory"
+main = "worker.js"
+compatibility_date = "2026-08-28"
+
+# Replace the placeholders below with the D1 database created for your
+# environment. Do not commit real account/database identifiers if policy
+# requires them to remain private.
+[[d1_databases]]
+binding = "DB"
+database_name = "REPLACE_WITH_D1_DATABASE_NAME"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

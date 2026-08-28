@@ -1,0 +1,23 @@
+# Local dependencies and generated state
+node_modules/
+.wrangler/
+dist/
+
+# Credentials and local configuration (keep only .env.example)
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+
+# Memory exports and import resume maps contain sensitive data
+*.jsonl
+*.map.json
+memory-backup*
+
+# Local logs and OS/editor files
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
