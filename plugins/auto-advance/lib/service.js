@@ -1,0 +1,578 @@
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
+
+/**
+ * This is intentionally copied from the final prompt in
+ * auto-continue-module-design.md. Keep line breaks and punctuation intact:
+ * it is part of the model-facing protocol.
+ */
+const AUTONOMOUS_PROMPT = `当前用户处于离开模式，并且希望你自主推进任务。
+请确认是否已经没有任何可以自主推进的任务，即所有任务都卡在必须需要用户来行动，否则无法推进的状态上，并且这个行动无法亲自做出（如在网络上配置东西，或者做视觉验收等能力有限无法做的决定）的阻塞项。
+如果面临决策但是可以自主做出（比如技术选型、具体策略的设计），那么应当作出决策并继续推进；如果只是完成了一个小的任务，那么应当继续推进大项目的下一个任务；如果面临一些危险的操作，可以在确保绝对安全的情况下继续推进（要求随时可复原）；如果面临一些重大的技术分支，可以先记录下来-存档确保可以回档（后续开发不退化）-记录选型供之后讨论和复盘，之后继续开发。
+如果当前不存在 goal 或者 goal 的描述存在阻碍/不符合当前要求导致阻塞，可以编辑 goal 并恢复运行。
+如果未来存在异步调用需要等待回复，并且当前确实没有其他值得推进的事情，那么可以停止并等待被异步唤起。
+如果当前确实所有大任务都进入到阻塞状态，无法继续推进，或者需要等待异步唤起，那么请输出【停止自主推进】，并不要附加多余的解释，自主推进进程将会关闭。`;
+
+const STOP_MARKER = "【停止自主推进】";
+const PLUGIN_ID = "auto-advance";
+const STATUS_EVENT = "sagitta-auto-advance/status";
+const DEFAULT_IDLE_TIMEOUT_MS = 300000;
+const LEGACY_WORKSPACE_CANDIDATES = [
+  "D:\\workspace\\sagitta-experience",
+  join(homedir(), ".dsh"),
+  join(homedir(), ".sagitta", "workspace"),
+  join(homedir(), "sagitta-experience"),
+  join(homedir(), "workspace", "sagitta-experience")
+];
+const ACTIVE_JOB_STATUSES = new Set(["running", "stopping"]);
+
+const REMOTE_INITIALIZERS = [];
+for (const method of ["getState", "setMode", "getTasks"]) {
+  Remote(method)(undefined, {
+    kind: "method",
+    name: method,
+    static: false,
+    private: false,
+    addInitializer(initializer) {
+      REMOTE_INITIALIZERS.push(initializer);
+    }
+  });
+}
+
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function renderError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function nonEmptyString(value) {
+  if (typeof value !== "string") return undefined;
+  const result = value.trim();
+  return result.length > 0 ? result : undefined;
+}
+
+function isTaskFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function hasTasksFile(workspace) {
+  return isTaskFile(join(workspace, "TASKS.md"));
+}
+
+function resolveWorkspace() {
+  const configuredWorkspace = nonEmptyString(process.env.SAGITTA_WORKSPACE);
+  if (configuredWorkspace !== undefined && hasTasksFile(configuredWorkspace)) return resolve(configuredWorkspace);
+
+  const seen = new Set();
+  for (const candidate of LEGACY_WORKSPACE_CANDIDATES) {
+    const workspace = resolve(candidate);
+    if (seen.has(workspace)) continue;
+    seen.add(workspace);
+    if (hasTasksFile(workspace)) return workspace;
+  }
+  return resolve(process.cwd());
+}
+
+function resolveConfiguredPaths(config = {}) {
+  const workspace = resolveWorkspace();
+  const configuredStatePath = nonEmptyString(config.statePath);
+  const configuredTasksPath = nonEmptyString(config.tasksPath);
+  return {
+    statePath: configuredStatePath === undefined ? join(workspace, ".sagitta-auto-advance.json") : resolve(configuredStatePath),
+    tasksPath: configuredTasksPath === undefined ? join(workspace, "TASKS.md") : resolve(configuredTasksPath)
+  };
+}
+
+function normalizeConfig(config = {}) {
+  const idleTimeoutMs = Number(config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
+  const paths = resolveConfiguredPaths(config);
+  return {
+    idleTimeoutMs: Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0 ? idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
+    statePath: paths.statePath,
+    tasksPath: paths.tasksPath
+  };
+}
+
+function taskFileDiagnostics(path) {
+  try {
+    const stat = statSync(path);
+    return { exists: stat.isFile(), mtime: stat.isFile() ? new Date(stat.mtimeMs).toISOString() : null };
+  } catch {
+    return { exists: false, mtime: null };
+  }
+}
+
+function extractText(content) {
+  if (!Array.isArray(content)) return "";
+  return content.filter((block) => block?.type === "text" && typeof block.text === "string").map((block) => block.text).join("");
+}
+
+function isExactStopMessage(message) {
+  return message?.role === "assistant" && extractText(message.content).includes(STOP_MARKER);
+}
+
+function isAutoAdvanceMessage(message, state) {
+  return message?.id !== undefined && message.id === state.lastAutoMessageId;
+}
+
+/**
+ * The inbox half of goal-round-driver's readyToDrive predicate. It is kept
+ * exported so the smoke test can exercise the important queue guard without
+ * constructing a complete DSH runtime.
+ */
+function hasPendingInbox(agent) {
+  return (agent?.inbox?.nextStep?.length ?? 0) > 0 || (agent?.inbox?.nextTurn?.length ?? 0) > 0;
+}
+
+class AutoAdvanceService extends TypertRemoteService {
+  static inject = ["agents", "goals", "sessions"];
+
+  constructor(ctx, config = {}) {
+    super(ctx, "sagittaAutoAdvance");
+    for (const initializer of REMOTE_INITIALIZERS) initializer.call(this);
+
+    this.config = normalizeConfig(config);
+    const taskFile = taskFileDiagnostics(this.config.tasksPath);
+    this.logger()?.info?.(`sagitta-auto-advance: tasksPath=${this.config.tasksPath} exists=${taskFile.exists} mtime=${taskFile.mtime ?? "null"}`);
+    this.states = new Map();
+    this.listeners = new Set();
+    this.persistedModes = this.loadModes();
+
+    ctx.on("agent/created", ({ agent }) => {
+      const state = this.stateFor(agent);
+      this.maybeArm(state);
+    });
+    ctx.on("agent/disposed", ({ agent }) => {
+      const state = this.states.get(agent);
+      if (state === undefined) return;
+      state.disposed = true;
+      this.clearTimer(state);
+      this.states.delete(agent);
+      this.broadcast(state);
+    });
+    ctx.on("agent/session-start", ({ agent }) => {
+      const state = this.stateFor(agent);
+      state.enabled = this.persistedModes.get(agent.id) === true;
+      state.stoppedByProtocol = false;
+      state.lastAutoMessageId = undefined;
+      this.resetTimer(state, "session-start");
+    });
+    ctx.on("agent/status", ({ agent, status }) => {
+      const state = this.stateFor(agent);
+      this.touchOwners(agent, "child-status");
+      if (status === "idle") this.maybeArm(state);
+      else this.resetTimer(state, "agent-running");
+    });
+    ctx.on("agent/inbox/inserted", ({ agent, message }) => {
+      const state = this.stateFor(agent);
+      if (isAutoAdvanceMessage(message, state)) {
+        this.clearTimer(state);
+        state.idleSince = null;
+        this.broadcast(state);
+        return;
+      }
+      this.resetTimer(state, "inbox-message");
+      this.touchOwners(agent, "child-inbox-message");
+    });
+    ctx.on("agent/inbox/claimed", ({ agent }) => {
+      this.resetTimer(this.stateFor(agent), "inbox-claimed");
+    });
+    ctx.on("agent/inbox/discarded", ({ agent }) => {
+      this.resetTimer(this.stateFor(agent), "inbox-discarded");
+    });
+    ctx.on("goal/changed", ({ agent }) => {
+      this.resetTimer(this.stateFor(agent), "goal-changed");
+    });
+    ctx.on("session/event", (session, event) => {
+      const agent = ctx.agents.get(session.id);
+      if (agent === undefined || agent.session !== session) return;
+      const state = this.stateFor(agent);
+      if (event.type === "user/message") {
+        if (event.data?.id === state.lastAutoMessageId) {
+          state.lastAutoMessageId = undefined;
+          this.broadcast(state);
+        } else {
+          this.resetTimer(state, "user-message");
+        }
+        return;
+      }
+      if (event.type === "assistant/message" && isExactStopMessage(event.data?.message)) {
+        this.stopByProtocol(state);
+      }
+    });
+
+    ctx.inject(["jobs"], (jobCtx) => {
+      const jobs = jobCtx.jobs;
+      const disposeDone = jobs.onJobDone((_snapshot, owner) => {
+        this.touchJobOwner(owner, "job-done");
+      });
+      const disposeChanged = jobs.onJobsChanged((owner) => {
+        this.touchJobOwner(owner, "jobs-changed");
+      });
+      jobCtx.effect(() => () => {
+        disposeDone?.();
+        disposeChanged?.();
+      }, "sagitta-auto-advance: job listeners");
+    });
+
+    ctx.effect(() => () => {
+      for (const state of this.states.values()) this.clearTimer(state);
+      this.states.clear();
+      this.listeners.clear();
+    }, "sagitta-auto-advance: timers");
+
+    for (const agent of ctx.agents.list()) this.stateFor(agent);
+  }
+
+  /** Register a same-process listener; the web UI uses the typed RPC snapshot. */
+  onStatus(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  getState(agent) {
+    return this.snapshot(this.stateFor(agent));
+  }
+
+  setMode(agent, enabled) {
+    const state = this.stateFor(agent);
+    state.enabled = enabled === true;
+    state.stoppedByProtocol = false;
+    this.persistedModes.set(agent.id, state.enabled);
+    this.persistModes();
+    if (state.enabled) this.maybeArm(state);
+    else {
+      this.clearTimer(state);
+      state.idleSince = null;
+      this.broadcast(state);
+    }
+    return this.snapshot(state);
+  }
+
+  getTasks() {
+    return readTasks(this.config.tasksPath, this.logger());
+  }
+
+  stateFor(agent) {
+    let state = this.states.get(agent);
+    if (state !== undefined) return state;
+    state = {
+      agent,
+      enabled: this.persistedModes.get(agent.id) === true,
+      timer: undefined,
+      timerGeneration: 0,
+      idleSince: null,
+      injectedAt: null,
+      lastAutoMessageId: undefined,
+      stoppedByProtocol: false,
+      disposed: false
+    };
+    this.states.set(agent, state);
+    return state;
+  }
+
+  isLive(state) {
+    return !state.disposed && this.ctx.fiber.state === 2 && this.ctx.agents.get(state.agent.id) === state.agent;
+  }
+
+  hasRunningWork(agent) {
+    for (const candidate of this.ctx.agents.list()) {
+      if (candidate === agent) continue;
+      if (this.ctx.agents.isOwnedBy(candidate.id, agent) && candidate.status === "running") return true;
+    }
+
+    const jobs = this.ctx.get("jobs");
+    if (jobs === undefined || typeof jobs.list !== "function") return false;
+    const callers = [undefined, ...this.ctx.agents.list()];
+    try {
+      for (const caller of callers) {
+        for (const snapshot of jobs.list(caller)) {
+          if (ACTIVE_JOB_STATUSES.has(snapshot?.status)) return true;
+        }
+      }
+    } catch (error) {
+      this.logger()?.warn?.(`sagitta-auto-advance: job readiness check failed: ${renderError(error)}`);
+      return true;
+    }
+    return false;
+  }
+
+  hasPendingWork(agent) {
+    return hasPendingInbox(agent) || this.hasRunningWork(agent);
+  }
+
+  readyToDrive(state) {
+    return this.isLive(state) && state.enabled && !state.stoppedByProtocol && state.agent.status === "idle" && !this.hasPendingWork(state.agent);
+  }
+
+  clearTimer(state) {
+    if (state.timer !== undefined) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    }
+    state.timerGeneration += 1;
+  }
+
+  resetTimer(state, reason) {
+    this.clearTimer(state);
+    state.idleSince = null;
+    if (this.readyToDrive(state)) this.armTimer(state);
+    else this.broadcast(state, reason);
+  }
+
+  maybeArm(state) {
+    if (!this.readyToDrive(state)) {
+      this.clearTimer(state);
+      state.idleSince = null;
+      this.broadcast(state);
+      return;
+    }
+    if (state.timer !== undefined) return;
+    this.armTimer(state);
+  }
+
+  armTimer(state) {
+    if (!this.readyToDrive(state)) return;
+    const generation = ++state.timerGeneration;
+    state.idleSince = Date.now();
+    state.timer = setTimeout(() => this.onTimer(state, generation), this.config.idleTimeoutMs);
+    state.timer.unref?.();
+    this.broadcast(state);
+  }
+
+  onTimer(state, generation) {
+    if (state.timerGeneration !== generation) return;
+    state.timer = undefined;
+    if (!this.readyToDrive(state)) {
+      state.idleSince = null;
+      this.broadcast(state, "timer-not-ready");
+      return;
+    }
+
+    const message = createUserMessage({
+      content: [{ type: "text", text: AUTONOMOUS_PROMPT }],
+      source: {
+        kind: "plugin",
+        plugin: PLUGIN_ID,
+        form: "notice",
+        summary: "idle timeout autonomous continuation"
+      }
+    });
+    state.lastAutoMessageId = message.id;
+    state.injectedAt = Date.now();
+    state.idleSince = null;
+    try {
+      agentFollowup(state.agent, message);
+      this.broadcast(state, "injected");
+    } catch (error) {
+      state.lastAutoMessageId = undefined;
+      this.logger()?.warn?.(`sagitta-auto-advance: could not queue continuation for agent "${state.agent.id}": ${renderError(error)}`);
+      this.broadcast(state, "queue-failed");
+      this.maybeArm(state);
+    }
+  }
+
+  stopByProtocol(state) {
+    state.enabled = false;
+    state.stoppedByProtocol = true;
+    this.persistedModes.set(state.agent.id, false);
+    this.persistModes();
+    this.clearTimer(state);
+    state.idleSince = null;
+    this.broadcast(state, "stop-protocol");
+  }
+
+  touchOwners(agent, reason) {
+    for (const state of this.states.values()) {
+      if (state.agent === agent || this.ctx.agents.isOwnedBy(agent.id, state.agent)) this.resetTimer(state, reason);
+    }
+  }
+
+  touchJobOwner(owner, reason) {
+    for (const state of this.states.values()) {
+      if (owner === undefined || owner === state.agent || this.ctx.agents.isOwnedBy(owner.id, state.agent)) this.resetTimer(state, reason);
+    }
+  }
+
+  snapshot(state) {
+    return {
+      enabled: state.enabled,
+      mode: state.enabled ? "auto" : "chat",
+      idleSince: state.idleSince,
+      injectedAt: state.injectedAt,
+      ready: this.readyToDrive(state),
+      hasPendingWork: this.hasPendingWork(state.agent),
+      stoppedByProtocol: state.stoppedByProtocol
+    };
+  }
+
+  broadcast(state, reason) {
+    const snapshot = this.snapshot(state);
+    for (const listener of [...this.listeners]) {
+      try {
+        listener({ agent: state.agent, state: snapshot, reason });
+      } catch (error) {
+        this.logger()?.warn?.(`sagitta-auto-advance: status listener failed: ${renderError(error)}`);
+      }
+    }
+    try {
+      this.ctx.emit?.(STATUS_EVENT, { agent: state.agent.id, state: snapshot, reason });
+    } catch (error) {
+      this.logger()?.debug?.(`sagitta-auto-advance: status event unavailable: ${renderError(error)}`);
+    }
+  }
+
+  logger() {
+    return this.ctx.logger;
+  }
+
+  loadModes() {
+    if (!existsSync(this.config.statePath)) return new Map();
+    try {
+      const raw = JSON.parse(readFileSync(this.config.statePath, "utf8"));
+      const modes = new Map();
+      if (!isRecord(raw?.sessions)) return modes;
+      for (const [id, enabled] of Object.entries(raw.sessions)) if (typeof id === "string" && typeof enabled === "boolean") modes.set(id, enabled);
+      return modes;
+    } catch (error) {
+      this.logger()?.warn?.(`sagitta-auto-advance: state file ignored: ${renderError(error)}`);
+      return new Map();
+    }
+  }
+
+  persistModes() {
+    try {
+      const parent = dirname(this.config.statePath);
+      if (parent && parent !== ".") mkdirSync(parent, { recursive: true });
+      writeFileSync(this.config.statePath, `${JSON.stringify({ version: 1, sessions: Object.fromEntries(this.persistedModes) }, null, 2)}\n`, "utf8");
+    } catch (error) {
+      this.logger()?.warn?.(`sagitta-auto-advance: mode persistence failed: ${renderError(error)}`);
+    }
+  }
+}
+
+function agentFollowup(agent, message) {
+  agent.followup(message);
+}
+
+function readTasks(path, logger) {
+  try {
+    const stat = readFileSync(path, { encoding: "utf8" });
+    const sections = [];
+    const pendingRequests = [];
+    let current = { title: "TASKS", items: [] };
+    let tableColumns;
+    let reportInboxLevel;
+    let collectPendingRequests = false;
+    let pendingRequestDraft;
+    const flushPendingRequest = () => {
+      if (pendingRequestDraft === undefined) return;
+      pendingRequests.push(parsePendingRequest(pendingRequestDraft.text, pendingRequestDraft.body, pendingRequestDraft.hasCheckbox));
+      pendingRequestDraft = undefined;
+    };
+    sections.push(current);
+    for (const line of stat.split(/\r?\n/u)) {
+      const heading = /^(#{1,6})\s+(.+?)\s*$/u.exec(line);
+      if (heading !== null) {
+        flushPendingRequest();
+        const level = heading[1].length;
+        const title = heading[2];
+        const isReportHeading = isReportInboxHeading(title);
+        const isPendingHeading = reportInboxLevel !== undefined && level > reportInboxLevel && isPendingRequestsHeading(title);
+        if (isReportHeading) reportInboxLevel = level;
+        else if (reportInboxLevel !== undefined && level <= reportInboxLevel) reportInboxLevel = undefined;
+        collectPendingRequests = isPendingHeading;
+        current = { title, items: [] };
+        tableColumns = undefined;
+        sections.push(current);
+        continue;
+      }
+      const task = /^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$/u.exec(line);
+      if (task !== null) {
+        flushPendingRequest();
+        current.items.push({ text: task[2], done: task[1].toLowerCase() === "x" });
+        if (collectPendingRequests && task[1] === " ") {
+          pendingRequestDraft = { text: task[2], body: [], hasCheckbox: true };
+        }
+        continue;
+      }
+      if (collectPendingRequests && pendingRequestDraft !== undefined && /^\s{2,}\S/u.test(line)) {
+        pendingRequestDraft.body.push(line.trim());
+        continue;
+      }
+      const cells = parseTableRow(line);
+      if (cells === undefined) continue;
+      if (cells.every((cell) => /^:?-{3,}:?$/u.test(cell))) continue;
+      if (tableColumns === undefined && cells.some((cell) => cell.includes("任务"))) {
+        tableColumns = {
+          task: cells.findIndex((cell) => cell.includes("任务")),
+          status: cells.findIndex((cell) => cell.includes("状态"))
+        };
+        continue;
+      }
+      if (tableColumns === undefined || tableColumns.task < 0 || cells[tableColumns.task] === undefined) continue;
+      const text = cleanMarkdown(cells[tableColumns.task]);
+      if (text.length === 0 || text === "任务") continue;
+      const status = tableColumns.status >= 0 ? cleanMarkdown(cells[tableColumns.status] ?? "") : "";
+      current.items.push({ text: status.length > 0 ? `${text}（${status}）` : text, done: /✅|完成/u.test(status) });
+    }
+    flushPendingRequest();
+    return { path, updatedAt: statMtime(path), sections: sections.filter((section) => section.items.length > 0), pendingRequests };
+  } catch (error) {
+    logger?.warn?.(`sagitta-auto-advance: cannot read task file: ${renderError(error)}`);
+    return { path, updatedAt: null, sections: [], pendingRequests: [], error: "TASKS.md 暂时不可读" };
+  }
+}
+
+function isReportInboxHeading(title) {
+  return /(?:§\s*2\b|汇报箱)/iu.test(title);
+}
+
+function isPendingRequestsHeading(title) {
+  return /需\s*涟漪\s*确认\s*[\/／]\s*行动/iu.test(title);
+}
+
+function parsePendingRequest(text, bodyLines, hasCheckbox) {
+  const firstLine = text.trim();
+  const titleMatch = /^\*\*(.+?)\*\*/u.exec(firstLine);
+  const title = cleanMarkdown(titleMatch?.[1] ?? firstLine) || "未命名需求";
+  const inlineBody = titleMatch === null ? "" : cleanMarkdown(firstLine.slice(titleMatch[0].length));
+  const body = [inlineBody, ...bodyLines.map(cleanMarkdown)].filter((value) => value.length > 0).join(" ");
+  return { title, hasCheckbox: hasCheckbox === true, body };
+}
+
+function parseTableRow(line) {
+  if (!/^\s*\|/u.test(line) || !/\|\s*$/u.test(line)) return undefined;
+  return line.trim().slice(1, -1).split("|").map((cell) => cell.trim());
+}
+
+function cleanMarkdown(value) {
+  return value.replace(/\*\*/gu, "").replace(/`/gu, "").trim();
+}
+
+function statMtime(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+export {
+  AutoAdvanceService,
+  AUTONOMOUS_PROMPT,
+  STOP_MARKER,
+  hasPendingInbox,
+  isExactStopMessage,
+  readTasks,
+  resolveConfiguredPaths
+};

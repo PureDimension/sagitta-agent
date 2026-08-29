@@ -1,0 +1,11 @@
+# @sagitta/memory-plugin bundle layer.
+#
+# Declared via the `dsh.bundle.patch` manifest in package.json. Mounting this
+# package as a bundle (listed in the profile's `dsh.profile.bundles`) applies
+# this insert and registers the memory plugin's tools into the tree.
+# User-level overrides live in the profile's cordis.patch.yml as an id-targeted
+# config entry (see the profile patch example in README.md), which overrides
+# the entry created here.
+- insert:
+    - id: memory
+      name: '@sagitta/memory-plugin'

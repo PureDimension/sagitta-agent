@@ -1,0 +1,33 @@
+{
+  "name": "@sagitta/updater",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./config": "./lib/config.js",
+    "./git": "./lib/git.js",
+    "./install": "./lib/install.js",
+    "./preset": "./lib/preset.js",
+    "./worker": "./lib/worker.js",
+    "./service": "./lib/service.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "engines": {
+    "node": ">=20.10"
+  }
+}

@@ -1,0 +1,5 @@
+# @sagitta/updater v2 bundle layer.
+# The profile may override paths/branch/restart policy in its own patch.
+- insert:
+    - id: sagitta-updater
+      name: '@sagitta/updater'
