@@ -1,5 +1,5 @@
 // ============================================================================
-// sagitta-memory-plugin — 极简 HTTP(S) 客户端（lib/http.js）
+// sagitta-memory — 极简 HTTP(S) 客户端（lib/http.js）
 // ============================================================================
 // 为什么自研而不直接 fetch / 依赖 undici：
 //   · 目标 workers.dev 在国内网络需走本机 clash 代理（实测：直连超时，
@@ -127,7 +127,7 @@ export async function request(opts) {
   const targetPort = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
 
   const reqHeaders = {
-    "User-Agent": "sagitta-memory-plugin/1.0.0",
+    "User-Agent": "sagitta-memory/1.0.0",
     "Accept-Encoding": "identity", // 避免边缘 gzip，隧道模式无需解压缩
     ...headers,
   };

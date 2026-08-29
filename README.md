@@ -56,7 +56,7 @@ pwsh -NoProfile -File .\scripts\install.ps1 -DryRun
 dsh --profile web
 ```
 
-进入 `Settings > Plugins > Sagitta Manager`，填写 Worker API URL、Worker upload token、D1 read token 和 D1 write token。token 只在 DSH 设置页输入，不放入命令行、preset、profile patch、Git 或记忆条目。若当前 DSH 版本没有经过验证的整树重启桥，保存后页面会退化为“配置已保存，请手动重启”：
+进入 `Settings > Plugins > Sagitta Manager`，填写 Worker API URL、CF 账户 ID、Worker 脚本名、Worker upload token、D1 read token 和 D1 write token。部署元数据优先从 manager 配置页取得；manager 中的三个 token 只在 DSH 设置页输入，不放入命令行、preset、profile patch、Git 或记忆条目。若当前 DSH 版本没有经过验证的整树重启桥，保存后页面会退化为“配置已保存，请手动重启”：
 
 ```powershell
 dsh --profile web
@@ -72,7 +72,7 @@ GitHub 不替用户部署 Worker。请先复制并审阅 `worker/wrangler.toml.e
 pwsh -NoProfile -File .\scripts\deploy-worker.ps1 -Mode Direct -DryRun
 ```
 
-正式 direct PUT 只从进程环境读取 `CLOUDFLARE_API_TOKEN`、`CF_ACCOUNT_ID` 和 `CF_SCRIPT_NAME`，不会回显 token；也可以使用本地 Wrangler 配置：
+独立 CLI 不直接连接 DSH settings：调用方可把 manager `getApiConfig()` 的 `cfAccountId`/`cfScriptName` 传入 `-AccountId`/`-ScriptName`；未传参数时按环境变量 `CF_ACCOUNT_ID`/`CF_SCRIPT_NAME`，再按 `worker/reference/account.example.json` 占位符回退。显式参数优先于环境变量。上传 token 仍从进程环境读取 `CLOUDFLARE_API_TOKEN`，不会回显 token；也可以使用本地 Wrangler 配置：
 
 ```powershell
 pwsh -NoProfile -File .\scripts\deploy-worker.ps1 -Mode Wrangler -WranglerConfigPath .\worker\wrangler.toml

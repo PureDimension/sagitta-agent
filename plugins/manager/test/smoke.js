@@ -5,7 +5,9 @@ const stored = {
   workerApiUrl: "https://worker.example.invalid",
   workerUploadToken: "smoke-upload-token",
   d1ReadToken: "smoke-read-token",
-  d1WriteToken: "smoke-write-token"
+  d1WriteToken: "smoke-write-token",
+  cfAccountId: "smoke-account-id",
+  cfScriptName: "smoke-script-name"
 };
 let registerCall;
 let service;
@@ -46,11 +48,18 @@ const context = {
   }
 };
 
-apply(context, { workerApiUrl: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" });
+apply(context, { workerApiUrl: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "", cfAccountId: "", cfScriptName: "" });
 assert.ok(service instanceof SagittaManagerService);
 assert.equal(registerCall.namespace, "sagitta-manager");
 assert.equal(registerCall.options.base.workerApiUrl, "");
-assert.equal(service.getApiConfig().workerApiUrl, stored.workerApiUrl);
+assert.deepEqual(service.getApiConfig(), {
+  workerApiUrl: stored.workerApiUrl,
+  workerUploadToken: stored.workerUploadToken,
+  d1ReadToken: stored.d1ReadToken,
+  d1WriteToken: stored.d1WriteToken,
+  cfAccountId: stored.cfAccountId,
+  cfScriptName: stored.cfScriptName
+});
 stored.workerApiUrl = "https://worker-updated.example.invalid";
 assert.equal(service.getApiConfig().workerApiUrl, stored.workerApiUrl);
 assert.deepEqual(service.getPublicStatus(), {
@@ -94,5 +103,7 @@ assert.equal(warnings.some((message) => message.includes("settings provider unav
 const schemaJson = Config.toJSON();
 const schemaText = JSON.stringify(schemaJson);
 assert.equal((schemaText.match(/"role":"secret"/g) ?? []).length, 3);
+assert.equal(schemaText.includes("cfAccountId"), true);
+assert.equal(schemaText.includes("cfScriptName"), true);
 
 console.log("manager smoke: PASS (registration, live reads, public redaction, secret schema roles)");

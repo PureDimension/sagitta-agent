@@ -13,6 +13,18 @@ const FIELDS = [
     secret: false
   },
   {
+    field: "cfAccountId",
+    label: "CF 账户 ID",
+    hint: "Worker direct PUT 部署使用的 Cloudflare 账户 ID；非 secret。",
+    secret: false
+  },
+  {
+    field: "cfScriptName",
+    label: "Worker 脚本名",
+    hint: "Worker direct PUT 部署使用的 Cloudflare Worker 脚本名；非 secret。",
+    secret: false
+  },
+  {
     field: "workerUploadToken",
     label: "Worker 部署 Token",
     hint: "仅 updater 部署 Worker 使用；输入框不会回填已存 Token。",
@@ -219,18 +231,20 @@ export function ManagerCard(props) {
   const scope = props.scope;
   const snapshot = useExternalSnapshot(scope, EMPTY_SCOPE_SNAPSHOT);
   const value = snapshot.value && typeof snapshot.value === "object" ? snapshot.value : {};
-  const [drafts, setDrafts] = React.useState(() => ({ workerApiUrl: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
+  const [drafts, setDrafts] = React.useState(() => ({ workerApiUrl: "", cfAccountId: "", cfScriptName: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
   const [staged, setStaged] = React.useState(() => new Set());
   const [saving, setSaving] = React.useState(false);
   const [message, setMessage] = React.useState("");
   const workerApiUrl = safeString(value.workerApiUrl);
+  const cfAccountId = safeString(value.cfAccountId);
+  const cfScriptName = safeString(value.cfScriptName);
   const health = useWorkerHealth(workerApiUrl);
   const writable = snapshot.writable === true && snapshot.status === "ready";
 
   React.useEffect(() => {
     if (snapshot.status !== "ready" || staged.size > 0) return;
-    setDrafts((previous) => ({ ...previous, workerApiUrl }));
-  }, [snapshot.status, snapshot.revision, staged.size, workerApiUrl]);
+    setDrafts((previous) => ({ ...previous, workerApiUrl, cfAccountId, cfScriptName }));
+  }, [snapshot.status, snapshot.revision, staged.size, workerApiUrl, cfAccountId, cfScriptName]);
 
   const edit = (field, text) => {
     setMessage("");
@@ -274,7 +288,8 @@ export function ManagerCard(props) {
         if (draft.length > 0 && staged.has(field.field)) await scope.set(field.field, draft);
       }
       setStaged(new Set());
-      setDrafts((previous) => ({ ...previous, workerApiUrl: safeString(scope.getSnapshot?.()?.value?.workerApiUrl), workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
+      const current = scope.getSnapshot?.()?.value;
+      setDrafts((previous) => ({ ...previous, workerApiUrl: safeString(current?.workerApiUrl), cfAccountId: safeString(current?.cfAccountId), cfScriptName: safeString(current?.cfScriptName), workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
       if (!restart) {
         setMessage(COPY.saved);
         return "saved";

@@ -1,5 +1,5 @@
 {
-  "name": "@sagitta/memory-plugin",
+  "name": "@sagitta/memory",
   "description": "Sagitta 记忆模块 DSH 本地插件：remember/recall/consolidate/verify 四个模型工具，映射已部署的 Cloudflare Worker API（设计 memory-system-design.md v1.3 §10：分数驱动 + 事件化验证机制）。",
   "version": "1.2.0",
   "type": "module",

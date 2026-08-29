@@ -1,4 +1,4 @@
-# @sagitta/memory-plugin bundle layer.
+# @sagitta/memory bundle layer.
 #
 # Declared via the `dsh.bundle.patch` manifest in package.json. Mounting this
 # package as a bundle (listed in the profile's `dsh.profile.bundles`) applies
@@ -8,4 +8,4 @@
 # the entry created here.
 - insert:
     - id: memory
-      name: '@sagitta/memory-plugin'
+      name: '@sagitta/memory'

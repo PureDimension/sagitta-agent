@@ -155,7 +155,7 @@ async function defaultResolvePlugin(name, { profileDir, repoPath, fsOps = defaul
       // canonical package names map to these stable workspace directories.
       const id = name === "@sagitta/manager"
         ? "manager"
-        : name === "@sagitta/memory-plugin"
+        : name === "@sagitta/memory"
           ? "memory"
           : name === "@sagitta/auto-advance"
             ? "auto-advance"

@@ -175,20 +175,20 @@ $patchPath = Join-Path $ProfilePath 'cordis.patch.yml'
 
 $plugins = [ordered]@{
     '@sagitta/manager'       = 'plugins\manager'
-    '@sagitta/memory-plugin' = 'plugins\memory'
+    '@sagitta/memory'        = 'plugins\memory'
     '@sagitta/auto-advance'  = 'plugins\auto-advance'
     '@sagitta/updater'       = 'plugins\updater'
 }
 $bundleNames = @(
     '@sagitta/manager'
-    '@sagitta/memory-plugin'
+    '@sagitta/memory'
     '@sagitta/auto-advance'
     '@sagitta/updater'
 )
 
 Write-Host "[install-profile-deps] profile: $ProfilePath"
 Write-Host "[install-profile-deps] repository: $RepoPath"
-Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory-plugin, @sagitta/auto-advance, @sagitta/updater'
+Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/updater'
 
 if (-not $DryRun) {
     foreach ($relativePluginPath in $plugins.Values) {

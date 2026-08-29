@@ -9,7 +9,9 @@ const API_FIELDS = [
   "workerApiUrl",
   "workerUploadToken",
   "d1ReadToken",
-  "d1WriteToken"
+  "d1WriteToken",
+  "cfAccountId",
+  "cfScriptName"
 ];
 
 const secret = () => z.string().default("").role("secret");
@@ -22,7 +24,11 @@ export const Config = z.object({
   d1ReadToken: secret()
     .description("D1-backed API 读权限 token；memory/task 读操作使用。"),
   d1WriteToken: secret()
-    .description("D1-backed API 写权限 token；memory/task 写操作使用。")
+    .description("D1-backed API 写权限 token；memory/task 写操作使用。"),
+  cfAccountId: z.string().default("")
+    .description("Cloudflare 账户 ID；Worker direct PUT 部署元数据，非 secret。"),
+  cfScriptName: z.string().default("")
+    .description("Cloudflare Worker 脚本名；Worker direct PUT 部署元数据，非 secret。")
 });
 
 function emptyApiConfig() {
@@ -30,7 +36,9 @@ function emptyApiConfig() {
     workerApiUrl: "",
     workerUploadToken: "",
     d1ReadToken: "",
-    d1WriteToken: ""
+    d1WriteToken: "",
+    cfAccountId: "",
+    cfScriptName: ""
   };
 }
 

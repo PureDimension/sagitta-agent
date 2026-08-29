@@ -1,4 +1,4 @@
-# sagitta-memory-plugin — Sagitta 记忆模块的 DSH 本地插件
+# sagitta-memory — Sagitta 记忆模块的 DSH 本地插件
 
 把设计文档（`memory-system-design.md`）里的记忆工具接到由
 `sagitta-manager` 统一提供配置的 Cloudflare Worker API，以 DSH
@@ -18,7 +18,7 @@
 ## 目录结构
 
 ```
-memory-plugin/
+memory/
   package.json      # 包声明（type:module；main 指向 lib/index.js）
   lib/
     index.js        # cordis 插件壳：Config/apply + 启动诊断（掩码） + 系统提示词段
@@ -43,14 +43,14 @@ DSH 自带工具插件完全一致。两条路径任选：
 
    ```sh
    cd "$HOME/.dsh/profiles/web"
-   pnpm add "@sagitta/memory-plugin@file:$HOME/.dsh/sagitta-agent/plugins/memory"
+   pnpm add "@sagitta/memory@file:$HOME/.dsh/sagitta-agent/plugins/memory"
    ```
 
 3. 在 `cordis.patch.yml`（profile 的补丁层）追加：
 
    ```yaml
    - id: memory
-     name: sagitta-memory-plugin
+     name: sagitta-memory
      config:
        proxy: direct                       # 或显式填写本机 HTTP 代理
        timeoutMs: 20000
@@ -58,13 +58,13 @@ DSH 自带工具插件完全一致。两条路径任选：
 
 4. 在 `Settings > Plugins > Sagitta Manager` 配置 Worker API URL、D1 read token、
    D1 write token 后重启/重载 DSH Web。启动日志会出现
-   `sagitta-memory-plugin 加载完成` + 凭据诊断（仅掩码）。
+   `sagitta-memory 加载完成` + 凭据诊断（仅掩码）。
 
 ### 路径 B：不装包，直接以相对入口挂载
 
 ```yaml
 - id: memory
-  name: ./node_modules/sagitta-memory-plugin/lib/index.js
+  name: ./node_modules/sagitta-memory/lib/index.js
   config:
     proxy: direct
 ```

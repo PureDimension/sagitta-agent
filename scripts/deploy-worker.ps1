@@ -7,6 +7,8 @@ param(
     [string]$ReferencePath = '',
     [string]$WranglerConfigPath = '',
     [string]$WorkerApiUrl = '',
+    [string]$AccountId = '',
+    [string]$ScriptName = '',
     [switch]$DryRun
 )
 
@@ -57,8 +59,8 @@ if (-not (Test-Path -LiteralPath $WorkerPath -PathType Leaf)) {
 }
 
 $reference = Read-ReferenceConfig -Path $ReferencePath
-$accountId = if (-not [string]::IsNullOrWhiteSpace($env:CF_ACCOUNT_ID)) { $env:CF_ACCOUNT_ID } else { [string]$reference['accountId'] }
-$scriptName = if (-not [string]::IsNullOrWhiteSpace($env:CF_SCRIPT_NAME)) { $env:CF_SCRIPT_NAME } else { [string]$reference['scriptName'] }
+$accountId = if (-not [string]::IsNullOrWhiteSpace($AccountId)) { $AccountId } elseif (-not [string]::IsNullOrWhiteSpace($env:CF_ACCOUNT_ID)) { $env:CF_ACCOUNT_ID } else { [string]$reference['accountId'] }
+$scriptName = if (-not [string]::IsNullOrWhiteSpace($ScriptName)) { $ScriptName } elseif (-not [string]::IsNullOrWhiteSpace($env:CF_SCRIPT_NAME)) { $env:CF_SCRIPT_NAME } else { [string]$reference['scriptName'] }
 if ([string]::IsNullOrWhiteSpace($WorkerApiUrl)) {
     $WorkerApiUrl = if (-not [string]::IsNullOrWhiteSpace($env:SAGITTA_WORKER_API_URL)) { $env:SAGITTA_WORKER_API_URL } else { [string]$reference['workerApiUrl'] }
 }

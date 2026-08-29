@@ -1,5 +1,5 @@
 // ============================================================================
-// sagitta-memory-plugin — Worker API 客户端（lib/client.js）
+// sagitta-memory — Worker API 客户端（lib/client.js）
 // ============================================================================
 // 端点契约对齐 cloudflare-worker/README.md + worker.js（v1.3.0）：
 //   GET  /mem/health                        部署验收（无需认证）

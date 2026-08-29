@@ -1,11 +1,11 @@
 // ============================================================================
-// sagitta-memory-plugin — DSH（DeepSeek Harness）本地插件入口（lib/index.js）
+// sagitta-memory — DSH（DeepSeek Harness）本地插件入口（lib/index.js）
 // ============================================================================
 // cordis 插件格式（对照 @deepseek-ai/dsh-tool-web / dsh-tool-ask-user）：
 //   export { name, inject, Config, apply }
 //   在 profile 的 cordis.patch.yml（或插件列表）中声明：
 //     - id: memory
-//       name: sagitta-memory-plugin
+//       name: sagitta-memory
 //       config: { ...可选... }
 // 职责：读取本地 transport 配置与 manager API 快照（绝不硬编码/绝不打印明文）→ 构建 API 客户端 →
 // 注册四个工具（memory_remember / memory_recall / memory_consolidate /
@@ -62,7 +62,7 @@ function apply(ctx, config) {
     return "未配置";
   };
   const diag = [
-    `sagitta-memory-plugin 加载完成`,
+    `sagitta-memory 加载完成`,
     `  API 配置来源=${source}`,
     `  baseUrl=${readRuntime.baseUrl || "(未配置)"}`,
     `  proxy=${resolved.proxy}`,

@@ -14,6 +14,8 @@ window.__ModuleLoader__.load({
     const RESTART_UNAVAILABLE = "restart-unavailable";
     const FIELDS = [
       { field: "workerApiUrl", label: "Worker API 地址", hint: "Sagitta Worker 运行时 API 根地址；memory、task 和健康检查从这里派生。", secret: false },
+      { field: "cfAccountId", label: "CF 账户 ID", hint: "Worker direct PUT 部署使用的 Cloudflare 账户 ID；非 secret。", secret: false },
+      { field: "cfScriptName", label: "Worker 脚本名", hint: "Worker direct PUT 部署使用的 Cloudflare Worker 脚本名；非 secret。", secret: false },
       { field: "workerUploadToken", label: "Worker 部署 Token", hint: "仅 updater 部署 Worker 使用；输入框不会回填已存 Token。", secret: true },
       { field: "d1ReadToken", label: "D1 读 Token", hint: "memory recall/list/search 与 task list/get 使用。", secret: true },
       { field: "d1WriteToken", label: "D1 写 Token", hint: "memory remember/consolidate/verify 与 task 写操作使用。", secret: true }
@@ -83,14 +85,16 @@ window.__ModuleLoader__.load({
       const scope = props.scope;
       const snapshot = useExternalSnapshot(scope, EMPTY_SCOPE_SNAPSHOT);
       const value = snapshot.value && typeof snapshot.value === "object" ? snapshot.value : {};
-      const [drafts, setDrafts] = react.useState(() => ({ workerApiUrl: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
+      const [drafts, setDrafts] = react.useState(() => ({ workerApiUrl: "", cfAccountId: "", cfScriptName: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
       const [staged, setStaged] = react.useState(() => new Set());
       const [saving, setSaving] = react.useState(false);
       const [message, setMessage] = react.useState("");
       const workerApiUrl = safeString(value.workerApiUrl);
+      const cfAccountId = safeString(value.cfAccountId);
+      const cfScriptName = safeString(value.cfScriptName);
       const health = useWorkerHealth(workerApiUrl);
       const writable = snapshot.writable === true && snapshot.status === "ready";
-      react.useEffect(() => { if (snapshot.status !== "ready" || staged.size > 0) return; setDrafts((previous) => ({ ...previous, workerApiUrl })); }, [snapshot.status, snapshot.revision, staged.size, workerApiUrl]);
+      react.useEffect(() => { if (snapshot.status !== "ready" || staged.size > 0) return; setDrafts((previous) => ({ ...previous, workerApiUrl, cfAccountId, cfScriptName })); }, [snapshot.status, snapshot.revision, staged.size, workerApiUrl, cfAccountId, cfScriptName]);
       const edit = (field, text) => {
         setMessage(""); setDrafts((previous) => ({ ...previous, [field]: text }));
         setStaged((previous) => { const next = new Set(previous); if (text.length === 0) next.delete(field); else next.add(field); return next; });
@@ -108,7 +112,8 @@ window.__ModuleLoader__.load({
         setSaving(true); setMessage("");
         try {
           for (const field of FIELDS) { const draft = safeString(drafts[field.field]); if (draft.length > 0 && staged.has(field.field)) await scope.set(field.field, draft); }
-          setStaged(new Set()); setDrafts((previous) => ({ ...previous, workerApiUrl: safeString(scope.getSnapshot?.()?.value?.workerApiUrl), workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
+          const current = scope.getSnapshot?.()?.value;
+          setStaged(new Set()); setDrafts((previous) => ({ ...previous, workerApiUrl: safeString(current?.workerApiUrl), cfAccountId: safeString(current?.cfAccountId), cfScriptName: safeString(current?.cfScriptName), workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
           if (!restart) { setMessage(COPY.saved); return "saved"; }
           const result = await Promise.resolve(requestHostRestart("sagitta-manager settings saved", props.requestHostRestart));
           setMessage(result === "restarted" || result === true ? COPY.saved : COPY.restartUnavailable); return result;

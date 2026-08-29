@@ -42,7 +42,7 @@ if ($LASTEXITCODE -ne 0) { throw 'dsh --profile web --dump-config failed; instal
 
 $checks = [ordered]@{
     'sagitta-manager'    = ($dump -match '(?m)sagitta-manager|@sagitta/manager')
-    'memory'              = ($dump -match '(?m)(^|[^\w])memory([^\w]|$)|@sagitta/memory-plugin')
+    'memory'              = ($dump -match '(?m)(^|[^\w])memory([^\w]|$)|@sagitta/memory')
     'sagitta-auto-advance'= ($dump -match '(?m)sagitta-auto-advance|@sagitta/auto-advance')
     'sagitta-updater'     = ($dump -match '(?m)sagitta-updater|@sagitta/updater')
     'preset default'      = ($dump -match '(?i)default\s*[:=]\s*["'']?sagitta\b|agent-presets[^\r\n]*sagitta')
