@@ -20,7 +20,7 @@ import { registerMemoryTools, MEMORY_PROMPT_GUIDANCE } from "./tools.js";
 const name = "memory";
 // manager is intentionally optional: if it is absent, the client degrades to
 // explicit migration fallback values and exposes a visible "未配置" error.
-const inject = ["tools", "systemPrompt"];
+const inject = ["tools", "systemPrompt", "sagitta-manager"];
 
 const Config = z.object({
   proxy: z
