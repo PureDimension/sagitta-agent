@@ -11,7 +11,22 @@ const Config = z.object({
 });
 
 function apply(ctx, config) {
-  ctx.plugin(AutoAdvanceService, config ?? {});
+  const manager = ctx?.["sagitta-manager"];
+  let managerApiConfig;
+  if (typeof manager?.getApiConfig === "function") {
+    try {
+      managerApiConfig = manager.getApiConfig();
+    } catch {
+      managerApiConfig = undefined;
+    }
+  }
+  // Keep the manager object for per-request refreshes, and retain the apply
+  // snapshot for startup ordering. Neither path emits credentials.
+  ctx.plugin(AutoAdvanceService, {
+    ...(config ?? {}),
+    manager,
+    managerApiConfig
+  });
 }
 
 export {

@@ -73,6 +73,26 @@ CREATE TABLE IF NOT EXISTS entries (
   CHECK (cross_session_count >= 0)
 );
 
+-- tasks：任务事实表（docs/task-api-p1.md §1；DELETE 仅将 archived 置 1）
+CREATE TABLE IF NOT EXISTS tasks (
+  id            TEXT PRIMARY KEY,                -- 生成：tsk-YYYYMMDD-<hex6>
+  project       TEXT NOT NULL,                   -- 所属项目（对应 TASKS §1A/1B 分类）
+  title         TEXT NOT NULL,                   -- 条目一行描述
+  status        TEXT NOT NULL DEFAULT 'open',    -- open | in_progress | blocked | waiting | done
+  priority      INTEGER NOT NULL DEFAULT 0,      -- 0 普通 / 1 高 / 2 紧急
+  checkbox      INTEGER NOT NULL DEFAULT 0,      -- 1=该条是涟漪待处理 checkbox
+  stream        TEXT NOT NULL DEFAULT 'company', -- personal-projects | company-projects | sagitta | ripple
+  body          TEXT DEFAULT '',                 -- 内嵌描述/notes
+  created_at    TEXT NOT NULL,                   -- ISO8601 UTC
+  updated_at    TEXT NOT NULL DEFAULT '',        -- ISO8601 UTC
+  done_at       TEXT DEFAULT '',
+  archived      INTEGER NOT NULL DEFAULT 0       -- 1=归档（软删，recall 默认排除同 memory 契约）
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
+CREATE INDEX IF NOT EXISTS idx_tasks_stream  ON tasks(stream);
+CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
+
 -- delegations：派单任务记录（L2 事实层，指挥者记忆的地基，design-review.md 维度五 P0）
 CREATE TABLE IF NOT EXISTS delegations (
   task_id               TEXT PRIMARY KEY,              -- 派单任务 id（如 dlg-20260817-gotest，设计 §9 示例）

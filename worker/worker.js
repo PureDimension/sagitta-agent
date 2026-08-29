@@ -26,7 +26,8 @@
 //      delegatee=ripple 保留不破坏
 //
 // 部署：Dashboard → Edit code 直接粘贴本文件（详见 worker/README.md）。
-//   D1 binding 名必须为 DB；环境变量 AUTH_TOKEN 必填（缺失时拒绝服务并返回 503）。
+//   D1 binding 名必须为 DB；/mem 使用 AUTH_TOKEN 兜底，task 可按读写使用
+//   D1_READ_TOKEN / D1_WRITE_TOKEN（均未配置时返回 503）。
 // 格式说明：本文件使用 **ES Module 格式**（export default { fetch(request, env) }），
 //   这是硬要求：Cloudflare 的 D1 binding 只支持 ES Module 格式，经典 Service Worker
 //   格式（addEventListener('fetch')）会报 `Binding 'DB' of type 'd1' requires a Worker
@@ -88,6 +89,13 @@ const MAX_BODY_BYTES = 1024 * 1024; // 请求体上限 1MB（记忆条目正文�
 const SCORE_MIN = 0;
 const SCORE_MAX = 3; // 设计 §4 v1.3 钳制上界；score<0 触发软归档（下界由归档消化）
 
+// task API（docs/task-api-p1.md §1）：任务状态独立于 memory 条目状态。
+const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'waiting', 'done'];
+// 任务沿用记忆四流；兼容草案 DDL 的默认值 company。
+const TASK_STREAMS = [...STREAMS, 'company'];
+const TASK_DEFAULT_STREAM = 'company';
+const TASK_PRIORITIES = [0, 1, 2];
+
 // ---- 基础工具 ---------------------------------------------------------------
 
 function nowIso() {
@@ -97,7 +105,7 @@ function nowIso() {
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type, CF-Access-Jwt-Assertion',
   };
 }
@@ -241,16 +249,27 @@ async function decorateEntries(db, rows) {
 
 // Cloudflare Access 已在网关层校验 JWT（CF-Access-Jwt-Assertion 头存在即放行），
 // 代码层仅做 Bearer 兜底；AUTH_TOKEN 未配置时拒绝服务（503，部署验收可发现）。
-function checkAuth(request, env) {
+// task 的 manager Bearer 读写分流复用同一头：若部署环境提供可选的
+// D1_READ_TOKEN / D1_WRITE_TOKEN，则按操作分别校验；未提供时回退现有 AUTH_TOKEN，
+// 保持当前 /mem 与旧部署的认证行为不变。
+function checkAuth(request, env, operation) {
   if (request.headers.get('CF-Access-Jwt-Assertion')) return null;
-  if (!env.AUTH_TOKEN) {
+  const operationToken = operation === 'read'
+    ? env.D1_READ_TOKEN
+    : operation === 'write'
+      ? env.D1_WRITE_TOKEN
+      : null;
+  const expectedToken = operationToken || env.AUTH_TOKEN;
+  if (!expectedToken) {
+    const tokenName = operation === 'read' ? 'D1_READ_TOKEN' : operation === 'write' ? 'D1_WRITE_TOKEN' : 'AUTH_TOKEN';
     return jsonError(503, 'NOT_CONFIGURED',
-      'AUTH_TOKEN 未配置：拒绝启动请求。请在 Dashboard → Settings → Variables and Secrets 设置 AUTH_TOKEN（生成命令见 README.md）。');
+      tokenName + ' 未配置：拒绝启动请求。请在 Dashboard → Settings → Variables and Secrets 设置认证 Secret（生成命令见 README.md）。');
   }
   const auth = request.headers.get('Authorization') || '';
-  if (auth === 'Bearer ' + env.AUTH_TOKEN) return null;
+  if (auth === 'Bearer ' + expectedToken) return null;
+  const tokenHint = operation === 'read' ? 'D1_READ_TOKEN' : operation === 'write' ? 'D1_WRITE_TOKEN' : 'AUTH_TOKEN';
   return jsonError(401, 'UNAUTHORIZED',
-    '认证失败：需要 Authorization: Bearer <AUTH_TOKEN>（或由 Cloudflare Access 网关放行）。');
+    '认证失败：需要 Authorization: Bearer <' + tokenHint + '>（或由 Cloudflare Access 网关放行）。');
 }
 
 // ---- 端点处理器 -------------------------------------------------------------
@@ -892,6 +911,245 @@ async function getDelegationHandler(db, taskId) {
   return jsonOk(row);
 }
 
+// ---- task API（docs/task-api-p1.md） ----------------------------------------
+
+function isTaskBody(body) {
+  return body !== null && typeof body === 'object' && !Array.isArray(body);
+}
+
+function serializeTask(row) {
+  if (!row) return null;
+  return Object.assign({}, row, {
+    priority: Number(row.priority),
+    checkbox: Number(row.checkbox),
+    archived: Number(row.archived),
+  });
+}
+
+function taskId() {
+  const day = nowIso().slice(0, 10).replace(/-/g, '');
+  const suffix = crypto.randomUUID().replace(/-/g, '').slice(0, 6);
+  return 'tsk-' + day + '-' + suffix;
+}
+
+function taskString(value, field, required = false) {
+  if (typeof value !== 'string' || (required && value.trim().length === 0)) {
+    return { error: jsonError(400, required ? field.toUpperCase() + '_REQUIRED' : 'INVALID_' + field.toUpperCase(),
+      required ? field + ' 必填' : field + ' 必须是字符串') };
+  }
+  return { value: required ? value.trim() : value };
+}
+
+function taskStatus(value) {
+  if (!TASK_STATUSES.includes(value)) {
+    return jsonError(400, 'INVALID_TASK_STATUS', 'status 必须是：' + TASK_STATUSES.join(' / '));
+  }
+  return null;
+}
+
+function taskPriority(value) {
+  if (!Number.isInteger(value) || !TASK_PRIORITIES.includes(value)) {
+    return jsonError(400, 'INVALID_PRIORITY', 'priority 必须是 0（普通）/ 1（高）/ 2（紧急）');
+  }
+  return null;
+}
+
+function taskCheckbox(value) {
+  if (value === true || value === 1) return 1;
+  if (value === false || value === 0) return 0;
+  return jsonError(400, 'INVALID_CHECKBOX', 'checkbox 必须是布尔值或 0/1');
+}
+
+function taskStream(value) {
+  if (!TASK_STREAMS.includes(value)) {
+    return jsonError(400, 'INVALID_TASK_STREAM', 'stream 必须是：' + TASK_STREAMS.join(' / '));
+  }
+  return null;
+}
+
+function taskQueryFlag(value, name) {
+  if (value === '1' || value === 'true') return 1;
+  if (value === '0' || value === 'false') return 0;
+  return jsonError(400, 'INVALID_' + name.toUpperCase(), name + ' 过滤值必须是 0/1');
+}
+
+async function getTaskRow(db, id) {
+  return await db.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first();
+}
+
+// GET /task —— 列表，默认排除 archived；checkbox 过滤供 auto-advance API 使用。
+async function listTasksHandler(db, url) {
+  const project = url.searchParams.get('project');
+  const stream = url.searchParams.get('stream');
+  const status = url.searchParams.get('status');
+  const checkbox = url.searchParams.get('checkbox');
+  if (stream && taskStream(stream)) return taskStream(stream);
+  if (status && taskStatus(status)) return taskStatus(status);
+
+  const where = ['archived = 0'];
+  const params = [];
+  if (project) { where.push('project = ?'); params.push(project); }
+  if (stream) { where.push('stream = ?'); params.push(stream); }
+  if (status) { where.push('status = ?'); params.push(status); }
+  if (checkbox !== null) {
+    const flagError = taskQueryFlag(checkbox, 'checkbox');
+    if (flagError instanceof Response) return flagError;
+    where.push('checkbox = ?');
+    params.push(flagError);
+  }
+  const whereSql = where.join(' AND ');
+  const rows = await db.prepare(
+    'SELECT * FROM tasks WHERE ' + whereSql + ' ORDER BY updated_at DESC, created_at DESC, id DESC'
+  ).bind(...params).all();
+  const items = (rows.results || []).map(serializeTask);
+  return jsonOk({
+    items,
+    total: items.length,
+    project: project || undefined,
+    stream: stream || undefined,
+    status: status || undefined,
+    checkbox: checkbox === null ? undefined : Number(checkbox === 'true' || checkbox === '1'),
+  });
+}
+
+// GET /task/{id} —— 单条；软归档任务可按 id 读取，列表/搜索默认不返回。
+async function getTaskHandler(db, id) {
+  const row = await getTaskRow(db, id);
+  if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+  return jsonOk(serializeTask(row));
+}
+
+// POST /task —— 创建任务；管理字段由服务端填写。
+async function createTaskHandler(db, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+
+  const project = taskString(body.project, 'project', true);
+  if (project.error) return project.error;
+  const title = taskString(body.title, 'title', true);
+  if (title.error) return title.error;
+
+  const status = body.status === undefined ? 'open' : body.status;
+  const statusError = taskStatus(status);
+  if (statusError) return statusError;
+  const priority = body.priority === undefined ? 0 : body.priority;
+  const priorityError = taskPriority(priority);
+  if (priorityError) return priorityError;
+  const checkbox = body.checkbox === undefined ? 0 : taskCheckbox(body.checkbox);
+  if (checkbox instanceof Response) return checkbox;
+  const stream = body.stream === undefined ? TASK_DEFAULT_STREAM : body.stream;
+  const streamError = taskStream(stream);
+  if (streamError) return streamError;
+  const taskBody = body.body === undefined ? '' : body.body;
+  if (typeof taskBody !== 'string') return jsonError(400, 'INVALID_BODY_TEXT', 'body 必须是字符串');
+
+  const id = taskId();
+  const now = nowIso();
+  const doneAt = status === 'done' ? now : '';
+  await db.prepare(
+    'INSERT INTO tasks (id, project, title, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(
+    id, project.value, title.value, status, priority, checkbox, stream, taskBody, now, now, doneAt, 0
+  ).run();
+
+  const row = await getTaskRow(db, id);
+  return jsonOk(serializeTask(row), 201);
+}
+
+// PATCH /task/{id} —— 部分更新允许的五个业务字段。
+async function patchTaskHandler(db, id, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const allowed = ['status', 'priority', 'body', 'title', 'checkbox'];
+  const present = allowed.filter((field) => Object.prototype.hasOwnProperty.call(body, field));
+  if (present.length === 0) return jsonError(400, 'PATCH_FIELDS_REQUIRED', 'PATCH 至少需要 status/priority/body/title/checkbox 之一');
+
+  const row = await getTaskRow(db, id);
+  if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+
+  const sets = [];
+  const params = [];
+  let nextStatus = row.status;
+  for (const field of present) {
+    if (field === 'status') {
+      const error = taskStatus(body.status);
+      if (error) return error;
+      nextStatus = body.status;
+      sets.push('status = ?');
+      params.push(body.status);
+    } else if (field === 'priority') {
+      const error = taskPriority(body.priority);
+      if (error) return error;
+      sets.push('priority = ?');
+      params.push(body.priority);
+    } else if (field === 'checkbox') {
+      const value = taskCheckbox(body.checkbox);
+      if (value instanceof Response) return value;
+      sets.push('checkbox = ?');
+      params.push(value);
+    } else if (field === 'title') {
+      const value = taskString(body.title, 'title', true);
+      if (value.error) return value.error;
+      sets.push('title = ?');
+      params.push(value.value);
+    } else if (field === 'body') {
+      if (typeof body.body !== 'string') return jsonError(400, 'INVALID_BODY_TEXT', 'body 必须是字符串');
+      sets.push('body = ?');
+      params.push(body.body);
+    }
+  }
+
+  const now = nowIso();
+  sets.push('updated_at = ?');
+  params.push(now);
+  if (present.includes('status')) {
+    let doneAt = row.done_at || '';
+    if (nextStatus === 'done' && row.status !== 'done') doneAt = now;
+    if (nextStatus !== 'done') doneAt = '';
+    sets.push('done_at = ?');
+    params.push(doneAt);
+  }
+  params.push(id);
+  await db.prepare('UPDATE tasks SET ' + sets.join(', ') + ' WHERE id = ?').bind(...params).run();
+  return await getTaskHandler(db, id);
+}
+
+// DELETE /task/{id} —— 软删，保留任务事实与审计字段。
+async function deleteTaskHandler(db, id) {
+  const row = await getTaskRow(db, id);
+  if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+  if (Number(row.archived) === 0) {
+    await db.prepare('UPDATE tasks SET archived = ?, updated_at = ? WHERE id = ?')
+      .bind(1, nowIso(), id).run();
+  }
+  const updated = await getTaskRow(db, id);
+  return jsonOk(serializeTask(updated));
+}
+
+// POST /task/search —— 关键词 LIKE；默认排除 archived。
+async function searchTasksHandler(db, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  if (!isNonEmptyString(body.query)) return jsonError(400, 'QUERY_REQUIRED', 'query 必填（关键词 LIKE 检索）');
+
+  const stream = body.stream;
+  const status = body.status;
+  if (stream && taskStream(stream)) return taskStream(stream);
+  if (status && taskStatus(status)) return taskStatus(status);
+
+  const pattern = '%' + escapeLike(body.query) + '%';
+  const where = [
+    'archived = 0',
+    "(project LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')",
+  ];
+  const params = [pattern, pattern, pattern, pattern];
+  if (stream) { where.push('stream = ?'); params.push(stream); }
+  if (status) { where.push('status = ?'); params.push(status); }
+  const rows = await db.prepare(
+    'SELECT * FROM tasks WHERE ' + where.join(' AND ') + ' ORDER BY updated_at DESC, created_at DESC, id DESC'
+  ).bind(...params).all();
+  const items = (rows.results || []).map(serializeTask);
+  return jsonOk({ query: body.query, items, total: items.length, stream, status });
+}
+
 // ---- 路由入口 ---------------------------------------------------------------
 
 // ES Module 格式下 env 由运行时直接注入（env.DB = D1 binding，env.AUTH_TOKEN = secret），
@@ -900,6 +1158,7 @@ async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  const segments = path.split('/').filter(Boolean); // ['mem'|'task', resource, ...]
 
   // CORS 预检（工具调用多为服务端到服务端，保留以方便调试）
   if (method === 'OPTIONS') {
@@ -910,7 +1169,10 @@ async function handleRequest(request, env) {
   if (method === 'GET' && path === '/mem/health') {
     return healthHandler(env);
   }
-  const authErr = checkAuth(request, env);
+  const taskOperation = segments[0] === 'task'
+    ? ((method === 'GET' || (method === 'POST' && segments[1] === 'search')) ? 'read' : 'write')
+    : undefined;
+  const authErr = checkAuth(request, env, taskOperation);
   if (authErr) return authErr;
 
   if (!env.DB) {
@@ -919,7 +1181,29 @@ async function handleRequest(request, env) {
   }
   const db = env.DB;
 
-  const segments = path.split('/').filter(Boolean); // ['mem', resource, ...]
+  if (segments[0] === 'task') {
+    try {
+      if (segments.length === 2 && segments[1] === 'search') {
+        if (method === 'POST') return await searchTasksHandler(db, await readJson(request));
+      } else if (segments.length === 1) {
+        if (method === 'GET') return await listTasksHandler(db, url);
+        if (method === 'POST') return await createTaskHandler(db, await readJson(request));
+      } else if (segments.length === 2) {
+        const id = decodeURIComponent(segments[1]);
+        if (method === 'GET') return await getTaskHandler(db, id);
+        if (method === 'PATCH') return await patchTaskHandler(db, id, await readJson(request));
+        if (method === 'DELETE') return await deleteTaskHandler(db, id);
+      }
+      return jsonError(405, 'METHOD_NOT_ALLOWED', '路径 ' + path + ' 不支持 ' + method);
+    } catch (err) {
+      if (err && err.httpStatus) {
+        return jsonError(err.httpStatus, err.code, err.message);
+      }
+      console.error('[sagitta-memory] unhandled task error:', err);
+      return jsonError(500, 'INTERNAL', '服务端内部错误：' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
   if (segments[0] !== 'mem' || segments.length < 2) {
     return jsonError(404, 'NOT_FOUND', '未知路径：' + path);
   }

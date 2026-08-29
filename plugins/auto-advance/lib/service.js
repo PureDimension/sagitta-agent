@@ -20,6 +20,7 @@ const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
 const STATUS_EVENT = "sagitta-auto-advance/status";
 const DEFAULT_IDLE_TIMEOUT_MS = 300000;
+const DEFAULT_TASK_API_TIMEOUT_MS = 10000;
 const LEGACY_WORKSPACE_CANDIDATES = [
   "D:\\workspace\\sagitta-experience",
   join(homedir(), ".dsh"),
@@ -54,6 +55,29 @@ function nonEmptyString(value) {
   if (typeof value !== "string") return undefined;
   const result = value.trim();
   return result.length > 0 ? result : undefined;
+}
+
+function normalizeTaskApiConfig(config = {}) {
+  const raw = isRecord(config) ? config : {};
+  const nested = isRecord(raw.apiConfig) ? raw.apiConfig : isRecord(raw.taskApiConfig) ? raw.taskApiConfig : {};
+  return {
+    workerApiUrl: nonEmptyString(nested.workerApiUrl ?? nested.apiUrl ?? raw.workerApiUrl ?? raw.apiUrl),
+    d1ReadToken: nonEmptyString(nested.d1ReadToken ?? raw.d1ReadToken)
+  };
+}
+
+function completeTaskApiConfig(config) {
+  const normalized = normalizeTaskApiConfig(config);
+  return normalized.workerApiUrl !== undefined && normalized.d1ReadToken !== undefined ? normalized : undefined;
+}
+
+function readManagerApiConfig(manager) {
+  if (typeof manager?.getApiConfig !== "function") return undefined;
+  try {
+    return manager.getApiConfig();
+  } catch {
+    return undefined;
+  }
 }
 
 function isTaskFile(path) {
@@ -98,7 +122,17 @@ function normalizeConfig(config = {}) {
   return {
     idleTimeoutMs: Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0 ? idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
     statePath: paths.statePath,
-    tasksPath: paths.tasksPath
+    tasksPath: paths.tasksPath,
+    // This field is already used by the profile patch during the transition.
+    taskFallback: config.taskFallback !== false,
+    taskApiTimeoutMs: Number.isFinite(Number(config.taskApiTimeoutMs)) && Number(config.taskApiTimeoutMs) > 0
+      ? Number(config.taskApiTimeoutMs)
+      : DEFAULT_TASK_API_TIMEOUT_MS,
+    // Explicit API settings are intentionally read without adding fields to the
+    // v0.1.7 RPC/typert contract. The manager snapshot is a separate source.
+    apiConfig: normalizeTaskApiConfig(config),
+    manager: config.manager,
+    managerApiConfig: normalizeTaskApiConfig(config.managerApiConfig)
   };
 }
 
@@ -142,7 +176,8 @@ class AutoAdvanceService extends TypertRemoteService {
 
     this.config = normalizeConfig(config);
     const taskFile = taskFileDiagnostics(this.config.tasksPath);
-    this.logger()?.info?.(`sagitta-auto-advance: tasksPath=${this.config.tasksPath} exists=${taskFile.exists} mtime=${taskFile.mtime ?? "null"}`);
+    const taskSource = this.resolveTaskApiConfig()?.source ?? "tasksPath-fallback";
+    this.logger()?.info?.(`sagitta-auto-advance: taskSource=${taskSource} tasksPath=${this.config.tasksPath} exists=${taskFile.exists} mtime=${taskFile.mtime ?? "null"}`);
     this.states = new Map();
     this.listeners = new Set();
     this.persistedModes = this.loadModes();
@@ -259,7 +294,43 @@ class AutoAdvanceService extends TypertRemoteService {
   }
 
   getTasks() {
-    return readTasks(this.config.tasksPath, this.logger());
+    const taskApi = this.resolveTaskApiConfig();
+    if (taskApi === undefined) return readTasks(this.config.tasksPath, this.logger());
+
+    return readTasksFromApi(taskApi, this.config, this.logger()).catch((error) => {
+      this.logger()?.warn?.(`sagitta-auto-advance: task API unavailable; falling back to tasksPath: ${renderError(error)}`);
+      if (this.config.taskFallback) return readTasks(this.config.tasksPath, this.logger());
+      return {
+        path: this.config.tasksPath,
+        updatedAt: null,
+        sections: [],
+        pendingRequests: [],
+        error: "任务 API 暂时不可用，文件 fallback 已关闭"
+      };
+    });
+  }
+
+  /**
+   * Task source priority is deliberately explicit:
+   * complete plugin API config > manager API config > tasksPath file fallback.
+   * The manager is read again for each panel refresh, matching memory's
+   * runtime configuration behavior; the apply-time snapshot is only used when
+   * the manager object has no callable getter at service construction time.
+   */
+  resolveTaskApiConfig() {
+    const explicit = completeTaskApiConfig(this.config.apiConfig);
+    if (explicit !== undefined) return { ...explicit, source: "explicit-api" };
+
+    const manager = this.config.manager ?? this.ctx?.["sagitta-manager"];
+    if (typeof manager?.getApiConfig === "function") {
+      const currentManager = completeTaskApiConfig(readManagerApiConfig(manager));
+      if (currentManager !== undefined) return { ...currentManager, source: "manager-api" };
+      return undefined;
+    }
+
+    const startupManager = completeTaskApiConfig(this.config.managerApiConfig);
+    if (startupManager !== undefined) return { ...startupManager, source: "manager-api" };
+    return undefined;
   }
 
   stateFor(agent) {
@@ -462,6 +533,73 @@ class AutoAdvanceService extends TypertRemoteService {
 
 function agentFollowup(agent, message) {
   agent.followup(message);
+}
+
+function taskApiUrl(workerApiUrl) {
+  const baseUrl = workerApiUrl.replace(/\/+$/u, "");
+  const url = new URL(`${baseUrl}/task`);
+  url.searchParams.set("checkbox", "1");
+  url.searchParams.set("status", "open");
+  return url;
+}
+
+function taskApiUpdatedAt(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function mapApiTask(item) {
+  const titleValue = item?.title ?? item?.text;
+  const title = cleanMarkdown(typeof titleValue === "string" ? titleValue : "") || "未命名需求";
+  const body = typeof item?.body === "string" ? cleanMarkdown(item.body) : "";
+  return { title, hasCheckbox: true, body };
+}
+
+function mapApiTaskSnapshot(items, tasksPath) {
+  let updatedAt = null;
+  const pendingRequests = items.map((item) => {
+    const itemUpdatedAt = taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt);
+    if (itemUpdatedAt !== null && (updatedAt === null || itemUpdatedAt > updatedAt)) updatedAt = itemUpdatedAt;
+    return mapApiTask(item);
+  });
+  return { path: tasksPath, updatedAt, sections: [], pendingRequests };
+}
+
+async function readTasksFromApi(apiConfig, config, logger) {
+  const url = taskApiUrl(apiConfig.workerApiUrl);
+  const signal = typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(config.taskApiTimeoutMs) : undefined;
+  let response;
+  try {
+    response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${apiConfig.d1ReadToken}`
+      },
+      signal
+    });
+  } catch (error) {
+    throw new Error(`请求失败：${renderError(error)}`);
+  }
+
+  const status = Number(response?.status);
+  const successful = response?.ok === true || (Number.isInteger(status) && status >= 200 && status < 300);
+  if (!successful) throw new Error(`HTTP ${Number.isInteger(status) ? status : "未知"}`);
+
+  let payload;
+  try {
+    const rawBody = typeof response.text === "function" ? await response.text() : await response.json();
+    payload = typeof rawBody === "string" ? JSON.parse(rawBody) : rawBody;
+  } catch {
+    throw new Error("响应不是合法 JSON");
+  }
+  if (!isRecord(payload) || payload.ok !== true || !isRecord(payload.data) || !Array.isArray(payload.data.items)) {
+    throw new Error("响应不符合 {ok:true,data:{items}} 契约");
+  }
+  logger?.debug?.(`sagitta-auto-advance: task API returned ${payload.data.items.length} open checkbox item(s)`);
+  return mapApiTaskSnapshot(payload.data.items, config.tasksPath);
 }
 
 function readTasks(path, logger) {
