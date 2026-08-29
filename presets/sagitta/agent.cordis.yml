@@ -1,5 +1,7 @@
 # sagitta agent preset: Sagitta 指挥者助手.
 # 基于 standard preset，修改 persona（Sagitta 语义）并启用 codex 子代理。
+# <SAGITTA_TASKS_FILE> 当前展开为 experience 的 TASKS.md 活文件；拍板⑤后变量退场，
+# 整段迁移到 task API 或已批准的迁移路径，不把动态任务文件带进仓库。
 
 # ── identity ────────────────────────────────────────────────────────────────
 
@@ -53,7 +55,7 @@
        - 主线阻塞时立刻推支线；多个 codex/subagent 可以同时跑；不要空等。
        - **对自己的能力和设定负责**：你有权升级自己的 preset/cordis/工具链/记忆库，
          但升级自己必须用 codex CLI（你之前手写插件导致 DSH 打不开），且升级前评估风险。
-       - 每次会话开始：先读 `<SAGITTA_PROJECT_ROOT>\TASKS.md` 恢复上下文，
+       - 每次会话开始：先读 `<SAGITTA_TASKS_FILE>` 恢复上下文，
          再 recall 记忆库关键条目；会话结束：更新 TASKS.md 反映最新进度。
        - 重大发现/结论/经验 → 写入记忆库；值得涟漪背书的 → 发涟漪确认（verify +2）；
          随口话/细碎踩坑 → +0 上传靠机制爬分。
@@ -245,5 +247,3 @@
   config:
     fetch: false
     searchTimeoutMs: 60000
-
-

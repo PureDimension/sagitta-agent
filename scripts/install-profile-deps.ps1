@@ -1,7 +1,21 @@
+<#
+  tasksPath contract (before Ripple decision ⑤):
+  - An explicit -TasksPath wins.
+  - Otherwise, a non-empty tasksPath already present in the profile patch is
+    preserved semantically, so reinstalling the profile is idempotent.
+  - A new profile uses the temporary D:\workspace\sagitta-experience\TASKS.md
+    fact-source path. This is intentionally not derived from RepoPath and is
+    expected to migrate to the task API after decision ⑤.
+
+  statePath is runtime state, not repository content. New installs keep it in
+  the profile directory so updater git pulls cannot collide with it; this
+  follows the existing auto-advance contract that an explicit statePath wins.
+#>
 [CmdletBinding()]
 param(
     [string]$ProfilePath = '',
     [string]$RepoPath = '',
+    [string]$TasksPath = '',
     [switch]$DryRun
 )
 
@@ -39,6 +53,40 @@ function Get-PatchId {
     $match = [regex]::Match($Line, '^-\s+id:\s*(?:''([^'']+)''|"([^"]+)"|([^\s#]+))\s*(?:#.*)?$')
     if (-not $match.Success) { return $null }
     foreach ($index in 1..3) { if ($match.Groups[$index].Success) { return $match.Groups[$index].Value } }
+    return $null
+}
+
+function Get-PatchConfigValue {
+    param(
+        [AllowNull()][string]$Text,
+        [string]$PatchId,
+        [string]$Key
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+
+    $lines = @($Text -split "`r?`n")
+    $keyPattern = [regex]::Escape($Key)
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ((Get-PatchId $lines[$index]) -ne $PatchId) { continue }
+        $end = $index + 1
+        while ($end -lt $lines.Count -and $null -eq (Get-PatchId $lines[$end])) { $end++ }
+        for ($entryIndex = $index + 1; $entryIndex -lt $end; $entryIndex++) {
+            $line = $lines[$entryIndex]
+            $singleQuoted = [regex]::Match($line, "^\s*$keyPattern\s*:\s*'((?:''|[^'])*)'(?:\s+#.*)?$")
+            if ($singleQuoted.Success) { return $singleQuoted.Groups[1].Value -replace "''", "'" }
+
+            $doubleQuoted = [regex]::Match($line, ('^\s*' + $keyPattern + '\s*:\s*"((?:\\.|[^"])*)"(?:\s+#.*)?$'))
+            if ($doubleQuoted.Success) { return $doubleQuoted.Groups[1].Value }
+
+            $plain = [regex]::Match($line, "^\s*$keyPattern\s*:\s*(?<value>[^#]*?)\s*(?:#.*)?$")
+            if ($plain.Success) {
+                $value = $plain.Groups['value'].Value.Trim()
+                if ($value -and $value -notin @('null', '~')) { return $value }
+                return $null
+            }
+        }
+        return $null
+    }
     return $null
 }
 
@@ -214,10 +262,22 @@ if ($packageBefore -ne $packageAfter) {
     Write-Host "[install-profile-deps] unchanged $packageJsonPath"
 }
 
+$existingPatch = if (Test-Path -LiteralPath $patchPath -PathType Leaf) { Get-Content -LiteralPath $patchPath -Raw -Encoding UTF8 } else { '' }
+$existingTasksPath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-auto-advance' -Key 'tasksPath'
+$effectiveTasksPath = if (-not [string]::IsNullOrWhiteSpace($TasksPath)) {
+    $TasksPath
+} elseif (-not [string]::IsNullOrWhiteSpace($existingTasksPath)) {
+    $existingTasksPath
+} else {
+    # Temporary fact-source contract until Ripple decision ⑤ moves the panel
+    # from TASKS.md fallback to the manager-backed task API.
+    'D:\workspace\sagitta-experience\TASKS.md'
+}
+
 $repoPathYaml = Quote-Yaml $RepoPath
 $profilePathYaml = Quote-Yaml (Join-Path $ProfilePath '')
-$statePathYaml = Quote-Yaml (Join-Path $RepoPath '.sagitta-auto-advance.json')
-$tasksPathYaml = Quote-Yaml (Join-Path $RepoPath 'TASKS.md')
+$statePathYaml = Quote-Yaml (Join-Path $ProfilePath '.sagitta-auto-advance.json')
+$tasksPathYaml = Quote-Yaml $effectiveTasksPath
 $dshHomeFromProfile = Split-Path -Parent (Split-Path -Parent $ProfilePath)
 $presetTargetYaml = Quote-Yaml (Join-Path $dshHomeFromProfile '.agent-presets\sagitta')
 $patchEntries = [ordered]@{
@@ -260,7 +320,6 @@ $patchEntries = [ordered]@{
     )
 }
 
-$existingPatch = if (Test-Path -LiteralPath $patchPath -PathType Leaf) { Get-Content -LiteralPath $patchPath -Raw -Encoding UTF8 } else { '' }
 $updatedPatch = Upsert-PatchEntries -Text $existingPatch -Entries $patchEntries
 if ($updatedPatch -ne $existingPatch) {
     if ($DryRun) {

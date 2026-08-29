@@ -11,9 +11,14 @@ const MARKER_FILE = ".sagitta-managed.json";
 
 const defaultFs = { mkdir, readFile, rename, rm, stat, writeFile };
 const requireFromUpdater = createRequire(import.meta.url);
-// Keep these names in lockstep with scripts/sync-preset.ps1. Unknown names
-// are intentionally left in the text and reported as warnings.
+// Keep this variable table in lockstep with $templateVariables in
+// scripts/sync-preset.ps1.
+// SAGITTA_TASKS_FILE is the external live task fact source before Ripple
+// decision ⑤; afterward retire it and move the whole instruction to the
+// task API or an approved migration path.
+// Unknown names are intentionally left in the text and reported as warnings.
 const TEMPLATE_PATTERN = /<([^<>]+)>/g;
+const DEFAULT_SAGITTA_TASKS_FILE = "D:\\workspace\\sagitta-experience\\TASKS.md";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -32,7 +37,11 @@ function templateDshHome(dshHome, userProfile) {
     path.join(templateUserProfile(userProfile), ".dsh");
 }
 
-function getPresetTemplateVariables({ repoPath, dshHome, userProfile } = {}) {
+function templateTasksFile(tasksFile) {
+  return text(tasksFile) || DEFAULT_SAGITTA_TASKS_FILE;
+}
+
+function getPresetTemplateVariables({ repoPath, dshHome, userProfile, tasksFile } = {}) {
   const variables = {};
   const repository = text(repoPath);
   if (repository !== undefined) {
@@ -41,6 +50,7 @@ function getPresetTemplateVariables({ repoPath, dshHome, userProfile } = {}) {
   }
   variables.USERPROFILE = templateUserProfile(userProfile);
   variables.DSH_HOME = templateDshHome(dshHome, userProfile);
+  variables.SAGITTA_TASKS_FILE = templateTasksFile(tasksFile);
   return variables;
 }
 
@@ -48,10 +58,11 @@ function expandPresetTemplate(source, {
   repoPath,
   dshHome,
   userProfile,
+  tasksFile,
   sourceName = "preset",
   logger = console
 } = {}) {
-  const variables = getPresetTemplateVariables({ repoPath, dshHome, userProfile });
+  const variables = getPresetTemplateVariables({ repoPath, dshHome, userProfile, tasksFile });
   const warnings = [];
   const expanded = source.replace(TEMPLATE_PATTERN, (match, name) => {
     if (Object.prototype.hasOwnProperty.call(variables, name)) return variables[name];
@@ -166,6 +177,7 @@ async function validatePresetSource(sourceDir, {
   repoPath,
   dshHome,
   userProfile,
+  tasksFile,
   logger = console,
   resolvePlugin = defaultResolvePlugin,
   fsOps = defaultFs
@@ -178,6 +190,7 @@ async function validatePresetSource(sourceDir, {
     repoPath,
     dshHome,
     userProfile,
+    tasksFile,
     sourceName: COMPOSITION_FILE,
     logger
   });
@@ -213,6 +226,7 @@ async function validatePresetSource(sourceDir, {
       repoPath,
       dshHome,
       userProfile,
+      tasksFile,
       sourceName: METADATA_FILE,
       logger
     });
@@ -284,6 +298,7 @@ async function syncPreset({
   repoPath,
   dshHome,
   userProfile,
+  tasksFile,
   logger = console,
   force = false,
   resolvePlugin,
@@ -294,6 +309,7 @@ async function syncPreset({
     repoPath,
     dshHome,
     userProfile,
+    tasksFile,
     logger,
     resolvePlugin,
     fsOps

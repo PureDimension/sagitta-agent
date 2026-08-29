@@ -34,6 +34,20 @@ pwsh -NoProfile -File .\scripts\install.ps1 -DryRun
 
 可用 `DSH_HOME` 覆盖 DSH 用户根目录、`SAGITTA_AGENT_DIR` 覆盖源码目录、`SAGITTA_DSH_ROOT` 覆盖 DSH 安装根目录。已有 DSH 时不会重新拉取；已有 profile、settings 和用户 preset 不会被粗暴覆盖，所有实际修改前都会生成 `.bak.<timestamp>`。
 
+### Preset 模板变量
+
+同步前，PS 与 Node 两侧都会展开以下五个变量；两侧变量表保持 lockstep：
+
+| 变量 | 当前语义 |
+| --- | --- |
+| `<SAGITTA_PROJECT_ROOT>` | Sagitta 源码仓库路径 |
+| `<SAGITTA_AGENT_DIR>` | Sagitta 源码目录（当前与项目根相同） |
+| `<USERPROFILE>` | 当前 Windows 用户目录 |
+| `<DSH_HOME>` | DSH 用户根目录 |
+| `<SAGITTA_TASKS_FILE>` | 拍板⑤前默认值为 `D:\workspace\sagitta-experience\TASKS.md`，即仓库外的动态任务事实源；拍板⑤后变量退场，整段切 task API 或批准的迁移路径 |
+
+`SAGITTA_TASKS_FILE` 刻意不指向仓库内的 `TASKS.md`：该文件是涟漪的日常动态事实源，不进 `sagitta-agent` 仓库。
+
 ## 配置
 
 启动 DSH：

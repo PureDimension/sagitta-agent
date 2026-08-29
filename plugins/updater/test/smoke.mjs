@@ -93,22 +93,23 @@ test("preset template expansion resolves paths before hashing and warns on unkno
   try {
     await mkdir(sourceDir, { recursive: true });
     await writeFile(path.join(sourceDir, "agent.cordis.yml"), [
-      "# <SAGITTA_AGENT_DIR> and <DSH_HOME> are also part of the template contract.",
+      "# <SAGITTA_PROJECT_ROOT> <SAGITTA_AGENT_DIR> and <DSH_HOME> are also part of the template contract.",
       "- id: persona",
       "  name: '@deepseek-ai/dsh-persona'",
       "  config:",
       "    text: >-",
-      "      Read <SAGITTA_PROJECT_ROOT>\\TASKS.md and <USERPROFILE>\\.ssh\\config.",
+      "      Read <SAGITTA_TASKS_FILE> and <USERPROFILE>\\.ssh\\config.",
       "      Unknown value: <UNKNOWN_TEMPLATE>",
       ""
     ].join("\n"), "utf8");
     await writeFile(path.join(sourceDir, "preset.yml"), "name: sagitta\ndescription: smoke\norder: 1\n", "utf8");
 
     const directExpansion = expandPresetTemplate(
-      "<SAGITTA_PROJECT_ROOT>\\TASKS.md <USERPROFILE>\\.ssh\\config <UNKNOWN_TEMPLATE>",
+      "<SAGITTA_PROJECT_ROOT> <SAGITTA_AGENT_DIR> <SAGITTA_TASKS_FILE> <USERPROFILE>\\.ssh\\config <UNKNOWN_TEMPLATE>",
       { repoPath, dshHome, logger: { warn: (message) => warnings.push(message) } }
     );
-    assert.equal(directExpansion.content, `${repoPath}\\TASKS.md ${process.env.USERPROFILE || os.homedir()}\\.ssh\\config <UNKNOWN_TEMPLATE>`);
+    const expectedTasksFile = "D:\\workspace\\sagitta-experience\\TASKS.md";
+    assert.equal(directExpansion.content, `${repoPath} ${repoPath} ${expectedTasksFile} ${process.env.USERPROFILE || os.homedir()}\\.ssh\\config <UNKNOWN_TEMPLATE>`);
     assert.deepEqual(directExpansion.warnings, ["UNKNOWN_TEMPLATE"]);
 
     const result = await syncPreset({
@@ -125,11 +126,11 @@ test("preset template expansion resolves paths before hashing and warns on unkno
     assert.deepEqual(result.templateWarnings, ["UNKNOWN_TEMPLATE"]);
 
     const targetComposition = await readFile(path.join(targetDir, "agent.cordis.yml"), "utf8");
-    assert.ok(targetComposition.includes(path.join(repoPath, "TASKS.md")));
+    assert.ok(targetComposition.includes(expectedTasksFile));
     assert.ok(targetComposition.includes(path.join(process.env.USERPROFILE || os.homedir(), ".ssh", "config")));
     assert.ok(targetComposition.includes(repoPath));
     assert.ok(targetComposition.includes(dshHome));
-    assert.doesNotMatch(targetComposition, /<SAGITTA_PROJECT_ROOT>|<USERPROFILE>/);
+    assert.doesNotMatch(targetComposition, /<SAGITTA_PROJECT_ROOT>|<SAGITTA_AGENT_DIR>|<SAGITTA_TASKS_FILE>|<USERPROFILE>/);
     assert.match(targetComposition, /<UNKNOWN_TEMPLATE>/);
     assert.equal(warnings.filter((message) => message.includes("UNKNOWN_TEMPLATE")).length, 2);
 

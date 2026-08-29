@@ -2,6 +2,7 @@
 param(
     [string]$DshHome = '',
     [string]$RepoPath = '',
+    [string]$TasksFile = '',
     [string]$PresetId = 'sagitta',
     [switch]$ForceSyncPreset,
     [switch]$DryRun
@@ -144,12 +145,25 @@ $userProfile = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
 } else {
     [IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile'))
 }
+$TasksFile = if (-not [string]::IsNullOrWhiteSpace($TasksFile)) {
+    [IO.Path]::GetFullPath($TasksFile)
+} else {
+    # Temporary seam: before Ripple decision ⑤ this is the external live
+    # fact source; afterward retire this variable and move the whole
+    # instruction to the task API or an approved migration path.
+    'D:\workspace\sagitta-experience\TASKS.md'
+}
 $templateVariables = [ordered]@{
-    # Keep these names in lockstep with plugins/updater/lib/preset.js.
+    # Keep this variable table in lockstep with getPresetTemplateVariables in
+    # plugins/updater/lib/preset.js.
+    # SAGITTA_TASKS_FILE is the external live task fact source before Ripple
+    # decision ⑤; afterward retire it and move the whole instruction to the
+    # task API or an approved migration path.
     SAGITTA_PROJECT_ROOT = $RepoPath
     SAGITTA_AGENT_DIR    = $RepoPath
     USERPROFILE          = $userProfile
     DSH_HOME             = $DshHome
+    SAGITTA_TASKS_FILE   = $TasksFile
 }
 
 foreach ($fileName in $sourceFiles) {

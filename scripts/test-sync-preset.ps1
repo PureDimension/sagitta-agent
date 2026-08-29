@@ -25,12 +25,12 @@ $syncScript = Join-Path $PSScriptRoot 'sync-preset.ps1'
 try {
     New-Item -ItemType Directory -Force -Path $sourceDir | Out-Null
     $agentSource = @'
-# <SAGITTA_AGENT_DIR> and <DSH_HOME> are also part of the template contract.
+# <SAGITTA_PROJECT_ROOT> <SAGITTA_AGENT_DIR> and <DSH_HOME> are also part of the template contract.
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
     text: >-
-      Read <SAGITTA_PROJECT_ROOT>\TASKS.md and <USERPROFILE>\.ssh\config.
+      Read <SAGITTA_TASKS_FILE> and <USERPROFILE>\.ssh\config.
       Unknown value: <UNKNOWN_TEMPLATE>
 '@
     $metadataSource = @'
@@ -53,12 +53,15 @@ order: 1
     } else {
         [IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile'))
     }
+    $expectedTasksFile = 'D:\workspace\sagitta-experience\TASKS.md'
     $targetContent = Get-Content -LiteralPath (Join-Path $targetDir 'agent.cordis.yml') -Raw -Encoding UTF8
-    Assert-True $targetContent.Contains((Join-Path $expectedRepo 'TASKS.md')) 'project root is expanded in PS output'
+    Assert-True $targetContent.Contains($expectedTasksFile) 'SAGITTA_TASKS_FILE is expanded in PS output'
     Assert-True $targetContent.Contains((Join-Path $expectedUserProfile '.ssh\config')) 'user profile is expanded in PS output'
     Assert-True $targetContent.Contains($expectedRepo) 'SAGITTA_AGENT_DIR is expanded in PS output'
     Assert-True $targetContent.Contains($expectedDshHome) 'DSH_HOME is expanded in PS output'
     Assert-True (-not $targetContent.Contains('<SAGITTA_PROJECT_ROOT>')) 'project root placeholder is absent from PS output'
+    Assert-True (-not $targetContent.Contains('<SAGITTA_AGENT_DIR>')) 'agent dir placeholder is absent from PS output'
+    Assert-True (-not $targetContent.Contains('<SAGITTA_TASKS_FILE>')) 'tasks file placeholder is absent from PS output'
     Assert-True (-not $targetContent.Contains('<USERPROFILE>')) 'user profile placeholder is absent from PS output'
     Assert-True $targetContent.Contains('<UNKNOWN_TEMPLATE>') 'unknown placeholder is preserved in PS output'
 
