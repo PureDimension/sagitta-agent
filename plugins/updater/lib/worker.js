@@ -70,9 +70,15 @@ async function healthResponseIsOk(response) {
   if (!response || response.ok !== true || typeof response.json !== "function") return false;
   try {
     const body = await response.json();
+    // New workers report the configured verifier as auth_mode (auth_token or
+    // d1); keep auth_token=true as a compatibility path for older workers.
+    const authMode = body?.env?.auth_mode;
+    const authConfigured = authMode === "auth_token" || authMode === "d1"
+      ? true
+      : authMode === undefined && body?.env?.auth_token === true;
     return body?.ok === true &&
       typeof body.version === "string" && body.version.length > 0 &&
-      body.env?.db === true && body.env?.auth_token === true;
+      body.env?.db === true && authConfigured;
   } catch {
     return false;
   }
@@ -88,6 +94,15 @@ async function runWrangler({ repoPath, workerConfigPath, exec = execCommand }) {
     encoding: "utf8"
   });
   return { status: "deployed", mode: "wrangler" };
+}
+
+function resolveWorkerConfig(config = {}, env = process.env) {
+  return {
+    workerApiUrl: nonEmptyString(config?.workerApiUrl) || nonEmptyString(env?.SAGITTA_WORKER_API_URL),
+    workerUploadToken: nonEmptyString(config?.workerUploadToken) || nonEmptyString(env?.CLOUDFLARE_API_TOKEN),
+    accountId: nonEmptyString(config?.accountId ?? config?.cfAccountId) || nonEmptyString(env?.CF_ACCOUNT_ID),
+    scriptName: nonEmptyString(config?.scriptName ?? config?.cfScriptName) || nonEmptyString(env?.CF_SCRIPT_NAME)
+  };
 }
 
 /**
@@ -110,9 +125,9 @@ async function deployWorker({
   allowWranglerFallback = true,
   healthCheck = true
 }) {
-  const apiUrl = nonEmptyString(workerApiUrl) || nonEmptyString(env?.SAGITTA_WORKER_API_URL);
-  const uploadToken =
-    nonEmptyString(workerUploadToken) || nonEmptyString(env?.CLOUDFLARE_API_TOKEN);
+  const workerConfig = resolveWorkerConfig({ workerApiUrl, workerUploadToken, accountId, scriptName }, env);
+  const apiUrl = workerConfig.workerApiUrl;
+  const uploadToken = workerConfig.workerUploadToken;
   if (!apiUrl || !uploadToken) {
     return { status: "skipped", reason: "manager-api-not-configured" };
   }
@@ -130,8 +145,9 @@ async function deployWorker({
     return { status: "skipped", reason: "worker-source-or-config-missing" };
   }
 
-  const resolvedAccountId = nonEmptyString(accountId) || nonEmptyString(env?.CF_ACCOUNT_ID);
-  const resolvedScriptName = nonEmptyString(scriptName) || deploymentConfig.name;
+  const resolvedAccountId = workerConfig.accountId;
+  const configuredScriptName = workerConfig.scriptName;
+  const resolvedScriptName = configuredScriptName || (deploymentConfig.hasPlaceholders ? undefined : deploymentConfig.name);
   let directFailure = false;
 
   if (resolvedAccountId && resolvedScriptName) {
@@ -188,6 +204,7 @@ export {
   healthUrl,
   parseTomlString,
   parseWorkerConfig,
+  resolveWorkerConfig,
   runWrangler,
   sourceSha,
   workerSourcePath

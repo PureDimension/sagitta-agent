@@ -51,6 +51,15 @@ function renderError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function safeLog(loggerOrGetter, level, message) {
+  try {
+    const logger = typeof loggerOrGetter === "function" ? loggerOrGetter() : loggerOrGetter;
+    logger?.[level]?.(message);
+  } catch {
+    // Diagnostics must never affect plugin startup or timer recovery.
+  }
+}
+
 function nonEmptyString(value) {
   if (typeof value !== "string") return undefined;
   const result = value.trim();
@@ -177,7 +186,7 @@ class AutoAdvanceService extends TypertRemoteService {
     this.config = normalizeConfig(config);
     const taskFile = taskFileDiagnostics(this.config.tasksPath);
     const taskSource = this.resolveTaskApiConfig()?.source ?? "tasksPath-fallback";
-    this.logger()?.info?.(`sagitta-auto-advance: taskSource=${taskSource} tasksPath=${this.config.tasksPath} exists=${taskFile.exists} mtime=${taskFile.mtime ?? "null"}`);
+    safeLog(() => this.logger(), "info", `sagitta-auto-advance: taskSource=${taskSource} tasksPath=${this.config.tasksPath} exists=${taskFile.exists} mtime=${taskFile.mtime ?? "null"}`);
     this.states = new Map();
     this.listeners = new Set();
     this.persistedModes = this.loadModes();
@@ -421,34 +430,56 @@ class AutoAdvanceService extends TypertRemoteService {
   }
 
   onTimer(state, generation) {
-    if (state.timerGeneration !== generation) return;
-    state.timer = undefined;
-    if (!this.readyToDrive(state)) {
-      state.idleSince = null;
-      this.broadcast(state, "timer-not-ready");
-      return;
-    }
-
-    const message = createUserMessage({
-      content: [{ type: "text", text: AUTONOMOUS_PROMPT }],
-      source: {
-        kind: "plugin",
-        plugin: PLUGIN_ID,
-        form: "notice",
-        summary: "idle timeout autonomous continuation"
-      }
-    });
-    state.lastAutoMessageId = message.id;
-    state.injectedAt = Date.now();
-    state.idleSince = null;
+    let queueAttempted = false;
     try {
+      if (state.timerGeneration !== generation) return;
+      state.timer = undefined;
+      if (!this.readyToDrive(state)) {
+        state.idleSince = null;
+        this.broadcast(state, "timer-not-ready");
+        return;
+      }
+
+      const message = createUserMessage({
+        content: [{ type: "text", text: AUTONOMOUS_PROMPT }],
+        source: {
+          kind: "plugin",
+          plugin: PLUGIN_ID,
+          form: "notice",
+          summary: "idle timeout autonomous continuation"
+        }
+      });
+      state.lastAutoMessageId = message.id;
+      state.injectedAt = Date.now();
+      state.idleSince = null;
+      queueAttempted = true;
       agentFollowup(state.agent, message);
       this.broadcast(state, "injected");
     } catch (error) {
-      state.lastAutoMessageId = undefined;
-      this.logger()?.warn?.(`sagitta-auto-advance: could not queue continuation for agent "${state.agent.id}": ${renderError(error)}`);
-      this.broadcast(state, "queue-failed");
-      this.maybeArm(state);
+      try {
+        state.lastAutoMessageId = undefined;
+        state.idleSince = null;
+      } catch {
+        // Keep the timer callback contained even for an invalid state object.
+      }
+      const reason = queueAttempted ? "could not queue continuation" : "timer callback failed";
+      safeLog(() => this.logger(), "warn", `sagitta-auto-advance: ${reason} for agent "${state.agent?.id ?? "unknown"}": ${renderError(error)}`);
+      try {
+        this.broadcast(state, queueAttempted ? "queue-failed" : "timer-failed");
+      } catch (broadcastError) {
+        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: timer recovery broadcast failed: ${renderError(broadcastError)}`);
+      }
+      try {
+        this.maybeArm(state);
+      } catch (recoveryError) {
+        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: timer recovery failed: ${renderError(recoveryError)}`);
+      }
+    } finally {
+      try {
+        if (state.timerGeneration === generation) state.timer = undefined;
+      } catch (error) {
+        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: timer cleanup failed: ${renderError(error)}`);
+      }
     }
   }
 

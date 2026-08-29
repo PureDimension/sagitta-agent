@@ -48,6 +48,30 @@ export class HttpTimeoutError extends Error {
   }
 }
 
+function isLoopbackHostname(hostname) {
+  const value = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (value === "localhost" || value === "::1") return true;
+  return net.isIP(value) === 4 && value.startsWith("127.");
+}
+
+function validateUrl(url, { allowQuery = true } = {}) {
+  const u = new URL(url);
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new Error("仅支持 https / http 目标（https=workers.dev 生产；http=本地 loopback 测试桩）");
+  }
+  if (u.username || u.password) throw new Error("目标 URL 不得包含 userinfo");
+  if (u.hash) throw new Error("目标 URL 不得包含 fragment");
+  if (!allowQuery && u.search) throw new Error("基础 URL 不得包含 query");
+  if (u.protocol === "http:" && !isLoopbackHostname(u.hostname)) {
+    throw new Error("非 loopback HTTP 目标必须使用 HTTPS");
+  }
+  return u;
+}
+
+export function validateBaseUrl(url) {
+  return validateUrl(url, { allowQuery: false });
+}
+
 // ---- 响应解析（仅代理隧道返回的原始字节需要手写解析） -----------------------
 
 /**
@@ -117,12 +141,9 @@ function decodeChunked(buf) {
  */
 export async function request(opts) {
   const { method = "GET", url, headers = {}, body, timeoutMs = 20000, signal, proxy } = opts;
-  const u = new URL(url);
+  const u = validateUrl(url);
   // https：生产路径（workers.dev，可走 CONNECT 代理隧道）；
-  // http：本地路径（wrangler dev / 本地冒烟桩），直连不走代理。
-  if (u.protocol !== "https:" && u.protocol !== "http:") {
-    throw new Error("仅支持 https / http 目标（https=workers.dev 生产；http=本地 wrangler dev / 本地测试桩）");
-  }
+  // http：仅允许 loopback 本地路径（wrangler dev / 本地冒烟桩），直连不走代理。
   const targetHost = u.hostname;
   const targetPort = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
 

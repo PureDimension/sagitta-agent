@@ -4,7 +4,7 @@ import { normalizeUpdaterConfig } from "./config.js";
 import { runUpdateCheck } from "./git.js";
 import { installProfileDependencies } from "./install.js";
 import { syncPreset } from "./preset.js";
-import { deployWorker } from "./worker.js";
+import { deployWorker, resolveWorkerConfig } from "./worker.js";
 
 const REQUIRED_REPOSITORY_DIRS = ["plugins", "presets", "worker", "scripts"];
 
@@ -148,25 +148,25 @@ async function runStartupMaintenance({
     try {
       apiConfig = await service.getApiConfig();
     } catch {
-      report("manager-config-failed", "Sagitta Manager 配置读取失败，Worker 更新已跳过");
+      report("manager-config-failed", "Sagitta Manager 配置读取失败，Worker 将尝试使用环境变量配置");
     }
   } else {
-    report("manager-unavailable", "Sagitta Manager service 不可用，Worker 更新已跳过");
+    report("manager-unavailable", "Sagitta Manager service 不可用，Worker 将尝试使用环境变量配置");
   }
 
+  const workerConfig = resolveWorkerConfig(apiConfig, env);
   let workerResult = { status: "not-run", changed: false };
   if (!config.workerUpdate) {
     workerResult = { status: "skipped", reason: "worker-update-disabled" };
     report("worker-update-disabled", "Worker 自动更新已关闭");
-  } else if (!apiConfig?.workerApiUrl || !apiConfig?.workerUploadToken) {
+  } else if (!workerConfig.workerApiUrl || !workerConfig.workerUploadToken) {
     workerResult = { status: "skipped", reason: "manager-api-not-configured" };
-    report("worker-not-configured", "Worker 未配置；请到 Plugins > Sagitta Manager 配置");
+    report("worker-not-configured", "Worker 未配置；请到 Plugins > Sagitta Manager 配置或设置环境变量");
   } else {
     try {
       workerResult = await deploy({
         repoPath: config.repoPath,
-        workerApiUrl: apiConfig.workerApiUrl,
-        workerUploadToken: apiConfig.workerUploadToken,
+        ...workerConfig,
         workerConfigPath: config.workerConfigPath,
         env,
         ...workerOptions

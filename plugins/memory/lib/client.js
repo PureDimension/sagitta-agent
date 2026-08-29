@@ -21,7 +21,7 @@
 // 本（工具结果、错误消息、日志）。错误消息只给“是否配置 + 掩码尾巴 + 指引”。
 // ============================================================================
 
-import { request, HttpStatusError, HttpNetworkError, HttpTimeoutError } from "./http.js";
+import { request, validateBaseUrl, HttpStatusError, HttpNetworkError, HttpTimeoutError } from "./http.js";
 
 /** 服务端返回的业务错误（{ok:false, error:{code,message}} 已解包）。 */
 export class MemoryApiError extends Error {
@@ -226,7 +226,13 @@ export class SagittaMemoryClient {
     if (!runtime.baseUrl || (!runtime.auth.accessPresent && !runtime.auth.bearerPresent)) {
       throw missingConfigurationError(operation, runtime);
     }
-    const url = runtime.baseUrl + path + (query ? buildQuery(query) : "");
+    let url;
+    try {
+      const baseUrl = validateBaseUrl(runtime.baseUrl).toString().replace(/\/+$/, "");
+      url = baseUrl + path + (query ? buildQuery(query) : "");
+    } catch (err) {
+      throw translateFailure(err, { proxy: runtime.proxy, timeoutMs: runtime.timeoutMs });
+    }
     let response;
     try {
       response = await request({

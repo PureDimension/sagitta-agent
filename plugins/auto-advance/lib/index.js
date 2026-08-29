@@ -6,8 +6,8 @@ const inject = ["agents", "goals", "sessions"];
 
 const Config = z.object({
   idleTimeoutMs: z.number().default(300000).description("Idle duration before an automatic continuation is injected."),
-  statePath: z.string().description("JSON file used to persist the per-session mode. Defaults to the resolved Sagitta workspace."),
-  tasksPath: z.string().description("Read-only Markdown task file shown by the client panel. Defaults to the resolved Sagitta workspace.")
+  statePath: z.string().optional().description("JSON file used to persist the per-session mode. Defaults to the resolved Sagitta workspace."),
+  tasksPath: z.string().optional().description("Read-only Markdown task file shown by the client panel. Defaults to the resolved Sagitta workspace.")
 });
 
 function apply(ctx, config) {
