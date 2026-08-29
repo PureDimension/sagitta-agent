@@ -110,8 +110,9 @@ async function deployWorker({
   allowWranglerFallback = true,
   healthCheck = true
 }) {
-  const apiUrl = nonEmptyString(workerApiUrl);
-  const uploadToken = nonEmptyString(workerUploadToken);
+  const apiUrl = nonEmptyString(workerApiUrl) || nonEmptyString(env?.SAGITTA_WORKER_API_URL);
+  const uploadToken =
+    nonEmptyString(workerUploadToken) || nonEmptyString(env?.CLOUDFLARE_API_TOKEN);
   if (!apiUrl || !uploadToken) {
     return { status: "skipped", reason: "manager-api-not-configured" };
   }
