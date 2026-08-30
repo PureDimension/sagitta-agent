@@ -1,0 +1,11 @@
+{
+  "name": "@sagitta/codex-dispatch",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Sagitta codex 派单插件：codex 任务注册/监控/自动回收，与 auto-advance 自主推进协作",
+  "main": "lib/index.js",
+  "dependencies": {},
+  "scripts": {
+    "check": "node --check lib/index.js"
+  }
+}

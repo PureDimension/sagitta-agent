@@ -232,17 +232,19 @@ $plugins = [ordered]@{
     '@sagitta/memory'        = 'plugins\memory'
     '@sagitta/auto-advance'  = 'plugins\auto-advance'
     '@sagitta/updater'       = 'plugins\updater'
+    '@sagitta/codex-dispatch' = 'plugins\codex-dispatch'
 }
 $bundleNames = @(
     '@sagitta/manager'
     '@sagitta/memory'
     '@sagitta/auto-advance'
     '@sagitta/updater'
+    '@sagitta/codex-dispatch'
 )
 
 Write-Host "[install-profile-deps] profile: $ProfilePath"
 Write-Host "[install-profile-deps] repository: $RepoPath"
-Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/updater'
+Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/updater, @sagitta/codex-dispatch'
 
 if (-not $DryRun) {
     foreach ($relativePluginPath in $plugins.Values) {
@@ -385,6 +387,11 @@ $patchEntries = [ordered]@{
         "    profileDir: $profilePathYaml"
         "    restartPolicy: 'prompt'"
         '    workerDeploy: true'
+    )
+    'sagitta-codex' = @(
+        '- id: sagitta-codex'
+        '  config:'
+        "    defaultModel: 'gpt-5.6-luna'"
     )
 }
 

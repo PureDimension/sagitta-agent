@@ -378,6 +378,19 @@ class AutoAdvanceService extends TypertRemoteService {
       if (this.ctx.agents.isOwnedBy(candidate.id, agent) && candidate.status === "running") return true;
     }
 
+    // 有界工作注册表（sagitta-codex 插件）：只认"已注册的有界工作"（超时自动回收），
+    // 不再用笼统 jobs.list —— 后台 pwsh/ssh 等未注册任务不会永久卡住自主推进（08-30 修复）。
+    const codexService = this.ctx?.["sagitta-codex"];
+    if (codexService && typeof codexService.listActiveWorks === "function") {
+      try {
+        return codexService.listActiveWorks(agent.id).length > 0;
+      } catch (error) {
+        this.logger()?.warn?.(`sagitta-auto-advance: codex work check failed: ${renderError(error)}`);
+        return true; // 保守：查询失败视为有工作
+      }
+    }
+
+    // 无 codex 插件时回退旧逻辑（jobs.list）
     const jobs = this.ctx.get("jobs");
     if (jobs === undefined || typeof jobs.list !== "function") return false;
     const callers = [undefined, ...this.ctx.agents.list()];
