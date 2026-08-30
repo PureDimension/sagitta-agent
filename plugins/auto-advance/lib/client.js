@@ -290,6 +290,15 @@ window.__ModuleLoader__.load({
     function currentSessionId(ctx) {
       return ctx.sessions.list.getSnapshot().current;
     }
+    /** 当前激活会话的人类可读名：优先会话标题，其次工作目录名，兜底短 id。 */
+    function currentSessionLabel(ctx) {
+      const snapshot = ctx.sessions.list.getSnapshot();
+      const id = snapshot?.current;
+      if (id === undefined) return "未选择";
+      const entry = snapshot?.byId?.[id];
+      const label = entry?.displayTitle ?? entry?.title ?? entry?.cwd;
+      return safeText(label).trim() || shortSessionId(id);
+    }
     function shortSessionId(value) {
       const text = safeText(value).trim();
       return text.length > 8 ? `…${text.slice(-8)}` : text || "未选择";
@@ -420,7 +429,7 @@ window.__ModuleLoader__.load({
           createElement("span", { class: "saa-eyebrow" }, "SAGITTA / AGENT CONTROL"),
           createElement("div", { class: "saa-title" }, "自主推进"),
           createElement("div", { class: "saa-subtitle" }, "只读任务摘要 · 自动跟随悬浮球"),
-          createElement("div", { class: "saa-session" }, `当前作用会话：${shortSessionId(currentSessionId(ctx))}`)
+          createElement("div", { class: "saa-session" }, `当前作用会话：${currentSessionLabel(ctx)}`)
         );
         const actions = createElement("div", { class: "saa-actions" });
         const toggle = createElement("button", { class: "saa-toggle", type: "button", "data-enabled": String(lastState?.enabled === true) }, lastState?.enabled ? "已开启" : "已关闭");
