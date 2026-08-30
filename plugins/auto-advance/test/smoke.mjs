@@ -285,6 +285,7 @@ function protocolHarness() {
   };
   const events = [];
   const service = Object.create(AutoAdvanceService.prototype);
+  service.config = { idleTimeoutMs: 60000 };
   service.ctx = {
     fiber: { state: 2 },
     agents: { get: (id) => id === agent.id ? agent : undefined, list: () => [agent], isOwnedBy: () => false },

@@ -57,9 +57,21 @@ function loggerWarn(ctx, message) {
 }
 
 function asyncWorkFrom(ctx) {
+  // 属性访问 ctx["sagitta-async-work"] 在 cordis 4.0.1 里要求插件在 inject 中声明
+  // 该服务：fiber 链检索 (lib/index.js 680-693) 走到底层 root fiber（runtime=null）
+  // 会抛 "cannot get property ... without inject"。抛错 ≠ 服务缺失，所以属性访问
+  // 单独 try/catch，失败继续走 ctx.get 兜底（不能把两者放同一个 try——否则抛错
+  // 直接跳 catch 返回 undefined，兜底永远执行不到）。
+  let direct;
   try {
-    const direct = ctx?.["sagitta-async-work"];
-    if (direct !== undefined) return direct;
+    direct = ctx?.["sagitta-async-work"];
+  } catch {
+    direct = undefined;
+  }
+  if (direct !== undefined) return direct;
+  // ctx.get(name, false) 走 ReflectService 全局 store（_getImpl），不要求 inject 声明；
+  // strict=false 不校验 provider fiber 状态，是真正的"无 inject 读取"路径。
+  try {
     return typeof ctx?.get === "function" ? ctx.get("sagitta-async-work", false) : undefined;
   } catch {
     return undefined;
