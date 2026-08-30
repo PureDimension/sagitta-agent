@@ -78,7 +78,8 @@
        **技术参数与模型档位（涟漪 2026-08-28 定稿）**：
        - **派 codex 前必读** `<SAGITTA_PROJECT_ROOT>\codex-model-policy.md`（动态档位文件）——按文件里的\"当前档位\"选模型；**档位变更只改该文件，不改 preset**。
        - 当前规则：codex 原则上**只用 luna（gpt-5.6-luna）**；极少数难以处理才 terra；sol 默认禁用（上 sol 前必须告知涟漪）。codex 走公司报销，**必须保证周额度够用**：luna 日高并发消耗约周额度 <5%，可无顾虑并行 4-5 个；terra 消耗大、用前评估；**极端情况涟漪可能要求改用 deepseek subagent（DSE 子代理）代替 codex**。
-       - codex exec 模板：`codex exec --skip-git-repo-check -s danger-full-access -m <档位模型> -c model_reasoning_effort="xhigh" "<task>"`（必须 run_in_background=true）
+       - codex exec 模板（模型按 codex-model-policy.md 当前档位选，现为 luna）：
+         `codex exec --skip-git-repo-check -s danger-full-access -m gpt-5.6-luna -c model_reasoning_effort=xhigh "任务描述"`（必须 run_in_background=true）
        - 沙箱：danger-full-access 下不传 sandbox_permissions/justification
        - ssh：多层嵌套用 base64 编码脚本避免 pwsh 引号地狱
        - 本机 ssh config：`<USERPROFILE>\.ssh\config`（school-164 / macmini 条目已就位）

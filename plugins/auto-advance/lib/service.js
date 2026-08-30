@@ -576,9 +576,10 @@ function agentFollowup(agent, message) {
 
 function taskApiUrl(workerApiUrl) {
   const baseUrl = workerApiUrl.replace(/\/+$/u, "");
+  // 全量拉取（archived 由 worker 默认排除）：pendingRequests 在 mapApiTaskSnapshot
+  // 内按 checkbox=1 且未完成过滤；sections 按 project 分组展示全部进行中任务。
   const url = new URL(`${baseUrl}/task`);
-  url.searchParams.set("checkbox", "1");
-  url.searchParams.set("status", "open");
+  url.searchParams.set("size", "200");
   return url;
 }
 
@@ -589,21 +590,48 @@ function taskApiUpdatedAt(value) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+function cleanBody(value) {
+  // 去掉 markdown checkbox/列表前缀与残留标记，只留描述
+  return value
+    .replace(/^\s*[-*]\s*\[(?: |x|X)\]\s*/u, "")
+    .replace(/^\s*[-*]\s+/u, "")
+    .replace(/\*\*/gu, "")
+    .replace(/`/gu, "")
+    .trim();
+}
+
 function mapApiTask(item) {
   const titleValue = item?.title ?? item?.text;
   const title = cleanMarkdown(typeof titleValue === "string" ? titleValue : "") || "未命名需求";
-  const body = typeof item?.body === "string" ? cleanMarkdown(item.body) : "";
-  return { title, hasCheckbox: true, body };
+  const project = typeof item?.project === "string" && item.project.trim() ? item.project.trim() : "未分类";
+  return {
+    text: title,                       // 项目进度区（normalizeTask 用 text）
+    title,                             // 待处理需求区用
+    status: typeof item?.status === "string" ? item.status : "open",
+    updatedAt: taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt),
+    project,                           // 分组键
+    hasCheckbox: item?.checkbox === 1 || item?.checkbox === "1",
+    body: typeof item?.body === "string" ? cleanBody(item.body) : "",
+  };
 }
 
 function mapApiTaskSnapshot(items, tasksPath) {
   let updatedAt = null;
-  const pendingRequests = items.map((item) => {
-    const itemUpdatedAt = taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt);
+  const pendingRequests = [];
+  const byProject = new Map();
+  for (const item of items) {
+    const task = mapApiTask(item);
+    const itemUpdatedAt = task.updatedAt;
     if (itemUpdatedAt !== null && (updatedAt === null || itemUpdatedAt > updatedAt)) updatedAt = itemUpdatedAt;
-    return mapApiTask(item);
-  });
-  return { path: tasksPath, updatedAt, sections: [], pendingRequests };
+    // 待处理需求：checkbox=1 且未完成
+    if (task.hasCheckbox && task.status !== "done") pendingRequests.push(task);
+    if (!byProject.has(task.project)) byProject.set(task.project, []);
+    byProject.get(task.project).push(task);
+  }
+  const sections = [...byProject.entries()]
+    .map(([title, items]) => ({ title, items }))
+    .sort((a, b) => b.items.length - a.items.length);
+  return { path: tasksPath, updatedAt, sections, pendingRequests };
 }
 
 // 复用 @sagitta/memory 的 http.js（CONNECT 隧道 + 传输层重试），读云端 /task。
