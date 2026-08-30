@@ -12,7 +12,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import z from "@deepseek-ai/schemastery";
 
 const name = "sagitta-codex";
-const inject = ["tools", "agents"];
+const inject = ["tools", "agents", "sagitta-async-work"];
 
 const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_WORK_TIMEOUT_MS = 2 * 60 * 60 * 1000;

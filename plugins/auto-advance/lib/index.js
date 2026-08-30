@@ -10,7 +10,7 @@ import {
 } from "./service.js";
 
 const name = "sagitta-auto-advance";
-const inject = ["agents", "goals", "sessions", "sagitta-manager"];
+const inject = ["agents", "goals", "sessions", "sagitta-manager", "sagitta-async-work"];
 
 const Config = z.object({
   idleTimeoutMs: z.number().default(300000).description("Idle duration before an automatic continuation is injected."),

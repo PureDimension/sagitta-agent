@@ -226,10 +226,12 @@ class AsyncWorkService extends Service {
 }
 
 function apply(ctx, config) {
+  // 与 DSH 内部 Service 子类插件（@deepseek-ai/dsh-jobs-local 的 LocalJobRegistry 等）
+  // 写法对齐：cordis 4.0.1 的 Service 构造函数（lib/index.js ~1781 行）已通过
+  // `ctx.reflect.provide(name, this)` 自动注册到当前 fiber，apply 里**不得再手动
+  // ctx.provide** —— 重复注册会命中 cordis provide 的重复检查（~812 行
+  // `service "..." has been registered`）抛错，只能靠 try/catch 吞掉，属于双注册噪声。
   const service = new AsyncWorkService(ctx, config ?? {});
-  // Service normally publishes itself through cordis. This small fallback also
-  // makes the plugin straightforward to exercise with a minimal test harness.
-  try { ctx?.provide?.(name, service); } catch { /* cordis may already own publication */ }
   registerAsyncWorkTools(ctx, service);
 
   if (typeof ctx?.effect === "function") {

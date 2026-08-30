@@ -239,7 +239,7 @@ function hasPendingInbox(agent) {
 }
 
 class AutoAdvanceService extends TypertRemoteService {
-  static inject = ["agents", "goals", "sessions"];
+  static inject = ["agents", "goals", "sessions", "sagitta-async-work"];
 
   constructor(ctx, config = {}) {
     super(ctx, "sagittaAutoAdvance");
