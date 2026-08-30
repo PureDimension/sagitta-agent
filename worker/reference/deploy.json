@@ -1,0 +1,16 @@
+{
+  "bindings": [
+    {
+      "name": "DB",
+      "type": "d1",
+      "id": "a8196e39-a777-4f9d-913e-30516fec2425"
+    },
+    {
+      "name": "AUTH_TOKEN",
+      "type": "secret_text",
+      "generate": true,
+      "fromEnv": "SAGITTA_WORKER_AUTH_TOKEN"
+    }
+  ],
+  "notes": "Worker 部署 bindings 参考（multipart PUT 用）。D1 id 非密钥可入库；AUTH_TOKEN 为 Bearer 兜底 secret：部署时优先读环境变量 SAGITTA_WORKER_AUTH_TOKEN，缺失则随机生成（Bearer 路径实际未启用，轮换无兼容风险）。deploy-worker.ps1 与 updater lib/worker.js 共用本文件。"
+}

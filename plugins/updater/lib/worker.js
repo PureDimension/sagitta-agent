@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
@@ -40,6 +40,42 @@ function parseWorkerConfig(text) {
 
 function workerSourcePath(repoPath) {
   return path.join(repoPath, "worker", "worker.js");
+}
+
+function deployReferencePath(repoPath) {
+  return path.join(repoPath, "worker", "reference", "deploy.json");
+}
+
+/**
+ * 从 worker/reference/deploy.json 构建 multipart metadata 的 bindings。
+ * secret_text：fromEnv 有值则用；标记 generate 时缺失则随机生成（绝不落日志）。
+ * 返回 undefined 表示 reference 缺失（调用方回退纯 JS PUT 并告警）；否则抛错表示配置非法。
+ */
+async function resolveDeployBindings(deployReferencePath, env = process.env) {
+  let reference;
+  try {
+    reference = JSON.parse(await readFile(deployReferencePath, "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(reference.bindings)) return [];
+  const bindings = [];
+  for (const binding of reference.bindings) {
+    if (binding?.type === "secret_text") {
+      let value = typeof binding.fromEnv === "string" ? nonEmptyString(env[binding.fromEnv]) : undefined;
+      if (!value && binding.generate === true) value = randomBytes(32).toString("hex");
+      if (!value) {
+        throw new Error(`secret binding ${binding.name} 无值（fromEnv 未配置且未标记 generate）`);
+      }
+      bindings.push({ name: binding.name, type: "secret_text", text: value });
+    } else if (binding?.type === "d1") {
+      if (!nonEmptyString(binding.id)) throw new Error(`d1 binding ${binding.name} 缺少 id`);
+      bindings.push({ name: binding.name, type: "d1", id: binding.id });
+    } else {
+      throw new Error(`未知 binding 类型 ${binding?.type}`);
+    }
+  }
+  return bindings;
 }
 
 function directUploadUrl(accountId, scriptName) {
@@ -152,14 +188,28 @@ async function deployWorker({
 
   if (resolvedAccountId && resolvedScriptName) {
     try {
-      const response = await request(directUploadUrl(resolvedAccountId, resolvedScriptName), {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${uploadToken}`,
-          "Content-Type": "application/javascript"
-        },
-        body: source
-      });
+      const url = directUploadUrl(resolvedAccountId, resolvedScriptName);
+      const headers = { Authorization: `Bearer ${uploadToken}` };
+      let body;
+      // multipart PUT（metadata + 模块 part）：携带 D1/secret bindings，避免清空线上绑定。
+      // part 名 = 模块文件名；content-type 必须 application/javascript+module（CF 对 module 格式的硬要求）；
+      // metadata.main_module 引用同一 part 名（官方 multipart 契约，缺任一都会 10021）。
+      // reference 缺失时回退纯 JS PUT（旧行为），但告警提示部署可能丢失 bindings。
+      const bindings = await resolveDeployBindings(deployReferencePath(repoPath), env);
+      if (bindings) {
+        const moduleName = path.basename(sourcePath);
+        const metadata = { main_module: moduleName, bindings };
+        const form = new FormData();
+        form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+        // 必须用 File（不是 Blob）：CF 要求模块 part 带 filename（Content-Disposition: ... filename=...），
+        // Blob part 无 filename 会 10021。content-type 必须是 application/javascript+module。
+        form.append(moduleName, new File([source], moduleName, { type: "application/javascript+module" }));
+        body = form;
+      } else {
+        headers["Content-Type"] = "application/javascript";
+        body = source;
+      }
+      const response = await request(url, { method: "PUT", headers, body });
       if (!await responseIsOk(response)) throw new Error("cloudflare-upload-failed");
     } catch {
       directFailure = true;
@@ -197,6 +247,7 @@ async function deployWorker({
 
 export {
   WORKER_TIMEOUT_MS,
+  deployReferencePath,
   deployWorker,
   directUploadUrl,
   execCommand,
@@ -204,6 +255,7 @@ export {
   healthUrl,
   parseTomlString,
   parseWorkerConfig,
+  resolveDeployBindings,
   resolveWorkerConfig,
   runWrangler,
   sourceSha,

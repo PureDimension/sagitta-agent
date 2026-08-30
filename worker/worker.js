@@ -913,6 +913,38 @@ async function getDelegationHandler(db, taskId) {
 
 // ---- task API（docs/task-api-p1.md） ----------------------------------------
 
+// tasks 表自举：幂等建表（CREATE TABLE/INDEX IF NOT EXISTS 均为 no-op）。
+// 用 DB binding 直接执行，无需 D1 API token 权限；模块级 promise 缓存防并发重复执行；
+// 失败置空允许下次重试（此时 task 路由自然 500，/mem 不受影响）。
+let tasksSchemaReady = null;
+function ensureTasksSchema(db) {
+  if (tasksSchemaReady !== null) return tasksSchemaReady;
+  tasksSchemaReady = db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS tasks (
+      id            TEXT PRIMARY KEY,
+      project       TEXT NOT NULL,
+      title         TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'open',
+      priority      INTEGER NOT NULL DEFAULT 0,
+      checkbox      INTEGER NOT NULL DEFAULT 0,
+      stream        TEXT NOT NULL DEFAULT 'company',
+      body          TEXT DEFAULT '',
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL DEFAULT '',
+      done_at       TEXT DEFAULT '',
+      archived      INTEGER NOT NULL DEFAULT 0
+    )`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_stream ON tasks(stream)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`),
+  ]).then(() => true).catch((err) => {
+    console.error('[sagitta-memory] tasks schema bootstrap failed:', err && err.message ? err.message : String(err));
+    tasksSchemaReady = null;
+    return false;
+  });
+  return tasksSchemaReady;
+}
+
 function isTaskBody(body) {
   return body !== null && typeof body === 'object' && !Array.isArray(body);
 }
@@ -1182,6 +1214,8 @@ async function handleRequest(request, env) {
   const db = env.DB;
 
   if (segments[0] === 'task') {
+    // tasks 表自举（幂等）：首次 task 请求前建表；失败不抛错（task 路由保持原 500 行为）
+    await ensureTasksSchema(db);
     try {
       if (segments.length === 2 && segments[1] === 'search') {
         if (method === 'POST') return await searchTasksHandler(db, await readJson(request));
