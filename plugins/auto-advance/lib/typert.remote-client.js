@@ -8,7 +8,10 @@ const stateSchema = z.object({
   injectedAt: z.union([z.number(), z.null()]).readonly(),
   ready: z.boolean().readonly(),
   hasPendingWork: z.boolean().readonly(),
-  stoppedByProtocol: z.boolean().readonly()
+  stoppedByProtocol: z.boolean().readonly(),
+  agentStatus: z.string().readonly(),
+  degraded: z.boolean().readonly(),
+  degradedReason: z.union([z.string(), z.null()]).readonly()
 });
 const taskSchema = z.object({
   text: z.string().readonly(),
@@ -22,6 +25,7 @@ const pendingRequestSchema = z.object({
 const tasksSchema = z.object({
   path: z.string().readonly(),
   updatedAt: z.union([z.number(), z.null()]).readonly(),
+  source: z.union([z.literal("cloud"), z.literal("file"), z.literal("file-stale")]).readonly().optional(),
   sections: z.array(z.object({
     title: z.string().readonly(),
     items: z.array(taskSchema).readonly()

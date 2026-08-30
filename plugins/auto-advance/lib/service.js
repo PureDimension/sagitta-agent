@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
+import { splitCloudTaskSnapshotStrict, validateCloudTaskPage, MAX_PAGE_SIZE } from "./snapshot.js";
 
 /**
  * This is intentionally copied from the final prompt in
@@ -25,6 +26,9 @@ const PLUGIN_ID = "auto-advance";
 const STATUS_EVENT = "sagitta-auto-advance/status";
 const DEFAULT_IDLE_TIMEOUT_MS = 300000;
 const DEFAULT_TASK_API_TIMEOUT_MS = 3000;
+const DEFAULT_TASK_PAGE_SIZE = 200;
+const CLOUD_RETRY_DELAYS_MS = [30000, 120000, 300000];
+const CLOUD_RETRY_JITTER = 0.2;
 const LEGACY_WORKSPACE_CANDIDATES = [
   "D:\\workspace\\sagitta-experience",
   join(homedir(), ".dsh"),
@@ -32,7 +36,6 @@ const LEGACY_WORKSPACE_CANDIDATES = [
   join(homedir(), "sagitta-experience"),
   join(homedir(), "workspace", "sagitta-experience")
 ];
-const ACTIVE_JOB_STATUSES = new Set(["running", "stopping"]);
 
 const REMOTE_INITIALIZERS = [];
 for (const method of ["getState", "setMode", "getTasks"]) {
@@ -55,6 +58,13 @@ function renderError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function taskApiUnavailable(message, cause) {
+  const error = new Error(`task-api-unavailable: ${message}`);
+  error.code = "task-api-unavailable";
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
 function safeLog(loggerOrGetter, level, message) {
   try {
     const logger = typeof loggerOrGetter === "function" ? loggerOrGetter() : loggerOrGetter;
@@ -75,10 +85,14 @@ function normalizeTaskApiConfig(config = {}) {
   const nested = isRecord(raw.apiConfig) ? raw.apiConfig : isRecord(raw.taskApiConfig) ? raw.taskApiConfig : {};
   return {
     workerApiUrl: nonEmptyString(nested.workerApiUrl ?? nested.apiUrl ?? raw.workerApiUrl ?? raw.apiUrl),
-    d1ReadToken: nonEmptyString(nested.d1ReadToken ?? raw.d1ReadToken),
+    d1ReadToken: nonEmptyString(nested.d1ReadToken ?? nested.authToken ?? raw.d1ReadToken ?? raw.authToken),
     accessClientId: nonEmptyString(nested.accessClientId ?? raw.accessClientId),
-    accessClientSecret: nonEmptyString(nested.accessClientSecret ?? raw.accessClientSecret)
+    accessClientSecret: nonEmptyString(nested.accessClientSecret ?? nested.accessSecret ?? raw.accessClientSecret ?? raw.accessSecret)
   };
+}
+
+function hasConfiguredTaskApiValue(config) {
+  return config !== undefined && Object.values(config).some((value) => value !== undefined);
 }
 
 function completeTaskApiConfig(config) {
@@ -143,14 +157,17 @@ function normalizeConfig(config = {}) {
     idleTimeoutMs: Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0 ? idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
     statePath: paths.statePath,
     tasksPath: paths.tasksPath,
-    // This field is already used by the profile patch during the transition.
-    taskFallback: config.taskFallback !== false,
     taskApiTimeoutMs: Number.isFinite(Number(config.taskApiTimeoutMs)) && Number(config.taskApiTimeoutMs) > 0
       ? Number(config.taskApiTimeoutMs)
       : DEFAULT_TASK_API_TIMEOUT_MS,
-    proxy: typeof config.proxy === "string" && config.proxy.trim().length > 0 ? config.proxy.trim() : "direct",
-    // Explicit API settings are intentionally read without adding fields to the
-    // v0.1.7 RPC/typert contract. The manager snapshot is a separate source.
+    proxy: typeof config.proxy === "string" && config.proxy.trim().length > 0
+      ? config.proxy.trim()
+      : (nonEmptyString(process.env.DSH_MEMORY_PROXY) ?? "direct"),
+    taskPageSize: Number.isInteger(Number(config.taskPageSize)) && Number(config.taskPageSize) > 0
+      ? Math.min(MAX_PAGE_SIZE, Number(config.taskPageSize))
+      : DEFAULT_TASK_PAGE_SIZE,
+    // Explicit API settings are migration fallback values. A configured manager
+    // snapshot wins exactly as it does for memory's task client.
     apiConfig: normalizeTaskApiConfig(config),
     manager: config.manager,
     managerApiConfig: normalizeTaskApiConfig(config.managerApiConfig)
@@ -220,6 +237,10 @@ class AutoAdvanceService extends TypertRemoteService {
       state.enabled = this.persistedModes.get(agent.id) === true;
       state.stoppedByProtocol = false;
       state.lastAutoMessageId = undefined;
+      state.cloudSnapshot = undefined;
+      state.retryAttempt = 0;
+      state.degraded = false;
+      state.degradedReason = null;
       this.resetTimer(state, "session-start");
     });
     ctx.on("agent/status", ({ agent, status }) => {
@@ -316,41 +337,37 @@ class AutoAdvanceService extends TypertRemoteService {
 
   getTasks() {
     const taskApi = this.resolveTaskApiConfig();
-    if (taskApi === undefined) return readTasks(this.config.tasksPath, this.logger());
-
     return readTasksFromApi(taskApi, this.config, this.logger()).catch((error) => {
-      this.logger()?.warn?.(`sagitta-auto-advance: task API unavailable; falling back to tasksPath: ${renderError(error)}`);
-      if (this.config.taskFallback) return readTasks(this.config.tasksPath, this.logger());
+      // This is deliberately the UI-only path. No caller used by
+      // auto-advance qualification reaches readTasks/readTasksFromApi.
+      this.logger()?.warn?.(`sagitta-auto-advance: task API unavailable; using stale tasksPath for UI: ${renderError(error)}`);
+      const stale = readTasks(this.config.tasksPath, this.logger());
       return {
-        path: this.config.tasksPath,
-        updatedAt: null,
-        sections: [],
-        pendingRequests: [],
-        error: "任务 API 暂时不可用，文件 fallback 已关闭"
+        ...stale,
+        source: "file-stale",
+        error: `任务 API 暂时不可用（${renderError(error)}）；当前为 file-stale 文件快照${stale.error ? `；${stale.error}` : ""}`
       };
     });
   }
 
   /**
-   * Task source priority is deliberately explicit:
-   * complete plugin API config > manager API config > tasksPath file fallback.
-   * The manager is read again for each panel refresh, matching memory's
-   * runtime configuration behavior; the apply-time snapshot is only used when
-   * the manager object has no callable getter at service construction time.
+   * Resolve the same runtime API source as memory: a configured manager
+   * snapshot wins; explicit values are only a migration fallback when the
+   * manager is absent or empty. The manager is read for every request.
    */
   resolveTaskApiConfig() {
-    const explicit = completeTaskApiConfig(this.config.apiConfig);
-    if (explicit !== undefined) return { ...explicit, source: "explicit-api" };
-
+    const explicit = normalizeTaskApiConfig(this.config.apiConfig);
     const manager = this.config.manager ?? this.ctx?.["sagitta-manager"];
     if (typeof manager?.getApiConfig === "function") {
-      const currentManager = completeTaskApiConfig(readManagerApiConfig(manager));
-      if (currentManager !== undefined) return { ...currentManager, source: "manager-api" };
+      const currentManager = normalizeTaskApiConfig(readManagerApiConfig(manager));
+      if (hasConfiguredTaskApiValue(currentManager)) return { ...currentManager, source: "manager-api" };
+      if (hasConfiguredTaskApiValue(explicit)) return { ...explicit, source: "explicit-api" };
       return undefined;
     }
 
-    const startupManager = completeTaskApiConfig(this.config.managerApiConfig);
-    if (startupManager !== undefined) return { ...startupManager, source: "manager-api" };
+    const startupManager = normalizeTaskApiConfig(this.config.managerApiConfig);
+    if (hasConfiguredTaskApiValue(startupManager)) return { ...startupManager, source: "manager-api" };
+    if (hasConfiguredTaskApiValue(explicit)) return { ...explicit, source: "explicit-api" };
     return undefined;
   }
 
@@ -366,7 +383,13 @@ class AutoAdvanceService extends TypertRemoteService {
       injectedAt: null,
       lastAutoMessageId: undefined,
       stoppedByProtocol: false,
-      disposed: false
+      disposed: false,
+      requestController: undefined,
+      retryAttempt: 0,
+      retrying: false,
+      degraded: false,
+      degradedReason: null,
+      cloudSnapshot: undefined
     };
     this.states.set(agent, state);
     return state;
@@ -376,60 +399,79 @@ class AutoAdvanceService extends TypertRemoteService {
     return !state.disposed && this.ctx.fiber.state === 2 && this.ctx.agents.get(state.agent.id) === state.agent;
   }
 
-  hasRunningWork(agent) {
-    for (const candidate of this.ctx.agents.list()) {
-      if (candidate === agent) continue;
-      if (this.ctx.agents.isOwnedBy(candidate.id, agent) && candidate.status === "running") return true;
-    }
-
-    // 有界工作注册表（sagitta-codex 插件）：只认"已注册的有界工作"（超时自动回收），
-    // 不再用笼统 jobs.list —— 后台 pwsh/ssh 等未注册任务不会永久卡住自主推进（08-30 修复）。
-    // 注意：cordis 未 inject 声明的服务不能属性访问（会抛 cannot get property without inject），
-    // 必须用 ctx.get(name, false) 可选获取（服务不存在返回 undefined，不抛错不等待）。
-    let codexService;
+  getAsyncWorkService() {
     try {
-      codexService = typeof this.ctx.get === "function" ? this.ctx.get("sagitta-codex", false) : undefined;
-    } catch (error) {
-      codexService = undefined;
+      return typeof this.ctx.get === "function" ? this.ctx.get("sagitta-async-work", false) : undefined;
+    } catch {
+      return undefined;
     }
-    if (codexService && typeof codexService.listActiveWorks === "function") {
-      try {
-        return codexService.listActiveWorks(agent.id).length > 0;
-      } catch (error) {
-        this.logger()?.warn?.(`sagitta-auto-advance: codex work check failed: ${renderError(error)}`);
-        return true; // 保守：查询失败视为有工作
-      }
-    }
-
-    // 无 codex 插件时回退旧逻辑（jobs.list）
-    const jobs = this.ctx.get("jobs");
-    if (jobs === undefined || typeof jobs.list !== "function") return false;
-    const callers = [undefined, ...this.ctx.agents.list()];
-    try {
-      for (const caller of callers) {
-        for (const snapshot of jobs.list(caller)) {
-          if (ACTIVE_JOB_STATUSES.has(snapshot?.status)) return true;
-        }
-      }
-    } catch (error) {
-      this.logger()?.warn?.(`sagitta-auto-advance: job readiness check failed: ${renderError(error)}`);
-      return true;
-    }
-    return false;
   }
 
-  hasPendingWork(agent) {
-    return hasPendingInbox(agent) || this.hasRunningWork(agent);
+  hasRunningWork(agent, taskId) {
+    for (const candidate of this.ctx.agents.list()) {
+      if (candidate === agent) continue;
+      if (!this.ctx.agents.isOwnedBy(candidate.id, agent) || candidate.status !== "running") continue;
+      const candidateTaskId = candidate.task_id ?? candidate.taskId;
+      if (taskId === undefined || candidateTaskId === undefined || candidateTaskId === taskId) return true;
+    }
+
+    // Stage 4's generic registry is the only bounded-work source. An absent
+    // or malformed service is treated as unavailable and blocks progress;
+    // auto-advance must never assume an unobserved async operation is finished.
+    const asyncWork = this.getAsyncWorkService();
+    if (asyncWork === undefined) return true;
+    if (typeof asyncWork.listActive !== "function") {
+      this.logger()?.warn?.("sagitta-auto-advance: async-work registry has no listActive method");
+      return true;
+    }
+    try {
+      const works = asyncWork.listActive(agent.id, taskId === undefined ? {} : { taskId });
+      if (!Array.isArray(works)) throw new Error("listActive did not return an array");
+      return works.some((work) => {
+        if (work?.status !== undefined && work.status !== "running") return false;
+        const workTaskId = work?.task_id ?? work?.taskId;
+        return taskId === undefined || workTaskId === taskId;
+      });
+    } catch (error) {
+      this.logger()?.warn?.(`sagitta-auto-advance: async-work check failed: ${renderError(error)}`);
+      return true;
+    }
+  }
+
+  hasPendingWork(agent, taskId) {
+    return hasPendingInbox(agent) || this.hasRunningWork(agent, taskId);
+  }
+
+  availableRunnableTasks(state, snapshot = state.cloudSnapshot) {
+    if (!snapshot?.runnable) return [];
+    return snapshot.runnable.filter((task) => !this.hasRunningWork(state.agent, task.task_id ?? task.id));
   }
 
   readyToDrive(state) {
-    return this.isLive(state) && state.enabled && !state.stoppedByProtocol && state.agent.status === "idle" && !this.hasPendingWork(state.agent);
+    if (!this.isLive(state) || !state.enabled || state.stoppedByProtocol || state.agent.status !== "idle") return false;
+    if (hasPendingInbox(state.agent)) return false;
+    // Before the first cloud read, arm a probe. Once a valid snapshot exists,
+    // keep only task-id-isolated runnable work eligible; confirmations do not
+    // need an async-work binding.
+    if (state.cloudSnapshot !== undefined) {
+      if (state.cloudSnapshot.confirmationQueue.length > 0) return true;
+      return this.availableRunnableTasks(state).length > 0;
+    }
+    return true;
   }
 
   clearTimer(state) {
     if (state.timer !== undefined) {
       clearTimeout(state.timer);
       state.timer = undefined;
+    }
+    if (state.requestController !== undefined) {
+      try {
+        state.requestController.abort();
+      } catch {
+        // Abort is best effort; generation still invalidates the response.
+      }
+      state.requestController = undefined;
     }
     state.timerGeneration += 1;
   }
@@ -455,62 +497,156 @@ class AutoAdvanceService extends TypertRemoteService {
   armTimer(state) {
     if (!this.readyToDrive(state)) return;
     const generation = ++state.timerGeneration;
+    state.retrying = false;
     state.idleSince = Date.now();
-    state.timer = setTimeout(() => this.onTimer(state, generation), this.config.idleTimeoutMs);
+    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, this.config.idleTimeoutMs);
     state.timer.unref?.();
     this.broadcast(state);
   }
 
-  onTimer(state, generation) {
-    let queueAttempted = false;
+  isCurrentRun(state, generation) {
+    return state.timerGeneration === generation && this.isLive(state) && state.enabled &&
+      !state.stoppedByProtocol && state.agent.status === "idle" && !hasPendingInbox(state.agent);
+  }
+
+  queuePrompt(state, generation, text, summary, reason) {
+    if (!this.isCurrentRun(state, generation)) return false;
+    const message = createUserMessage({
+      content: [{ type: "text", text }],
+      source: {
+        kind: "plugin",
+        plugin: PLUGIN_ID,
+        form: "notice",
+        summary,
+      }
+    });
+    state.lastAutoMessageId = message.id;
+    state.injectedAt = Date.now();
+    state.idleSince = null;
+    agentFollowup(state.agent, message);
+    this.broadcast(state, reason);
+    return true;
+  }
+
+  scheduleCloudRetry(state, generation, error) {
+    if (!this.isCurrentRun(state, generation)) return;
+    const attempt = state.retryAttempt;
+    const baseDelay = CLOUD_RETRY_DELAYS_MS[Math.min(attempt, CLOUD_RETRY_DELAYS_MS.length - 1)];
+    const jitter = 1 + ((Math.random() * 2 - 1) * CLOUD_RETRY_JITTER);
+    const delay = Math.min(CLOUD_RETRY_DELAYS_MS[CLOUD_RETRY_DELAYS_MS.length - 1], Math.max(1000, Math.round(baseDelay * jitter)));
+    state.retryAttempt = Math.min(attempt + 1, CLOUD_RETRY_DELAYS_MS.length - 1);
+    state.retrying = true;
+    state.degraded = true;
+    state.degradedReason = renderError(error);
+    state.idleSince = null;
+    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, delay);
+    state.timer.unref?.();
+    this.broadcast(state, "defer: task-api-unavailable");
+  }
+
+  scheduleBoundedWorkRecheck(state, generation) {
+    if (!this.isCurrentRun(state, generation) || state.timer !== undefined) return;
+    state.retrying = true;
+    state.idleSince = null;
+    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, Math.min(30000, this.config.idleTimeoutMs));
+    state.timer.unref?.();
+    this.broadcast(state, "defer: bounded-work");
+  }
+
+  autoStopNoRunnableTasks(state) {
+    state.enabled = false;
+    state.stoppedByProtocol = true;
+    this.persistedModes.set(state.agent.id, false);
+    this.persistModes();
+    this.clearTimer(state);
+    state.idleSince = null;
+    this.broadcast(state, "autostop: no-runnable-tasks");
+  }
+
+  async onTimer(state, generation) {
+    const retrying = state.retrying === true;
+    state.retrying = false;
     try {
-      if (state.timerGeneration !== generation) return;
+      if (!this.isCurrentRun(state, generation)) return;
       state.timer = undefined;
-      if (!this.readyToDrive(state)) {
+      if (!retrying && !this.readyToDrive(state)) {
         state.idleSince = null;
         this.broadcast(state, "timer-not-ready");
         return;
       }
 
-      const message = createUserMessage({
-        content: [{ type: "text", text: AUTONOMOUS_PROMPT }],
-        source: {
-          kind: "plugin",
-          plugin: PLUGIN_ID,
-          form: "notice",
-          summary: "idle timeout autonomous continuation"
-        }
-      });
-      state.lastAutoMessageId = message.id;
-      state.injectedAt = Date.now();
-      state.idleSince = null;
-      queueAttempted = true;
-      agentFollowup(state.agent, message);
-      this.broadcast(state, "injected");
-    } catch (error) {
+      const controller = new AbortController();
+      state.requestController = controller;
+      let snapshot;
       try {
+        const taskApi = this.resolveTaskApiConfig();
+        if (completeTaskApiConfig(taskApi) === undefined) {
+          throw taskApiUnavailable(taskApi === undefined ? "Worker API 未配置" : "Worker API 认证或地址配置不完整");
+        }
+        snapshot = await readCloudTaskSnapshotStrict(taskApi, this.config, controller.signal, this.logger());
+      } finally {
+        if (state.requestController === controller) state.requestController = undefined;
+      }
+
+      // A user message, agent status transition, disable, dispose, or timer
+      // reset invalidates this generation while the network request awaited.
+      if (!this.isCurrentRun(state, generation)) return;
+      state.cloudSnapshot = snapshot;
+      state.retryAttempt = 0;
+      state.degraded = false;
+      state.degradedReason = null;
+
+      if (snapshot.confirmationQueue.length > 0) {
+        const lines = snapshot.confirmationQueue.map((task) =>
+          `- task_id=${task.task_id} pending_status=${task.pending_status} confirmation_id=${task.confirmation_id} expected_updated_at=${task.updated_at}`
+        );
+        const prompt = [
+          "当前云端任务快照包含待确认的终态申请。请只使用 task_confirm 逐项处理，不要把 pending 当成已完成或已阻塞。",
+          "确认清单（必须原样使用 task_id、confirmation_id、expected_updated_at）：",
+          ...lines,
+          "除非确认队列已处理完毕，本轮不要推进普通任务。",
+        ].join("\n");
+        this.queuePrompt(state, generation, prompt, "cloud task confirmation queue", "injected: confirmation-queue");
+        return;
+      }
+
+      const runnable = this.availableRunnableTasks(state, snapshot);
+      if (runnable.length > 0) {
+        const lines = runnable.map((task) => {
+          const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
+          const title = typeof task.title === "string" ? task.title.trim() : "";
+          return `- task_id=${task.task_id} status=${task.status} pending_status=null updated_at=${task.updated_at}${project} title=${JSON.stringify(title)}`;
+        });
+        const prompt = [
+          AUTONOMOUS_PROMPT,
+          "",
+          "本轮严格使用下面这份完整云端 runnable 清单：",
+          ...lines,
+          "清单外任务本轮不得推进；若要新增工作，先 task_create，并等待下一次完整云端快照。终态只能先申请 pending，再用 task_confirm 完成确认。",
+        ].join("\n");
+        this.queuePrompt(state, generation, prompt, "cloud runnable task snapshot", "injected: runnable-tasks");
+        return;
+      }
+
+      if (snapshot.runnable.length > 0) {
+        // Runnable tasks exist but every one is isolated behind its own
+        // bounded work. They are not an objective empty snapshot.
+        this.scheduleBoundedWorkRecheck(state, generation);
+        return;
+      }
+
+      this.autoStopNoRunnableTasks(state);
+    } catch (error) {
+      if (!this.isCurrentRun(state, generation)) return;
+      if (error?.code === "task-api-unavailable") {
+        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: cloud snapshot unavailable for agent "${state.agent?.id ?? "unknown"}": ${renderError(error)}`);
+        this.scheduleCloudRetry(state, generation, error);
+      } else {
         state.lastAutoMessageId = undefined;
         state.idleSince = null;
-      } catch {
-        // Keep the timer callback contained even for an invalid state object.
-      }
-      const reason = queueAttempted ? "could not queue continuation" : "timer callback failed";
-      safeLog(() => this.logger(), "warn", `sagitta-auto-advance: ${reason} for agent "${state.agent?.id ?? "unknown"}": ${renderError(error)}`);
-      try {
-        this.broadcast(state, queueAttempted ? "queue-failed" : "timer-failed");
-      } catch (broadcastError) {
-        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: timer recovery broadcast failed: ${renderError(broadcastError)}`);
-      }
-      try {
+        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: continuation injection failed for agent "${state.agent?.id ?? "unknown"}": ${renderError(error)}`);
+        this.broadcast(state, "queue-failed");
         this.maybeArm(state);
-      } catch (recoveryError) {
-        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: timer recovery failed: ${renderError(recoveryError)}`);
-      }
-    } finally {
-      try {
-        if (state.timerGeneration === generation) state.timer = undefined;
-      } catch (error) {
-        safeLog(() => this.logger(), "warn", `sagitta-auto-advance: timer cleanup failed: ${renderError(error)}`);
       }
     }
   }
@@ -522,6 +658,7 @@ class AutoAdvanceService extends TypertRemoteService {
     this.persistModes();
     this.clearTimer(state);
     state.idleSince = null;
+    state.retrying = false;
     this.broadcast(state, "stop-protocol");
   }
 
@@ -545,7 +682,10 @@ class AutoAdvanceService extends TypertRemoteService {
       injectedAt: state.injectedAt,
       ready: this.readyToDrive(state),
       hasPendingWork: this.hasPendingWork(state.agent),
-      stoppedByProtocol: state.stoppedByProtocol
+      stoppedByProtocol: state.stoppedByProtocol,
+      agentStatus: typeof state.agent.status === "string" ? state.agent.status : "unknown",
+      degraded: state.degraded === true,
+      degradedReason: state.degradedReason ?? null
     };
   }
 
@@ -598,12 +738,11 @@ function agentFollowup(agent, message) {
   agent.followup(message);
 }
 
-function taskApiUrl(workerApiUrl) {
+function taskApiUrl(workerApiUrl, page = 1, size = DEFAULT_TASK_PAGE_SIZE) {
   const baseUrl = workerApiUrl.replace(/\/+$/u, "");
-  // 全量拉取（archived 由 worker 默认排除）：pendingRequests 在 mapApiTaskSnapshot
-  // 内按 checkbox=1 且未完成过滤；sections 按 project 分组展示全部进行中任务。
   const url = new URL(`${baseUrl}/task`);
-  url.searchParams.set("size", "200");
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("size", String(size));
   return url;
 }
 
@@ -628,19 +767,27 @@ function mapApiTask(item) {
   const titleValue = item?.title ?? item?.text;
   const title = cleanMarkdown(typeof titleValue === "string" ? titleValue : "") || "未命名需求";
   const project = typeof item?.project === "string" && item.project.trim() ? item.project.trim() : "未分类";
-  return {
+  const task = {
     text: title,                       // 项目进度区（normalizeTask 用 text + done）
     title,                             // 待处理需求区用
     done: item?.status === "done",     // tasksSchema 硬性要求（boolean）
     status: typeof item?.status === "string" ? item.status : "open",
     updatedAt: taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt),
+    createdAt: taskApiUpdatedAt(item?.created_at ?? item?.createdAt),
+    pendingStatus: item?.pending_status ?? null,
+    blockedReason: item?.blocked_reason ?? null,
+    doneAt: item?.done_at ?? null,
+    confirmationId: item?.confirmation_id ?? null,
     project,                           // 分组键
     hasCheckbox: item?.checkbox === 1 || item?.checkbox === "1",
     body: typeof item?.body === "string" ? cleanBody(item.body) : "",
   };
+  const id = typeof item?.task_id === "string" ? item.task_id : typeof item?.id === "string" ? item.id : undefined;
+  if (id !== undefined) task.task_id = id;
+  return task;
 }
 
-function mapApiTaskSnapshot(items, tasksPath) {
+function mapApiTaskSnapshot(items, tasksPath, source = "cloud") {
   let updatedAt = null;
   const pendingRequests = [];
   const byProject = new Map();
@@ -655,12 +802,12 @@ function mapApiTaskSnapshot(items, tasksPath) {
   }
   const sections = [...byProject.entries()]
     .map(([title, items]) => ({ title, items }))
-    .sort((a, b) => b.items.length - a.items.length);
-  return { path: tasksPath, updatedAt, sections, pendingRequests };
+    .sort((a, b) => b.items.length - a.items.length || a.title.localeCompare(b.title));
+  return { path: tasksPath, updatedAt, sections, pendingRequests, source };
 }
 
 // 复用 @sagitta/memory 的 http.js（CONNECT 隧道 + 传输层重试），读云端 /task。
-// 动态 import：memory 插件不可用（未安装/禁用）时回退 Node fetch 直连（旧行为）。
+// 动态 import 只用于配置了代理的生产路径；loopback direct 保留 fetch 便于本地桩。
 let memoryRequestModulePromise = null;
 function memoryHttpRequest() {
   if (memoryRequestModulePromise === null) {
@@ -671,70 +818,134 @@ function memoryHttpRequest() {
   return memoryRequestModulePromise;
 }
 
-async function readTasksFromApi(apiConfig, config, logger) {
-  const url = taskApiUrl(apiConfig.workerApiUrl);
+function isLoopbackHostname(hostname) {
+  const value = String(hostname || "").toLowerCase().replace(/^\[|\]$/gu, "");
+  return value === "localhost" || value === "::1" || /^127\./u.test(value);
+}
+
+function isLoopbackUrl(value) {
+  try {
+    return isLoopbackHostname(new URL(value).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function assertTaskTransportPolicy(baseUrl, proxy) {
+  const configuredProxy = typeof proxy === "string" ? proxy.trim() : "";
+  const direct = configuredProxy.length === 0 || configuredProxy.toLowerCase() === "direct";
+  if (direct && !isLoopbackUrl(baseUrl)) {
+    throw taskApiUnavailable("配置错误：访问非 loopback Worker 禁止使用 direct；请配置 DSH_MEMORY_PROXY 或插件 proxy，未配置代理时已 fail closed");
+  }
+}
+
+function buildTaskAuthHeaders(apiConfig) {
+  const headers = { Accept: "application/json", "Accept-Encoding": "identity" };
+  // Keep the exact memory ordering: a read Bearer wins over Access headers.
+  if (apiConfig?.d1ReadToken) headers.Authorization = `Bearer ${apiConfig.d1ReadToken}`;
+  else if (apiConfig?.accessClientId && apiConfig?.accessClientSecret) {
+    headers["CF-Access-Client-Id"] = apiConfig.accessClientId;
+    headers["CF-Access-Client-Secret"] = apiConfig.accessClientSecret;
+  }
+  return headers;
+}
+
+function taskApiUnavailableFrom(error) {
+  if (error?.code === "task-api-unavailable") return error;
+  return taskApiUnavailable(renderError(error), error);
+}
+
+function linkedAbortSignal(signal, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error(`请求超时（${timeoutMs}ms）`)), timeoutMs);
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+    }
+  };
+}
+
+async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
+  if (completeTaskApiConfig(apiConfig) === undefined) {
+    throw taskApiUnavailable("Worker API 认证或地址配置不完整");
+  }
+  const url = taskApiUrl(apiConfig.workerApiUrl, page, config.taskPageSize);
+  assertTaskTransportPolicy(apiConfig.workerApiUrl, config.proxy);
+  const requestHeaders = buildTaskAuthHeaders(apiConfig);
   const timeoutMs = config.taskApiTimeoutMs;
   const useProxy = typeof config.proxy === "string" && config.proxy.trim().length > 0 && config.proxy.trim().toLowerCase() !== "direct";
-  // 认证：优先 Bearer（d1ReadToken）；否则 Cloudflare Access 双 key（网关放行 → CF-Access-Jwt-Assertion → 免 Bearer）
-  const requestHeaders = { Accept: "application/json" };
-  if (apiConfig.d1ReadToken) {
-    requestHeaders.Authorization = `Bearer ${apiConfig.d1ReadToken}`;
-  } else if (apiConfig.accessClientId && apiConfig.accessClientSecret) {
-    requestHeaders["CF-Access-Client-Id"] = apiConfig.accessClientId;
-    requestHeaders["CF-Access-Client-Secret"] = apiConfig.accessClientSecret;
-  }
-
   let status = 0;
   let bodyText = "";
   if (useProxy) {
     const memoryRequest = await memoryHttpRequest();
     if (typeof memoryRequest !== "function") {
-      throw new Error("proxy 已配置但 @sagitta/memory 的 http.js 不可用（memory 插件缺失/版本过旧）");
+      throw taskApiUnavailable("proxy 已配置但 @sagitta/memory 的 http.js 不可用（memory 插件缺失/版本过旧）");
     }
-    let response;
     try {
-      response = await memoryRequest({
+      const response = await memoryRequest({
         method: "GET",
         url: url.toString(),
         headers: requestHeaders,
         timeoutMs,
+        signal,
         proxy: config.proxy,
       });
+      status = Number(response?.status);
+      bodyText = response?.body ? Buffer.from(response.body).toString("utf8") : "";
     } catch (error) {
-      throw new Error(`请求失败：${renderError(error)}`);
+      throw taskApiUnavailable(`请求失败：${renderError(error)}`, error);
     }
-    status = Number(response?.status);
-    bodyText = response?.body ? Buffer.from(response.body).toString("utf8") : "";
   } else {
-    const signal = typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(timeoutMs) : undefined;
-    let response;
+    const linked = linkedAbortSignal(signal, timeoutMs);
     try {
-      response = await fetch(url.toString(), {
-        method: "GET",
-        headers: requestHeaders,
-        signal,
-      });
+      const response = await fetch(url.toString(), { method: "GET", headers: requestHeaders, signal: linked.signal });
+      status = Number(response?.status);
+      bodyText = typeof response.text === "function" ? await response.text() : "";
     } catch (error) {
-      throw new Error(`请求失败：${renderError(error)}`);
+      throw taskApiUnavailable(`请求失败：${renderError(error)}`, error);
+    } finally {
+      linked.dispose();
     }
-    status = Number(response?.status);
-    bodyText = typeof response.text === "function" ? await response.text() : "";
   }
 
-  const successful = status >= 200 && status < 300;
-  if (!successful) throw new Error(`HTTP ${Number.isInteger(status) ? status : "未知"}`);
-
+  if (status < 200 || status >= 300) throw taskApiUnavailable(`HTTP ${Number.isInteger(status) ? status : "未知"}`);
   let payload;
   try {
     payload = JSON.parse(bodyText);
-  } catch {
-    throw new Error("响应不是合法 JSON");
+  } catch (error) {
+    throw taskApiUnavailable("响应不是合法 JSON", error);
   }
-  if (!isRecord(payload) || payload.ok !== true || !isRecord(payload.data) || !Array.isArray(payload.data.items)) {
-    throw new Error("响应不符合 {ok:true,data:{items}} 契约");
+  try {
+    const pageData = validateCloudTaskPage(payload);
+    logger?.debug?.(`sagitta-auto-advance: task API returned page=${pageData.page} items=${pageData.items.length} total=${pageData.total}`);
+    return pageData;
+  } catch (error) {
+    throw taskApiUnavailableFrom(error);
   }
-  logger?.debug?.(`sagitta-auto-advance: task API returned ${payload.data.items.length} open checkbox item(s)`);
-  return mapApiTaskSnapshot(payload.data.items, config.tasksPath);
+}
+
+async function readCloudTaskSnapshotStrict(apiConfig, config, signal, logger) {
+  try {
+    const first = await requestTaskApiPage(apiConfig, config, 1, signal, logger);
+    const pageCount = Math.max(1, Math.ceil(first.total / first.size));
+    const pages = [first];
+    for (let page = 2; page <= pageCount; page++) {
+      pages.push(await requestTaskApiPage(apiConfig, config, page, signal, logger));
+    }
+    return splitCloudTaskSnapshotStrict({ pages });
+  } catch (error) {
+    throw taskApiUnavailableFrom(error);
+  }
+}
+
+async function readTasksFromApi(apiConfig, config, logger) {
+  const snapshot = await readCloudTaskSnapshotStrict(apiConfig, config, undefined, logger);
+  return mapApiTaskSnapshot(snapshot.items, config.tasksPath, "cloud");
 }
 
 function readTasks(path, logger) {
@@ -799,10 +1010,10 @@ function readTasks(path, logger) {
       current.items.push({ text: status.length > 0 ? `${text}（${status}）` : text, done: /✅|完成/u.test(status) });
     }
     flushPendingRequest();
-    return { path, updatedAt: statMtime(path), sections: sections.filter((section) => section.items.length > 0), pendingRequests };
+    return { path, updatedAt: statMtime(path), sections: sections.filter((section) => section.items.length > 0), pendingRequests, source: "file" };
   } catch (error) {
     logger?.warn?.(`sagitta-auto-advance: cannot read task file: ${renderError(error)}`);
-    return { path, updatedAt: null, sections: [], pendingRequests: [], error: "TASKS.md 暂时不可读" };
+    return { path, updatedAt: null, sections: [], pendingRequests: [], source: "file", error: "TASKS.md 暂时不可读" };
   }
 }
 
@@ -848,5 +1059,9 @@ export {
   isExactStopMessage,
   readTasks,
   readTasksFromApi,
+  readCloudTaskSnapshotStrict,
+  splitCloudTaskSnapshotStrict,
+  buildTaskAuthHeaders,
+  isLoopbackUrl,
   resolveConfiguredPaths
 };

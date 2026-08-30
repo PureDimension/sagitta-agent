@@ -59,13 +59,13 @@ window.__ModuleLoader__.load({
     }
     function stateSchema() {
       return strictSchema((value) => {
-        if (value === null || typeof value !== "object" || typeof value.enabled !== "boolean" || (value.mode !== "auto" && value.mode !== "chat") || (value.idleSince !== null && typeof value.idleSince !== "number") || (value.injectedAt !== null && typeof value.injectedAt !== "number") || typeof value.ready !== "boolean" || typeof value.hasPendingWork !== "boolean" || typeof value.stoppedByProtocol !== "boolean") throw new Error("invalid autonomous-continuation state");
+        if (value === null || typeof value !== "object" || typeof value.enabled !== "boolean" || (value.mode !== "auto" && value.mode !== "chat") || (value.idleSince !== null && typeof value.idleSince !== "number") || (value.injectedAt !== null && typeof value.injectedAt !== "number") || typeof value.ready !== "boolean" || typeof value.hasPendingWork !== "boolean" || typeof value.stoppedByProtocol !== "boolean" || typeof value.agentStatus !== "string" || typeof value.degraded !== "boolean" || (value.degradedReason !== null && typeof value.degradedReason !== "string")) throw new Error("invalid autonomous-continuation state");
         return value;
       });
     }
     function tasksSchema() {
       return strictSchema((value) => {
-        if (value === null || typeof value !== "object" || typeof value.path !== "string" || (value.updatedAt !== null && typeof value.updatedAt !== "number") || !Array.isArray(value.sections)) throw new Error("invalid task snapshot");
+        if (value === null || typeof value !== "object" || typeof value.path !== "string" || (value.updatedAt !== null && typeof value.updatedAt !== "number") || !Array.isArray(value.sections) || (value.source !== undefined && !["cloud", "file", "file-stale"].includes(value.source))) throw new Error("invalid task snapshot");
         for (const section of value.sections) {
           if (section === null || typeof section.title !== "string" || !Array.isArray(section.items)) throw new Error("invalid task section");
           for (const item of section.items) if (item === null || typeof item.text !== "string" || typeof item.done !== "boolean") throw new Error("invalid task item");
@@ -108,6 +108,7 @@ window.__ModuleLoader__.load({
       .saa-eyebrow { display: block; margin-bottom: 3px; color: var(--saa-brand); font-size: 10px; font-weight: 700; letter-spacing: .12em; line-height: 1; text-transform: uppercase; }
       .saa-title { overflow: hidden; color: #f7faff; font-size: 16px; font-weight: 700; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; }
       .saa-subtitle { margin-top: 4px; color: var(--saa-muted); font-size: 11px; }
+      .saa-session { margin-top: 5px; overflow: hidden; color: #c7d7ed; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
       .saa-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
       .saa-toggle, .saa-close { border: 0; cursor: pointer; font: inherit; transition: background .18s ease, color .18s ease, opacity .18s ease; }
       .saa-toggle { border-radius: 999px; padding: 7px 11px; color: #fff; background: #316fe0; font-size: 11px; font-weight: 650; white-space: nowrap; }
@@ -121,6 +122,7 @@ window.__ModuleLoader__.load({
       .saa-status-row { min-width: 0; padding: 9px 10px; border: 1px solid rgba(148,171,201,.1); border-radius: 11px; background: rgba(255,255,255,.045); color: var(--saa-muted); font-size: 11px; }
       .saa-status-row strong { display: block; margin-bottom: 2px; color: #8395ac; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
       .saa-status-row span { display: block; overflow: hidden; color: #e7eef8; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+      .saa-queue-hint { grid-column: 1 / -1; margin-top: 1px; padding: 8px 10px; border: 1px solid rgba(110,158,255,.2); border-radius: 10px; background: rgba(83,135,234,.1); color: #bcd2f5; font-size: 11px; }
       .saa-task-title { display: flex; flex: 0 0 auto; align-items: baseline; justify-content: space-between; gap: 8px; margin: 19px 0 9px; color: #f7faff; font-size: 13px; font-weight: 700; }
       .saa-pending-heading { margin-top: 3px; }
       .saa-pending-list { display: grid; gap: 7px; margin: 0 0 4px; padding: 0; list-style: none; }
@@ -154,6 +156,7 @@ window.__ModuleLoader__.load({
       .saa-task-status[data-status="waiting"] { background: rgba(148,165,187,.13); color: #bec9d7; }
       .saa-task-updated { color: #73859c; font-size: 10px; }
       .saa-empty, .saa-error { padding: 13px; border-radius: 11px; background: rgba(255,255,255,.04); color: #899bb2; }
+      .saa-stale { margin: -2px 0 8px; color: #ffc17e; font-size: 10px; }
       .saa-raw { max-width: 100%; box-sizing: border-box; margin: 0; padding: 13px; border: 1px solid rgba(148,171,201,.13); border-radius: 11px; background: rgba(0,0,0,.16); color: #bdcbe0; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
       .saa-error { color: #ffaaa8; }
       @keyframes saa-panel-in { from { opacity: 0; } to { opacity: 1; } }
@@ -287,6 +290,10 @@ window.__ModuleLoader__.load({
     function currentSessionId(ctx) {
       return ctx.sessions.list.getSnapshot().current;
     }
+    function shortSessionId(value) {
+      const text = safeText(value).trim();
+      return text.length > 8 ? `…${text.slice(-8)}` : text || "未选择";
+    }
     function safeText(value) {
       return typeof value === "string" ? value : "";
     }
@@ -412,7 +419,8 @@ window.__ModuleLoader__.load({
         headMain.append(
           createElement("span", { class: "saa-eyebrow" }, "SAGITTA / AGENT CONTROL"),
           createElement("div", { class: "saa-title" }, "自主推进"),
-          createElement("div", { class: "saa-subtitle" }, "只读任务摘要 · 自动跟随悬浮球")
+          createElement("div", { class: "saa-subtitle" }, "只读任务摘要 · 自动跟随悬浮球"),
+          createElement("div", { class: "saa-session" }, `当前作用会话：${shortSessionId(currentSessionId(ctx))}`)
         );
         const actions = createElement("div", { class: "saa-actions" });
         const toggle = createElement("button", { class: "saa-toggle", type: "button", "data-enabled": String(lastState?.enabled === true) }, lastState?.enabled ? "已开启" : "已关闭");
@@ -432,8 +440,11 @@ window.__ModuleLoader__.load({
           row("模式", lastState?.mode === "auto" ? "自主推进" : "自由聊天"),
           row("Idle", lastState?.idleSince === null || lastState?.idleSince === undefined ? "未计时" : `${formatDuration(lastState.idleSince)}（计时中）`),
           row("上次注入", formatTime(lastState?.injectedAt)),
-          row("条件", lastState?.hasPendingWork ? "有待处理工作" : lastState?.ready ? "可推进" : "暂不可推进")
+          row("条件", lastState?.degraded ? `云端降级：${lastState.degradedReason || "稍后重试"}` : lastState?.hasPendingWork ? "有待处理工作" : lastState?.ready ? "可推进" : "暂不可推进")
         );
+        if (lastState?.agentStatus !== "idle" || lastState?.hasPendingWork) {
+          status.append(createElement("div", { class: "saa-queue-hint" }, "输入会排队，agent 空闲后处理"));
+        }
         panel.append(status);
         const groups = taskGroups(tasks);
         const rawContent = rawTaskContent(tasks);
@@ -462,6 +473,7 @@ window.__ModuleLoader__.load({
         const taskTitle = createElement("div", { class: "saa-task-title" });
         taskTitle.append(createElement("span", {}, "项目进度"), createElement("span", { class: "saa-task-count" }, `${groups.length} 个项目`));
         taskScroll.append(taskTitle);
+        if (tasks?.source === "file-stale") taskScroll.append(createElement("div", { class: "saa-stale" }, "⚠ file-stale：云端任务暂不可用，以下仅供展示"));
         if (tasks?.error) taskScroll.append(createElement("div", { class: "saa-error" }, tasks.error));
         else if (groups.length === 0 && rawContent) taskScroll.append(createElement("pre", { class: "saa-raw" }, rawContent));
         else if (groups.length === 0) taskScroll.append(createElement("div", { class: "saa-empty" }, "暂无任务"));
