@@ -605,8 +605,9 @@ function mapApiTask(item) {
   const title = cleanMarkdown(typeof titleValue === "string" ? titleValue : "") || "未命名需求";
   const project = typeof item?.project === "string" && item.project.trim() ? item.project.trim() : "未分类";
   return {
-    text: title,                       // 项目进度区（normalizeTask 用 text）
+    text: title,                       // 项目进度区（normalizeTask 用 text + done）
     title,                             // 待处理需求区用
+    done: item?.status === "done",     // tasksSchema 硬性要求（boolean）
     status: typeof item?.status === "string" ? item.status : "open",
     updatedAt: taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt),
     project,                           // 分组键
