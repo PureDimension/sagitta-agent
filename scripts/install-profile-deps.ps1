@@ -232,6 +232,7 @@ $plugins = [ordered]@{
     '@sagitta/memory'        = 'plugins\memory'
     '@sagitta/auto-advance'  = 'plugins\auto-advance'
     '@sagitta/updater'       = 'plugins\updater'
+    '@sagitta/async-work'    = 'plugins\async-work'
     '@sagitta/codex-dispatch' = 'plugins\codex-dispatch'
 }
 $bundleNames = @(
@@ -239,12 +240,13 @@ $bundleNames = @(
     '@sagitta/memory'
     '@sagitta/auto-advance'
     '@sagitta/updater'
+    '@sagitta/async-work'
     '@sagitta/codex-dispatch'
 )
 
 Write-Host "[install-profile-deps] profile: $ProfilePath"
 Write-Host "[install-profile-deps] repository: $RepoPath"
-Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/updater, @sagitta/codex-dispatch'
+Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/updater, @sagitta/async-work, @sagitta/codex-dispatch'
 
 if (-not $DryRun) {
     foreach ($relativePluginPath in $plugins.Values) {
@@ -397,6 +399,11 @@ $patchEntries = [ordered]@{
         "    profileDir: $profilePathYaml"
         "    restartPolicy: 'prompt'"
         '    workerDeploy: true'
+    )
+    'sagitta-async-work' = @(
+        '- id: sagitta-async-work'
+        '  config:'
+        '    defaultTimeoutMs: 7200000'
     )
     'sagitta-codex' = @(
         '- id: sagitta-codex'

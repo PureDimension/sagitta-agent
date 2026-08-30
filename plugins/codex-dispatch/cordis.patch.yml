@@ -1,5 +1,7 @@
 # @sagitta/codex-dispatch bundle layer.
-# Declared via the `dsh.bundle.patch` manifest in package.json.
+# Declared via the `dsh.bundle.patch` manifest in package.json. The generic
+# async-work bundle is installed before this optional adapter; if it is absent
+# the adapter remains loaded but rejects dispatch/status calls fail-closed.
 - insert:
     - id: sagitta-codex
       name: '@sagitta/codex-dispatch'

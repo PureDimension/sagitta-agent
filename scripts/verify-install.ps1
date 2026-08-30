@@ -45,6 +45,7 @@ $checks = [ordered]@{
     'memory'              = ($dump -match '(?m)(^|[^\w])memory([^\w]|$)|@sagitta/memory')
     'sagitta-auto-advance'= ($dump -match '(?m)sagitta-auto-advance|@sagitta/auto-advance')
     'sagitta-updater'     = ($dump -match '(?m)sagitta-updater|@sagitta/updater')
+    'sagitta-async-work'  = ($dump -match '(?m)sagitta-async-work|@sagitta/async-work')
     'sagitta-codex'       = ($dump -match '(?m)sagitta-codex|@sagitta/codex-dispatch')
     'preset default'      = ($dump -match '(?i)default\s*[:=]\s*["'']?sagitta\b|agent-presets[^\r\n]*sagitta')
     'profile path'        = ($dump -match [regex]::Escape($profilePath) -or $dump -match '(?i)profiles[\\/]+' + [regex]::Escape($ProfileName))

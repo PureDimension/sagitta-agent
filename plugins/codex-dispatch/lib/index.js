@@ -1,19 +1,11 @@
 // ============================================================================
-// sagitta-codex — codex 派单插件（lib/index.js）
+// sagitta-codex — codex 派单适配器
 // ============================================================================
-// 职责：
-//   1) 提供 codex_dispatch 工具：后台 spawn codex CLI 执行任务（模型/沙箱/推理档位可配），
-//      返回 workId；进程与 DSH 生命周期解耦（detached）。
-//   2) 工作注册表（按 agentId 记账）：dispatch 时注册"有界工作"（kind=codex，
-//      带 startedAt/timeoutMs）；进程退出自动回收；超时由 auto-advance 查询时判 stale。
-//   3) 提供 codex_status 工具查询工作状态（running/done/failed/stale）。
-//   4) 暴露服务 sagitta-codex（listActiveWorks/reapStale），供 auto-advance 的
-//      hasRunningWork 判定——只认"注册的有界工作"，不再被其他后台 job 卡死。
-// 安全：任务描述/模型等参数由调用方给出；不输出密钥；spawn 用参数数组避免引号问题。
-// ============================================================================
+// codex-dispatch 不再拥有工作注册表。它只负责受控子进程、codex 元数据和
+// 兼容 facade；所有 work_id/task_id/status 生命周期都委托给
+// sagitta-async-work。async-work 缺失或不可用时，派单和状态查询均 fail closed。
 
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -23,133 +15,520 @@ const name = "sagitta-codex";
 const inject = ["tools", "agents"];
 
 const DEFAULT_MODEL = "gpt-5.6-luna";
-const DEFAULT_WORK_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2h：超过视为 stale，auto-advance 自动释放
+const DEFAULT_WORK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MAX_CONCURRENT = 4;
 
 const Config = z.object({
   codexPath: z.string().default("codex").description("codex CLI 可执行文件（或 PATH 名）。"),
   defaultModel: z.string().default(DEFAULT_MODEL).description("默认模型（codex-model-policy.md 当前档位）。"),
-  workTimeoutMs: z.number().default(DEFAULT_WORK_TIMEOUT_MS).description("工作超时（毫秒）；超时视为 stale 自动回收。"),
-  maxConcurrent: z.number().min(1).default(MAX_CONCURRENT).description("每 agent 并发 codex 工作上限（正整数）。"),
+  workTimeoutMs: z.number().default(DEFAULT_WORK_TIMEOUT_MS).description("codex 工作超时（毫秒），必须在 1 秒至 24 小时内。"),
+  maxConcurrent: z.number().min(1).default(MAX_CONCURRENT).description("每 agent 并发 codex 工作上限。"),
   sandbox: z.string().default("danger-full-access").description("codex 沙箱模式。"),
-  reasoningEffort: z.string().default("xhigh").description("codex 推理档位。")
+  reasoningEffort: z.string().default("xhigh").description("codex 推理档位。"),
+  legacyDetachedPids: z.array(z.number()).default([])
+    .description("历史 detached codex PID（仅清理明确提供的 PID；无法确认时 async-work 保持 degraded）。"),
 });
 
-const WORK_STATUS = Object.freeze({
-  RUNNING: "running",
-  DONE: "done",
-  FAILED: "failed",
-  KILLED: "killed",
-  STALE: "stale"
-});
+const WORK_STATUSES = ["running", "completed", "failed", "cancelled", "expired"];
+const CODEX_WORK_FIELDS = {
+  work_id: { type: "string", required: true },
+  workId: { type: "string" },
+  task_id: { type: "string", required: true },
+  owner_id: { type: "string", required: true },
+  kind: { type: "string", required: true },
+  desc: { type: "string", required: true },
+  task: { type: "string" },
+  model: { type: "string" },
+  pid: { type: "integer" },
+  started_at: { type: "string", required: true },
+  startedAt: { type: "integer" },
+  timeout_ms: { type: "integer", required: true },
+  timeoutMs: { type: "integer" },
+  status: { type: "string", required: true, enum: WORK_STATUSES },
+  ended_at: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+  endedAt: { oneOf: [{ type: "integer" }, { type: "null" }] },
+  reason: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+  exit_code: { oneOf: [{ type: "integer" }, { type: "null" }] },
+};
+const CODEX_WORK_SCHEMA = { type: "object", additionalProperties: false, properties: CODEX_WORK_FIELDS };
 
-class CodexWorkRegistry {
-  constructor({ workTimeoutMs, maxConcurrent }) {
-    this.workTimeoutMs = workTimeoutMs;
-    this.maxConcurrent = maxConcurrent;
-    this.byAgent = new Map(); // agentId -> Map<workId, work>
-  }
+function loggerWarn(ctx, message) {
+  try { ctx?.logger?.warn?.(message); } catch { /* diagnostics are best effort */ }
+}
 
-  _works(agentId) {
-    if (!this.byAgent.has(agentId)) this.byAgent.set(agentId, new Map());
-    return this.byAgent.get(agentId);
-  }
-
-  register(agentId, { kind = "codex", task, model, pid, timeoutMs }) {
-    const works = this._works(agentId);
-    const active = [...works.values()].filter((w) => w.status === WORK_STATUS.RUNNING && !this.isStale(w));
-    if (active.length >= this.maxConcurrent) {
-      throw new Error(`codex 并发上限 ${this.maxConcurrent} 已满（agent ${agentId}）；请先等现有工作结束或 codex_status 查看。`);
-    }
-    const work = {
-      id: randomUUID().slice(0, 8),
-      kind,
-      task: String(task ?? "").slice(0, 200),
-      model,
-      pid,
-      startedAt: Date.now(),
-      timeoutMs: timeoutMs ?? this.workTimeoutMs,
-      status: WORK_STATUS.RUNNING,
-      exitCode: null,
-      endedAt: null,
-    };
-    works.set(work.id, work);
-    return work;
-  }
-
-  isStale(work) {
-    return work.status === WORK_STATUS.RUNNING && Date.now() - work.startedAt > work.timeoutMs;
-  }
-
-  markEnded(agentId, workId, status, exitCode) {
-    const work = this.byAgent.get(agentId)?.get(workId);
-    if (!work || work.status !== WORK_STATUS.RUNNING) return work;
-    work.status = status;
-    work.exitCode = exitCode ?? null;
-    work.endedAt = Date.now();
-    return work;
-  }
-
-  /** 活跃（running 且未超时）工作列表——auto-advance 用它判断"有工作" */
-  listActive(agentId) {
-    const works = this.byAgent.get(agentId);
-    if (!works) return [];
-    const result = [];
-    for (const work of works.values()) {
-      if (work.status === WORK_STATUS.RUNNING && !this.isStale(work)) result.push({ ...work });
-    }
-    return result;
-  }
-
-  /** 回收：超时 stale 工作标记 + 清理 ended 历史（保留最近 20 条供 status 查询） */
-  reap(agentId) {
-    const works = this.byAgent.get(agentId);
-    if (!works) return 0;
-    let reaped = 0;
-    for (const work of works.values()) {
-      if (work.status === WORK_STATUS.RUNNING && this.isStale(work)) {
-        work.status = WORK_STATUS.STALE;
-        work.endedAt = Date.now();
-        reaped++;
-      }
-    }
-    // 清理 ended 历史（保留 20 条）
-    const ended = [...works.values()].filter((w) => w.status !== WORK_STATUS.RUNNING);
-    if (ended.length > 20) {
-      const toDrop = ended.slice(0, ended.length - 20);
-      for (const work of toDrop) works.delete(work.id);
-    }
-    return reaped;
-  }
-
-  get(agentId, workId) {
-    return this.byAgent.get(agentId)?.get(workId) ?? null;
-  }
-
-  kill(agentId, workId) {
-    const work = this.get(agentId, workId);
-    if (!work) return { ok: false, reason: "work-not-found" };
-    if (work.status !== WORK_STATUS.RUNNING) return { ok: false, reason: `not-running(${work.status})` };
-    if (work.pid) {
-      try { process.kill(-work.pid, "SIGTERM"); } catch { try { process.kill(work.pid, "SIGTERM"); } catch { /* already gone */ } }
-    }
-    work.status = WORK_STATUS.KILLED;
-    work.endedAt = Date.now();
-    return { ok: true };
+function asyncWorkFrom(ctx) {
+  try {
+    const direct = ctx?.["sagitta-async-work"];
+    if (direct !== undefined) return direct;
+    return typeof ctx?.get === "function" ? ctx.get("sagitta-async-work", false) : undefined;
+  } catch {
+    return undefined;
   }
 }
 
-/**
- * 解析 codex 启动方式。Windows 下优先直接定位原生 codex.exe（vendor 目录），
- * 跳过 codex.js 包装层：codex.js 内部再 spawn 二进制且 stdio: "inherit"，
- * 会触发 Windows 为第二层控制台程序新建窗口（黑框弹窗）。直接 spawn
- * codex.exe + windowsHide:true + stdio:"ignore" 则完全无窗口。
- * 找不到原生二进制时回退老逻辑（node 跑 codex.js）；非 Windows 直接 spawn codexPath。
- */
-function resolveCodexLaunch(codexPath) {
-  if (process.platform !== "win32") {
-    return { command: codexPath, args: [] };
+function requireAsyncWork(ctx) {
+  const service = asyncWorkFrom(ctx);
+  if (!service || typeof service.register !== "function" || typeof service.listActive !== "function" ||
+      typeof service.get !== "function" || typeof service.complete !== "function" ||
+      typeof service.fail !== "function" || typeof service.cancel !== "function" ||
+      typeof service.reap !== "function") {
+    const error = new Error("sagitta-async-work 服务未加载或接口不完整；为避免未登记工作，codex 派单已保守拒绝");
+    error.code = "ASYNC_WORK_UNAVAILABLE";
+    error.status = 503;
+    throw error;
   }
+  return service;
+}
+
+function ownerIdOf(exec) {
+  const id = exec?.agent?.id;
+  return typeof id === "string" && id.trim().length > 0 ? id.trim() : "unknown";
+}
+
+function workIdOf(work) {
+  return work?.work_id ?? work?.workId ?? work?.id;
+}
+
+function legacyStatus(status) {
+  switch (status) {
+    case "completed": return "done";
+    case "cancelled": return "killed";
+    case "expired": return "stale";
+    default: return status;
+  }
+}
+
+function epochFromIso(value) {
+  if (typeof value !== "string") return undefined;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) ? epoch : undefined;
+}
+
+function toCodexWork(work, metadata = {}) {
+  if (!work) return null;
+  const workId = workIdOf(work);
+  const view = {
+    work_id: String(work.work_id ?? workId ?? ""),
+    workId: String(workId ?? ""),
+    task_id: String(work.task_id ?? metadata.taskId ?? ""),
+    owner_id: String(work.owner_id ?? metadata.ownerId ?? ""),
+    kind: String(work.kind ?? "codex"),
+    desc: String(work.desc ?? metadata.task ?? ""),
+    task: String(work.desc ?? metadata.task ?? ""),
+    started_at: String(work.started_at ?? ""),
+    timeout_ms: Number(work.timeout_ms),
+    status: work.status,
+    ended_at: work.ended_at ?? null,
+    reason: work.reason ?? null,
+  };
+  if (metadata.model !== undefined) view.model = metadata.model;
+  if (metadata.pid !== undefined && metadata.pid !== null) view.pid = metadata.pid;
+  const startedAt = epochFromIso(work.started_at);
+  if (startedAt !== undefined) view.startedAt = startedAt;
+  if (Number.isInteger(work.timeout_ms)) view.timeoutMs = work.timeout_ms;
+  if (work.ended_at !== null && work.ended_at !== undefined) {
+    const endedAt = epochFromIso(work.ended_at);
+    if (endedAt !== undefined) view.endedAt = endedAt;
+  } else {
+    view.endedAt = null;
+  }
+  if (metadata.exitCode !== undefined) view.exit_code = metadata.exitCode;
+  return view;
+}
+
+function toLegacyCodexWork(work, metadata = {}) {
+  const view = toCodexWork(work, metadata);
+  if (!view) return null;
+  return {
+    ...view,
+    id: view.work_id,
+    status: legacyStatus(view.status),
+    ...(view.exit_code !== undefined ? { exitCode: view.exit_code } : {}),
+  };
+}
+
+function runCodex({ codexPath, args, pidRef, cwd }) {
+  const { command, args: prefix } = resolveCodexLaunch(codexPath);
+  const child = spawn(command, [...prefix, ...args], {
+    // v1 is process-scoped: child lifetime is controlled by this adapter and
+    // must not survive DSH disposal as a detached orphan.
+    detached: false,
+    stdio: "ignore",
+    windowsHide: true,
+    ...(cwd ? { cwd } : {}),
+  });
+  if (child.pid === undefined) {
+    const error = new Error("codex 启动失败（spawn 未产生进程，命令不可执行）");
+    error.code = "SPAWN_NO_PID";
+    throw error;
+  }
+  if (pidRef) pidRef.current = child.pid;
+  // Intentionally do not call unref(): a running codex child belongs to this
+  // DSH process and is terminated by adapter disposal.
+  return child;
+}
+
+/**
+ * Locate and request termination of explicitly identified legacy detached
+ * processes. We never scan/kill arbitrary codex processes: old PIDs must come
+ * from the migration config or SAGITTA_CODEX_LEGACY_PIDS. A still-live PID is
+ * reported as uncertain so async-work can fail closed until the next check.
+ */
+function cleanupLegacyDetachedCodex(pids, logger) {
+  const normalized = [...new Set((Array.isArray(pids) ? pids : [])
+    .map((pid) => Number(pid))
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid))];
+  let attempted = 0;
+  let uncertain = false;
+  for (const pid of normalized) {
+    let alive = false;
+    try {
+      process.kill(pid, 0);
+      alive = true;
+    } catch (error) {
+      if (error?.code !== "ESRCH") uncertain = true;
+    }
+    if (!alive) continue;
+    attempted++;
+    try {
+      process.kill(pid, "SIGTERM");
+      // A signal being accepted does not prove that the detached process has
+      // exited. Keep the registry unavailable until a later verification.
+      try { process.kill(pid, 0); uncertain = true; } catch (error) {
+        if (error?.code !== "ESRCH") uncertain = true;
+      }
+    } catch {
+      uncertain = true;
+      try { logger?.(`sagitta-codex: 无法终止历史 detached PID ${pid}`); } catch { /* noop */ }
+    }
+  }
+  return { ok: !uncertain, attempted, pids: normalized };
+}
+
+function legacyPidsFrom(config) {
+  if (Array.isArray(config?.legacyDetachedPids)) return config.legacyDetachedPids;
+  const raw = process.env.SAGITTA_CODEX_LEGACY_PIDS;
+  if (!raw) return [];
+  return raw.split(",").map((value) => Number(value.trim())).filter((value) => Number.isInteger(value));
+}
+
+function terminateChild(child) {
+  if (!child || child.exitCode !== null && child.exitCode !== undefined) return false;
+  try {
+    if (typeof child.kill === "function") return child.kill("SIGTERM") !== false;
+  } catch {
+    // The process may have exited between the state check and kill.
+  }
+  return false;
+}
+
+/**
+ * Compatibility wrapper for callers that imported CodexWorkRegistry directly.
+ * It is an adapter over the generic service, not another Map-backed registry.
+ */
+class CodexWorkRegistry {
+  constructor({ asyncWork, maxConcurrent = MAX_CONCURRENT } = {}) {
+    this.asyncWork = asyncWork;
+    this.maxConcurrent = maxConcurrent;
+  }
+
+  _service() {
+    if (!this.asyncWork || typeof this.asyncWork.register !== "function" ||
+        typeof this.asyncWork.listActive !== "function" || typeof this.asyncWork.get !== "function" ||
+        typeof this.asyncWork.complete !== "function" || typeof this.asyncWork.fail !== "function" ||
+        typeof this.asyncWork.cancel !== "function" || typeof this.asyncWork.reap !== "function") {
+      const error = new Error("sagitta-async-work 服务不可用；codex registry 已保守拒绝操作");
+      error.code = "ASYNC_WORK_UNAVAILABLE";
+      throw error;
+    }
+    return this.asyncWork;
+  }
+
+  register(ownerId, { kind = "codex", task, taskId, task_id: taskIdSnake, model, timeoutMs } = {}) {
+    const service = this._service();
+    const active = service.listActive(ownerId, {});
+    if (!Array.isArray(active)) throw new Error("async-work listActive 未返回数组");
+    if (active.filter((work) => work.kind === "codex").length >= this.maxConcurrent) {
+      throw new Error(`codex 并发上限 ${this.maxConcurrent} 已满（agent ${ownerId}）`);
+    }
+    return service.register({ ownerId, taskId: taskId ?? taskIdSnake, kind, desc: task, timeoutMs });
+  }
+
+  listActive(ownerId, taskId) {
+    return this._service().listActive(ownerId, taskId === undefined ? {} : { taskId });
+  }
+
+  reap(ownerId) {
+    return this._service().reap(ownerId);
+  }
+
+  get(ownerId, workId) {
+    return this._service().get(ownerId, workId);
+  }
+
+  markEnded(ownerId, workId, status, _exitCode, taskId) {
+    const service = this._service();
+    if (status === "done" || status === "completed") return service.complete(ownerId, workId, taskId);
+    if (status === "failed") return service.fail(ownerId, workId, "codex exit failed", taskId);
+    if (status === "killed" || status === "cancelled") return service.cancel(ownerId, workId, taskId);
+    return service.get(ownerId, workId);
+  }
+
+  kill(ownerId, workId, taskId) {
+    return { ok: true, work: this._service().cancel(ownerId, workId, taskId) };
+  }
+}
+
+function registerCodexTools(ctx, options) {
+  const { resolved, records, disposed } = options;
+
+  ctx.tools.register(defineTool({
+    name: "codex_dispatch",
+    description:
+      "派发 codex CLI 后台任务并登记为有界异步工作。task_id 必填且会写入通用 async-work 注册表；" +
+      "工作结束/失败/超时会自动更新状态，DSH dispose 会取消并终止受控子进程。async-work 缺失时保守拒绝派单。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "绑定的任务 id；不能省略或用当前任务猜测。" },
+      task: { type: "string", required: true, description: "codex 任务描述（完整、自包含，codex 无本会话上下文）。" },
+      model: { type: "string", description: `模型（默认 ${DEFAULT_MODEL}；档位见 codex-model-policy.md）。` },
+      timeoutMs: { type: "integer", description: "本工作超时（毫秒，1 秒至 24 小时）。" },
+      cwd: { type: "string", description: "codex 工作目录（默认继承 DSH 进程 cwd）。" },
+    },
+    output: { schema: CODEX_WORK_SCHEMA },
+    render: (_args, value) => [{
+      type: "text",
+      text: `## codex 已派发（${value.work_id}）\n\n- task_id：${value.task_id}\n- 模型：${value.model}\n- 状态：${value.status}\n- 任务：${value.task.slice(0, 120)}${value.task.length > 120 ? "…" : ""}\n\n可用 codex_status 查询。`,
+    }],
+    presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+    timeoutMs: 30000,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      if (disposed.value) throw new Error("sagitta-codex 已进入 dispose，拒绝新派单");
+      const ownerId = ownerIdOf(exec);
+      const asyncWork = requireAsyncWork(ctx);
+      const active = asyncWork.listActive(ownerId, {});
+      if (!Array.isArray(active)) throw new Error("async-work listActive 未返回数组，已保守拒绝派单");
+      const codexActive = active.filter((work) => work?.kind === "codex");
+      if (codexActive.length >= resolved.maxConcurrent) {
+        throw new Error(`codex 并发上限 ${resolved.maxConcurrent} 已满（agent ${ownerId}）`);
+      }
+
+      const model = typeof args.model === "string" && args.model.trim() ? args.model.trim() : resolved.defaultModel;
+      const codexArgs = [
+        "exec",
+        "--skip-git-repo-check",
+        "-s", resolved.sandbox,
+        "-m", model,
+        "-c", `model_reasoning_effort=${resolved.reasoningEffort}`,
+        String(args.task),
+      ];
+      const timeoutMs = args.timeoutMs === undefined ? resolved.workTimeoutMs : args.timeoutMs;
+      let work;
+      try {
+        work = asyncWork.register({
+          ownerId,
+          taskId: args.task_id,
+          kind: "codex",
+          desc: String(args.task),
+          timeoutMs,
+        });
+      } catch (error) {
+        throw new Error(`codex 派发被拒：${error.message}`);
+      }
+      const workId = workIdOf(work);
+      if (!workId) throw new Error("async-work register 未返回 work_id，已保守拒绝启动 codex");
+      const metadata = {
+        ownerId,
+        taskId: args.task_id,
+        task: String(args.task),
+        model,
+        child: null,
+        pid: null,
+        exitCode: undefined,
+      };
+      records.set(String(workId), metadata);
+
+      const pidRef = { current: null };
+      let child;
+      try {
+        child = runCodex({
+          codexPath: resolved.codexPath,
+          args: codexArgs,
+          pidRef,
+          cwd: typeof args.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : undefined,
+        });
+      } catch (error) {
+        metadata.exitCode = null;
+        try { asyncWork.fail(ownerId, workId, `spawn failed: ${error.message}`, args.task_id); } catch { /* preserve original spawn error */ }
+        records.delete(String(workId));
+        throw new Error(`codex 启动失败：${error.message}`);
+      }
+      metadata.child = child;
+      metadata.pid = pidRef.current;
+
+      const settle = (kind, code, signal) => {
+        metadata.exitCode = code ?? null;
+        try {
+          if (kind === "completed") asyncWork.complete(ownerId, workId, args.task_id);
+          else asyncWork.fail(ownerId, workId, signal ? `codex terminated by ${signal}` : `codex exited with code ${code}`, args.task_id);
+        } catch (error) {
+          // Timeout, explicit cancel or dispose may win the race. The generic
+          // registry's terminal guard is authoritative in that case.
+          if (error?.code !== "ASYNC_WORK_TERMINAL") loggerWarn(ctx, `sagitta-codex: work ${workId} settle ignored: ${error?.message ?? error}`);
+        }
+      };
+      child.on("error", (error) => {
+        settle("failed", null, error?.message ?? "spawn-error");
+        loggerWarn(ctx, `sagitta-codex: work ${workId} spawn error: ${error?.message ?? String(error)}`);
+      });
+      child.on("exit", (code, signal) => settle(signal === null && code === 0 ? "completed" : "failed", code, signal));
+
+      return toCodexWork({ ...work, work_id: workId, task_id: args.task_id, desc: String(args.task) }, metadata);
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: `codex_dispatch(task_id=${args.task_id}, model=${args.model ?? "luna"}, task=${JSON.stringify(args.task).slice(0, 60)})`,
+      kind: "codex",
+      rawInput: JSON.stringify(args),
+    }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "codex_status",
+    description:
+      "查询 codex 派单工作状态（running/completed/failed/cancelled/expired）。可按 work_id、task_id 查询；" +
+      "返回 work_id/task_id 及通用 async-work 生命周期字段。async-work 不可用时保守报错。",
+    parameters: {
+      work_id: { type: "string", description: "工作 id（codex_dispatch 返回）。" },
+      task_id: { type: "string", description: "按任务 id 过滤。" },
+      // Keep the old camel-case input accepted for existing callers.
+      workId: { type: "string", description: "兼容旧调用的 work_id 写法。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { works: { type: "array", items: CODEX_WORK_SCHEMA, required: true } },
+      },
+    },
+    render: (_args, value) => [{
+      type: "text",
+      text: value.works.length === 0
+        ? "## codex 工作状态\n\n（无匹配工作）"
+        : "## codex 工作状态\n\n" + value.works.map((work) => `- **${work.work_id}** [${work.status}] task=${work.task_id} ${work.task}`).join("\n"),
+    }],
+    presentationMeta: (_args, value) => ({ count: value.works.length }),
+    timeoutMs: 15000,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const asyncWork = requireAsyncWork(ctx);
+      const ownerId = ownerIdOf(exec);
+      const requestedId = args.work_id ?? args.workId;
+      const result = [];
+      if (requestedId !== undefined) {
+        const work = asyncWork.get(ownerId, requestedId);
+        if (work && (args.task_id === undefined || work.task_id === args.task_id) && work.kind === "codex") {
+          result.push(toCodexWork(work, records.get(String(requestedId))));
+        }
+      } else {
+        for (const [workId, metadata] of records.entries()) {
+          if (metadata.ownerId !== ownerId || (args.task_id !== undefined && metadata.taskId !== args.task_id)) continue;
+          const work = asyncWork.get(ownerId, workId);
+          if (work?.kind === "codex") result.push(toCodexWork(work, metadata));
+        }
+        // After a process restart this adapter has no historical metadata. The
+        // process-scoped registry also has no restored records, but active
+        // entries from a test/custom service can still be reported safely.
+        if (result.length === 0) {
+          const active = asyncWork.listActive(ownerId, args.task_id === undefined ? {} : { taskId: args.task_id });
+          if (!Array.isArray(active)) throw new Error("async-work listActive 未返回数组");
+          for (const work of active.filter((item) => item?.kind === "codex")) result.push(toCodexWork(work, records.get(String(workIdOf(work)))));
+        }
+      }
+      return { works: result.filter(Boolean) };
+    },
+    presentCall: (args) => ({ card: "generic", title: `codex_status(work_id=${args.work_id ?? args.workId ?? "all"})`, kind: "codex", rawInput: JSON.stringify(args) }),
+  }));
+}
+
+function apply(ctx, config) {
+  const resolved = {
+    codexPath: config?.codexPath ?? "codex",
+    defaultModel: config?.defaultModel ?? DEFAULT_MODEL,
+    workTimeoutMs: config?.workTimeoutMs ?? DEFAULT_WORK_TIMEOUT_MS,
+    maxConcurrent: Number.isFinite(Number(config?.maxConcurrent)) && Number(config.maxConcurrent) > 0
+      ? Number(config.maxConcurrent) : MAX_CONCURRENT,
+    sandbox: config?.sandbox ?? "danger-full-access",
+    reasoningEffort: config?.reasoningEffort ?? "xhigh",
+  };
+  const records = new Map();
+  const disposed = { value: false };
+  const cleanupTimer = { value: null };
+  const asyncWork = asyncWorkFrom(ctx);
+  if (!asyncWork) loggerWarn(ctx, "sagitta-codex: sagitta-async-work 缺失；codex 工具将 fail closed，不会启动未登记子进程");
+
+  const legacy = cleanupLegacyDetachedCodex(legacyPidsFrom(config), (message) => loggerWarn(ctx, message));
+  if (!legacy.ok && asyncWork?.markUnavailable) {
+    const reason = `历史 detached codex 进程清理结果待确认（${legacy.attempted} 个 PID）`;
+    asyncWork.markUnavailable(reason);
+    cleanupTimer.value = setTimeout(() => {
+      let allGone = true;
+      for (const pid of legacy.pids) {
+        try { process.kill(pid, 0); allGone = false; } catch (error) {
+          if (error?.code !== "ESRCH") allGone = false;
+        }
+      }
+      if (allGone) asyncWork.markAvailable?.();
+      cleanupTimer.value = null;
+    }, 250);
+    cleanupTimer.value.unref?.();
+  }
+
+  const dispose = () => {
+    if (disposed.value) return;
+    disposed.value = true;
+    if (cleanupTimer.value !== null) clearTimeout(cleanupTimer.value);
+    const service = asyncWorkFrom(ctx);
+    // Cancel in the generic registry before terminating children, then forget
+    // adapter metadata. A missing service still cannot prevent child cleanup.
+    for (const [workId, metadata] of records.entries()) {
+      try {
+        const work = service?.get?.(metadata.ownerId, workId);
+        if (work?.status === "running") service.cancel(metadata.ownerId, workId, metadata.taskId);
+      } catch (error) {
+        loggerWarn(ctx, `sagitta-codex: dispose 无法 cancel work ${workId}：${error?.message ?? error}`);
+      }
+      terminateChild(metadata.child);
+    }
+    records.clear();
+  };
+
+  const facade = {
+    listActiveWorks(agentId, options = {}) {
+      const service = requireAsyncWork(ctx);
+      const active = service.listActive(agentId, options.taskId === undefined ? {} : { taskId: options.taskId });
+      if (!Array.isArray(active)) throw new Error("async-work listActive 未返回数组");
+      return active.filter((work) => work?.kind === "codex").map((work) => toLegacyCodexWork(work, records.get(String(workIdOf(work)))));
+    },
+    reapStale(agentId) {
+      return requireAsyncWork(ctx).reap(agentId);
+    },
+    getWork(agentId, workId) {
+      const work = requireAsyncWork(ctx).get(agentId, workId);
+      return work?.kind === "codex" ? toLegacyCodexWork(work, records.get(String(workId))) : null;
+    },
+  };
+  try { ctx?.provide?.(name, facade); } catch { /* optional in minimal harnesses */ }
+  registerCodexTools(ctx, { resolved, records, disposed });
+
+  if (typeof ctx?.effect === "function") ctx.effect(() => dispose, "sagitta-codex: controlled child cleanup");
+  else ctx?.on?.("dispose", dispose);
+  return facade;
+}
+
+/** Resolve the native Windows binary where available, avoiding a console window. */
+function resolveCodexLaunch(codexPath) {
+  if (process.platform !== "win32") return { command: codexPath, args: [] };
   const winTriple = "x86_64-pc-windows-msvc";
   const vendorExe = join("node_modules", "@openai", "codex-win32-x64", "vendor", winTriple, "bin", "codex.exe");
   const exeCandidates = [
@@ -157,244 +536,24 @@ function resolveCodexLaunch(codexPath) {
     join(process.env.APPDATA ?? "", "npm", vendorExe),
     join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", vendorExe),
   ];
-  for (const candidate of exeCandidates) {
-    if (candidate && existsSync(candidate)) {
-      return { command: candidate, args: [] };
-    }
-  }
+  for (const candidate of exeCandidates) if (candidate && existsSync(candidate)) return { command: candidate, args: [] };
   const jsCandidates = [
     process.env.CODEX_JS_PATH,
     join(process.env.APPDATA ?? "", "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
     join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
   ];
-  for (const candidate of jsCandidates) {
-    if (candidate && existsSync(candidate)) {
-      return { command: process.execPath, args: [candidate] };
-    }
-  }
-  // fallback：尝试 codexPath（如用户显式给了 .exe 路径）
+  for (const candidate of jsCandidates) if (candidate && existsSync(candidate)) return { command: process.execPath, args: [candidate] };
   return { command: codexPath, args: [] };
 }
 
-function runCodex({ codexPath, args, pidRef, cwd }) {
-  const { command, args: prefix } = resolveCodexLaunch(codexPath);
-  const child = spawn(command, [...prefix, ...args], {
-    detached: true,          // 与 DSH 生命周期解耦（DSH 重启不杀 codex）
-    stdio: "ignore",
-    windowsHide: true,       // 必须：Windows 下不弹控制台黑框
-    ...(cwd ? { cwd } : {}),
-  });
-  // spawn 失败（如 ENOENT）时 pid 为 undefined——同步判定"未真正启动"，避免假 running 状态
-  if (child.pid === undefined) {
-    const error = new Error("codex 启动失败（spawn 未产生进程，命令不可执行）");
-    error.code = "SPAWN_NO_PID";
-    throw error;
-  }
-  pidRef.current = child.pid;
-  child.unref();
-  return child;
-}
-
-export function apply(ctx, config) {
-  const resolved = config ?? {};
-  const registry = new CodexWorkRegistry({
-    workTimeoutMs: Number.isFinite(Number(resolved.workTimeoutMs)) && Number(resolved.workTimeoutMs) > 0
-      ? Number(resolved.workTimeoutMs) : DEFAULT_WORK_TIMEOUT_MS,
-    maxConcurrent: Number.isFinite(Number(resolved.maxConcurrent)) && Number(resolved.maxConcurrent) > 0
-      ? Number(resolved.maxConcurrent) : MAX_CONCURRENT,
-  });
-
-  // ---- 服务（供 auto-advance 注入）----
-  const service = {
-    listActiveWorks(agentId) {
-      return registry.listActive(agentId);
-    },
-    reapStale(agentId) {
-      return registry.reap(agentId);
-    },
-    getWork(agentId, workId) {
-      return registry.get(agentId, workId);
-    },
-  };
-  ctx.provide?.("sagitta-codex", service);
-  ctx.on?.("dispose", () => {
-    // 插件卸载不杀 codex（detached 独立）；只清理注册表
-    registry.byAgent.clear();
-  });
-
-  // ---- 工具：codex_dispatch ----
-  ctx.tools.register(defineTool({
-    name: "codex_dispatch",
-    description:
-      "派发 codex CLI 后台任务（公司报销配额）：自动在自主推进系统注册'有界工作'（超时自动回收，不永久卡住 auto-advance）。" +
-      "任务结束（done/failed）自动回收；可后续 codex_status 查询。模型默认按 codex-model-policy.md 档位（luna）。" +
-      "并发上限每 agent 4 个。",
-    parameters: {
-      task: { type: "string", required: true, description: "codex 任务描述（完整、自包含，codex 无本会话上下文）。" },
-      model: { type: "string", description: `模型（默认 ${DEFAULT_MODEL}；档位见 codex-model-policy.md）。` },
-      timeoutMs: { type: "integer", description: `本工作超时（毫秒，默认 ${DEFAULT_WORK_TIMEOUT_MS}）。` },
-      cwd: { type: "string", description: "codex 工作目录（默认继承 DSH 进程 cwd；建议传目标仓库/项目目录）。" },
-    },
-    output: {
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          workId: { type: "string", required: true },
-          pid: { type: "integer" },
-          status: { type: "string", required: true },
-          task: { type: "string" },
-          model: { type: "string" },
-        },
-      },
-      render: (_args, value) => [
-        { type: "text", text: `## codex 已派发（${value.workId}）\n\n- 模型：${value.model}\n- 状态：${value.status}\n- 任务：${value.task.slice(0, 120)}${value.task.length > 120 ? "…" : ""}\n\n完成后自动回收；可用 codex_status 查询。` },
-      ],
-      presentationMeta: (_args, value) => ({ workId: value.workId, status: value.status }),
-    },
-    timeoutMs: 30000,
-    isConcurrencySafe: () => true,
-    async execute(args, exec) {
-      const agentId = exec?.agent?.id ?? "unknown";
-      const model = typeof args.model === "string" && args.model.trim() ? args.model.trim() : resolved.defaultModel ?? DEFAULT_MODEL;
-      const timeoutMs = Number.isFinite(Number(args.timeoutMs)) && Number(args.timeoutMs) > 0 ? Number(args.timeoutMs) : undefined;
-
-      // 组装 codex exec 参数（数组形式，避免引号问题）
-      const codexArgs = [
-        "exec",
-        "--skip-git-repo-check",
-        "-s", resolved.sandbox ?? "danger-full-access",
-        "-m", model,
-        "-c", `model_reasoning_effort=${resolved.reasoningEffort ?? "xhigh"}`,
-        String(args.task),
-      ];
-
-      let work;
-      try {
-        work = registry.register(agentId, { kind: "codex", task: args.task, model, timeoutMs, pid: null });
-      } catch (error) {
-        throw new Error(`codex 派发被拒：${error.message}`);
-      }
-
-      const pidRef = { current: null };
-      let child;
-      try {
-        child = runCodex({
-          codexPath: resolved.codexPath ?? "codex",
-          args: codexArgs,
-          pidRef,
-          cwd: typeof args.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : undefined,
-        });
-      } catch (error) {
-        registry.markEnded(agentId, work.id, WORK_STATUS.FAILED, null);
-        throw new Error(`codex 启动失败：${error.message}`);
-      }
-      work.pid = pidRef.current;
-
-      child.on("error", (err) => {
-        registry.markEnded(agentId, work.id, WORK_STATUS.FAILED, null);
-        try { ctx.logger?.warn?.(`sagitta-codex: work ${work.id} spawn error: ${err?.message ?? String(err)}`); } catch { /* noop */ }
-      });
-      child.on("exit", (code, signal) => {
-        registry.markEnded(
-          agentId,
-          work.id,
-          signal ? WORK_STATUS.KILLED : code === 0 ? WORK_STATUS.DONE : WORK_STATUS.FAILED,
-          code
-        );
-      });
-
-      const result = {
-        workId: work.id,
-        status: WORK_STATUS.RUNNING,
-        task: String(args.task).slice(0, 200),
-        model,
-      };
-      if (work.pid !== null && work.pid !== undefined) result.pid = work.pid; // 条件添加（lossless）
-      return result;
-    },
-    presentCall: (args) => ({
-      card: "generic",
-      title: `codex_dispatch(model=${args.model ?? "luna"}, task=${JSON.stringify(args.task).slice(0, 60)})`,
-      kind: "codex",
-      rawInput: JSON.stringify(args),
-    }),
-  }));
-
-  // ---- 工具：codex_status ----
-  ctx.tools.register(defineTool({
-    name: "codex_status",
-    description:
-      "查询 codex 派单工作状态：running（活跃，未超时）/ done / failed / killed / stale（超时自动回收）。" +
-      "不给 workId 时列出该会话所有工作（含历史）。",
-    parameters: {
-      workId: { type: "string", description: "工作 id（codex_dispatch 返回）。" },
-    },
-    output: {
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          works: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                id: { type: "string", required: true },
-                kind: { type: "string" },
-                task: { type: "string" },
-                model: { type: "string" },
-                status: { type: "string", required: true },
-                startedAt: { type: "integer" },
-                endedAt: { type: "integer" },
-                exitCode: { type: "integer" },
-              },
-            },
-          },
-        },
-      },
-      render: (_args, value) => [
-        { type: "text", text: "## codex 工作状态\n\n" + value.works.map((w) => `- **${w.id}** [${w.status}] ${w.task.slice(0, 60)}`).join("\n") },
-      ],
-      presentationMeta: (_args, value) => ({ count: value.works.length }),
-    },
-    timeoutMs: 15000,
-    isConcurrencySafe: () => true,
-    async execute(args, exec) {
-      const agentId = exec?.agent?.id ?? "unknown";
-      registry.reap(agentId);
-      let works;
-      if (args.workId) {
-        const work = registry.get(agentId, args.workId);
-        works = work ? [work] : [];
-      } else {
-        works = [...(registry.byAgent.get(agentId)?.values() ?? [])];
-      }
-      return {
-        works: works.map((w) => {
-          // 条件添加：undefined 属性会被 snapshot 判 lossless 失败
-          const item = {
-            id: w.id,
-            kind: w.kind,
-            task: w.task,
-            model: w.model,
-            status: w.status,
-            startedAt: w.startedAt,
-          };
-          if (w.endedAt !== null && w.endedAt !== undefined) item.endedAt = w.endedAt;
-          if (w.exitCode !== null && w.exitCode !== undefined) item.exitCode = w.exitCode;
-          return item;
-        }),
-      };
-    },
-    presentCall: (args) => ({
-      card: "generic",
-      title: `codex_status(workId=${args.workId ?? "all"})`,
-      kind: "codex",
-      rawInput: JSON.stringify(args),
-    }),
-  }));
-}
-
-export { CodexWorkRegistry, Config, inject, name };
+export {
+  CODEX_WORK_FIELDS,
+  CodexWorkRegistry,
+  Config,
+  cleanupLegacyDetachedCodex,
+  inject,
+  name,
+  resolveCodexLaunch,
+  runCodex,
+  apply,
+};

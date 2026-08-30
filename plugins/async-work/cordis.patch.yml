@@ -1,0 +1,5 @@
+# @sagitta/async-work bundle layer.
+# The generic registry must be present before adapters such as codex-dispatch.
+- insert:
+    - id: sagitta-async-work
+      name: '@sagitta/async-work'
