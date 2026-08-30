@@ -740,6 +740,245 @@ export function registerMemoryTools(ctx, client) {
     },
     presentCall: (args) => presentCall("verify", args, args.task_id ? `task=${args.task_id}` : `entry=${args.entry_id || ""} signal=${args.signal || ""}`),
   }));
+
+  // ---- task API（docs/task-api-p1.md §1；/task 路由 2026-08-30 部署上线）----
+  // 任务管理（个人/公司项目待办）走云端 D1 tasks 表，与 memory 条目独立。
+  // 状态机：open | in_progress | blocked | waiting | done；priority 0普通/1高/2紧急；
+  // checkbox=1 表示"涟漪待处理"项（auto-advance 悬浮窗"待处理需求"区读 GET /task?checkbox=1&status=open）。
+  // archived=1 为软删（列表/搜索默认排除）；status=done 表示完成（保留事实，不软删）。
+
+  const TASK_FIELDS = {
+    id: { type: "string", required: true },
+    project: { type: "string", required: true },
+    title: { type: "string", required: true },
+    status: { type: "string", required: true },
+    priority: { type: "integer", required: true },
+    checkbox: { type: "integer", required: true },
+    stream: { type: "string", required: true },
+    body: { type: "string" },
+    created_at: { type: "string", required: true },
+    updated_at: { type: "string" },
+    done_at: { type: "string" },
+    archived: { type: "integer", required: true },
+  };
+  const TASK_STATUSES = ["open", "in_progress", "blocked", "waiting", "done"];
+  const TASK_STREAMS = [...STREAMS, "company"];
+
+  ctx.tools.register(defineTool({
+    name: "task_list",
+    description:
+      "任务列表（云端 D1 tasks 表，docs/task-api-p1.md）：按 project/stream/status/checkbox 过滤；" +
+      "默认排除 archived（软删）。checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。",
+    parameters: {
+      project: { type: "string", description: "项目过滤（如 research/lmy-diffusion-accel、sagitta-agent）。" },
+      stream: { type: "string", enum: TASK_STREAMS, description: "流过滤：personal-projects | company-projects | sagitta | ripple | company。" },
+      status: { type: "string", enum: TASK_STATUSES, description: "状态过滤。" },
+      checkbox: { type: "integer", description: "1=只列涟漪待处理项；0=只列非 checkbox 项。" },
+      page: { type: "integer" },
+      size: { type: "integer", description: "每页数量（默认 50）。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          total: { type: "integer", required: true },
+          items: { type: "array", items: { type: "object", additionalProperties: false, properties: TASK_FIELDS } },
+        },
+      },
+      render: (_args, value) => {
+        const head = `## 任务列表（${value.total} 项）\n`;
+        if (!value.items || value.items.length === 0) return [{ type: "text", text: head + "（无任务）" }];
+        const lines = value.items.map((t) => {
+          const cb = t.checkbox === 1 ? "☐" : "·";
+          const st = t.status === "done" ? "✅" : t.status === "blocked" ? "🚩" : t.status === "in_progress" ? "🔄" : t.status === "waiting" ? "⏳" : "□";
+          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}）`;
+        });
+        return [{ type: "text", text: head + lines.join("\n") }];
+      },
+      presentationMeta: (_args, value) => ({ total: value.total }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const data = await client.listTasks(
+        {
+          project: args.project,
+          stream: args.stream,
+          status: args.status,
+          checkbox: args.checkbox,
+          page: args.page,
+          size: args.size,
+        },
+        exec.signal
+      );
+      return { total: data.total, items: (data.items || []).map(pickTask) };
+    },
+    presentCall: (args) => presentCall("task_list", args, `project=${args.project || ""} status=${args.status || ""} checkbox=${args.checkbox ?? ""}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_create",
+    description:
+      "创建任务（云端 D1 tasks 表）：project（项目）+ title 必填；status 默认 open；priority 默认 0；" +
+      "checkbox=1 表示涟漪待处理项（会出现在悬浮窗\"待处理需求\"区）；stream 默认 company。管理字段由服务端生成。",
+    parameters: {
+      project: { type: "string", required: true, description: "所属项目（与 TASKS.md §1 分类对齐，如 research/lmy-diffusion-accel）。" },
+      title: { type: "string", required: true, description: "条目一行描述。" },
+      status: { type: "string", enum: TASK_STATUSES, description: "默认 open。" },
+      priority: { type: "integer", description: "0 普通 / 1 高 / 2 紧急（默认 0）。" },
+      checkbox: { type: "boolean", description: "true=涟漪待处理项（默认 false）。" },
+      stream: { type: "string", enum: TASK_STREAMS, description: "默认 company。" },
+      body: { type: "string", description: "内嵌描述/notes。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { ...TASK_FIELDS, message: { type: "string", required: true } },
+      },
+      render: (_args, value) => [{ type: "text", text: `## 任务已创建\n\n**${value.title}**（${value.id} · ${value.project} · ${value.status}${value.checkbox === 1 ? " · ☐待处理" : ""}）` }],
+      presentationMeta: (_args, value) => ({ id: value.id, project: value.project }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const body = {
+        project: args.project.trim(),
+        title: args.title.trim(),
+        ...(args.status ? { status: args.status } : {}),
+        ...(args.priority !== undefined ? { priority: args.priority } : {}),
+        ...(args.checkbox !== undefined ? { checkbox: args.checkbox === true ? 1 : 0 } : {}),
+        ...(args.stream ? { stream: args.stream } : {}),
+        ...(args.body !== undefined ? { body: args.body } : {}),
+      };
+      const created = await client.createTask(body, exec.signal);
+      return { ...pickTask(created), message: `已创建任务 ${created.id}` };
+    },
+    presentCall: (args) => presentCall("task_create", args, `project=${args.project} title=${JSON.stringify(args.title).slice(0, 40)}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_update",
+    description:
+      "更新任务（PATCH /task/{id}）：只允许业务字段（title/status/priority/body/checkbox）；" +
+      "status=done 表示完成（done_at 由服务端填写，保留事实）。task_id 可从 task_list 获取。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
+      title: { type: "string" },
+      status: { type: "string", enum: TASK_STATUSES },
+      priority: { type: "integer" },
+      body: { type: "string" },
+      checkbox: { type: "boolean" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { ...TASK_FIELDS, message: { type: "string", required: true } },
+      },
+      render: (_args, value) => [{ type: "text", text: `## 任务已更新\n\n**${value.title}**（${value.id} · ${value.status}${value.done_at ? ` · ✅ ${value.done_at}` : ""}）` }],
+      presentationMeta: (_args, value) => ({ id: value.id, status: value.status }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const body = {
+        ...(args.title !== undefined ? { title: args.title } : {}),
+        ...(args.status !== undefined ? { status: args.status } : {}),
+        ...(args.priority !== undefined ? { priority: args.priority } : {}),
+        ...(args.body !== undefined ? { body: args.body } : {}),
+        ...(args.checkbox !== undefined ? { checkbox: args.checkbox === true ? 1 : 0 } : {}),
+      };
+      if (Object.keys(body).length === 0) throw new Error("task_update 至少需要更新一个字段。");
+      const updated = await client.patchTask(args.task_id, body, exec.signal);
+      return { ...pickTask(updated), message: `已更新任务 ${updated.id}` };
+    },
+    presentCall: (args) => presentCall("task_update", args, `id=${args.task_id} status=${args.status || ""}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_archive",
+    description:
+      "软删除任务（DELETE /task/{id} → archived=1）：列表/搜索默认不再返回，保留事实与审计字段。" +
+      "完成的任务用 task_update status=done（不软删）；只有确实不再需要跟踪的才 archive。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { ...TASK_FIELDS, message: { type: "string", required: true } },
+      },
+      render: (_args, value) => [{ type: "text", text: `## 任务已归档\n\n**${value.title}**（${value.id}）已软删（archived=1），可从 D1 直接查回。` }],
+      presentationMeta: (_args, value) => ({ id: value.id, archived: true }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const removed = await client.deleteTask(args.task_id, exec.signal);
+      return { ...pickTask(removed), message: `已归档任务 ${removed.id}` };
+    },
+    presentCall: (args) => presentCall("task_archive", args, `id=${args.task_id}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_search",
+    description:
+      "关键词检索任务（POST /task/search，LIKE 匹配 title/body/project）：默认排除 archived。" +
+      "可选 project/stream/status 过滤。",
+    parameters: {
+      query: { type: "string", required: true, description: "关键词（匹配 title/body/project）。" },
+      project: { type: "string" },
+      stream: { type: "string", enum: TASK_STREAMS },
+      status: { type: "string", enum: TASK_STATUSES },
+      page: { type: "integer" },
+      size: { type: "integer" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          total: { type: "integer", required: true },
+          items: { type: "array", items: { type: "object", additionalProperties: false, properties: TASK_FIELDS } },
+        },
+      },
+      render: (_args, value) => [
+        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}）`).join("\n") },
+      ],
+      presentationMeta: (_args, value) => ({ total: value.total }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const data = await client.searchTasks(
+        { query: args.query, project: args.project, stream: args.stream, status: args.status, page: args.page, size: args.size },
+        exec.signal
+      );
+      return { total: data.total, items: (data.items || []).map(pickTask) };
+    },
+    presentCall: (args) => presentCall("task_search", args, `query=${JSON.stringify(args.query)}`),
+  }));
+}
+
+function pickTask(task) {
+  if (!task) return null;
+  return {
+    id: task.id,
+    project: task.project,
+    title: task.title,
+    status: task.status,
+    priority: Number(task.priority ?? 0),
+    checkbox: Number(task.checkbox ?? 0),
+    stream: task.stream,
+    body: task.body,
+    created_at: task.created_at,
+    updated_at: task.updated_at,
+    done_at: task.done_at,
+    archived: Number(task.archived ?? 0),
+  };
 }
 
 // ---- 系统提示词引导（工具使用纪律 + §4 v1.3 分数驱动信任轨道） ----------------

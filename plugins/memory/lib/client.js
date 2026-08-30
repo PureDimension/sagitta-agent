@@ -325,6 +325,53 @@ export class SagittaMemoryClient {
   async getDelegation(taskId, signal) {
     return await this.request(`/mem/delegations/${encodeURIComponent(taskId)}`, { method: "GET", operation: "read", signal });
   }
+
+  // ---- task API（docs/task-api-p1.md；/task 路由 08-30 部署上线）----
+
+  async listTasks(filters = {}, signal) {
+    const { project, stream, status, checkbox, page, size } = filters;
+    const query = {};
+    if (project) query.project = project;
+    if (stream) query.stream = stream;
+    if (status) query.status = status;
+    if (checkbox !== undefined && checkbox !== null && checkbox !== "") query.checkbox = String(checkbox);
+    if (page !== undefined) query.page = page;
+    if (size !== undefined) query.size = size;
+    return await this.request("/task", { method: "GET", operation: "read", query, signal });
+  }
+
+  async getTask(id, signal) {
+    return await this.request(`/task/${encodeURIComponent(id)}`, { method: "GET", operation: "read", signal });
+  }
+
+  async createTask(payload, signal) {
+    return await this.request("/task", { method: "POST", operation: "write", body: payload, signal });
+  }
+
+  async patchTask(id, payload, signal) {
+    return await this.request(`/task/${encodeURIComponent(id)}`, { method: "PATCH", operation: "write", body: payload, signal });
+  }
+
+  async deleteTask(id, signal) {
+    return await this.request(`/task/${encodeURIComponent(id)}`, { method: "DELETE", operation: "write", signal });
+  }
+
+  async searchTasks(params = {}, signal) {
+    const { query, project, stream, status, page, size } = params;
+    return await this.request("/task/search", {
+      method: "POST",
+      operation: "read",
+      body: {
+        query,
+        ...(project ? { project } : {}),
+        ...(stream ? { stream } : {}),
+        ...(status ? { status } : {}),
+        ...(page !== undefined ? { page } : {}),
+        ...(size !== undefined ? { size } : {}),
+      },
+      signal,
+    });
+  }
 }
 
 function buildQuery(obj) {
