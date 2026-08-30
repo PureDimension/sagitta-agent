@@ -1,11 +1,11 @@
 <#
-  tasksPath contract (before Ripple decision ⑤):
+  tasksPath contract (UI-only stale display):
   - An explicit -TasksPath wins.
   - Otherwise, a non-empty tasksPath already present in the profile patch is
     preserved semantically, so reinstalling the profile is idempotent.
   - A new profile uses the temporary D:\workspace\sagitta-experience\TASKS.md
-    fact-source path. This is intentionally not derived from RepoPath and is
-    expected to migrate to the task API after decision ⑤.
+    display path. This is intentionally not derived from RepoPath; it never
+    participates in autonomous task qualification.
 
   statePath is runtime state, not repository content. New installs keep it in
   the profile directory so updater git pulls cannot collide with it; this
@@ -337,8 +337,8 @@ $effectiveTasksPath = if (-not [string]::IsNullOrWhiteSpace($TasksPath)) {
 } elseif (-not [string]::IsNullOrWhiteSpace($existingTasksPath)) {
     $existingTasksPath
 } else {
-    # Temporary fact-source contract until Ripple decision ⑤ moves the panel
-    # from TASKS.md fallback to the manager-backed task API.
+    # Retained only as the read-only UI stale-display path. Autonomous
+    # qualification always uses the manager-backed cloud task API.
     'D:\workspace\sagitta-experience\TASKS.md'
 }
 
@@ -385,7 +385,6 @@ $patchEntries = [ordered]@{
         '    idleTimeoutMs: 300000'
         "    statePath: $statePathYaml"
         "    tasksPath: $tasksPathYaml"
-        '    taskFallback: true'
     )
     'sagitta-updater' = @(
         '- id: sagitta-updater'

@@ -1,5 +1,13 @@
 import z from "@deepseek-ai/schemastery";
-import { AutoAdvanceService, AUTONOMOUS_PROMPT, STOP_MARKER, splitCloudTaskSnapshotStrict } from "./service.js";
+import {
+  AutoAdvanceService,
+  AUTONOMOUS_PROMPT,
+  STOP_MARKER,
+  splitCloudTaskSnapshotStrict,
+  parseRoundCloseText,
+  parseRoundCloseMessage,
+  validateRoundClosePayload,
+} from "./service.js";
 
 const name = "sagitta-auto-advance";
 const inject = ["agents", "goals", "sessions", "sagitta-manager"];
@@ -38,6 +46,9 @@ export {
   Config,
   STOP_MARKER,
   splitCloudTaskSnapshotStrict,
+  parseRoundCloseText,
+  parseRoundCloseMessage,
+  validateRoundClosePayload,
   apply,
   inject,
   name

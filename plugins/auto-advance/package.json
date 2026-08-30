@@ -1,11 +1,11 @@
 {
   "name": "@sagitta/auto-advance",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "type": "module",
   "main": "lib/index.js",
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/service.js && node --check lib/snapshot.js && node --check lib/client.js && node --check lib/typert.host.js && node --check lib/typert.remote-client.js && node --check test/smoke.mjs",
+    "check": "node --check lib/index.js && node --check lib/service.js && node --check lib/snapshot.js && node --check lib/round-close.js && node --check lib/client.js && node --check lib/typert.host.js && node --check lib/typert.remote-client.js && node --check test/smoke.mjs",
     "smoke": "node test/smoke.mjs"
   },
   "exports": {

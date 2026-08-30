@@ -6,6 +6,17 @@ export declare const inject: readonly ["agents", "goals", "sessions"];
 export declare const Config: unknown;
 export declare const AUTONOMOUS_PROMPT: string;
 export declare const STOP_MARKER: string;
+export declare function parseRoundCloseText(text: string): {
+  readonly task_id: string;
+  readonly action: "update" | "done" | "blocked";
+  readonly progress: string;
+  readonly next: string;
+  readonly round_id: string;
+  readonly blocked_reason?: string;
+  readonly expected_updated_at?: string;
+};
+export declare function parseRoundCloseMessage(message: unknown): { kind: "tool" | "text"; payload: ReturnType<typeof parseRoundCloseText> } | { kind: "tool-other" } | null;
+export declare function validateRoundClosePayload(value: unknown): ReturnType<typeof parseRoundCloseText>;
 export declare function splitCloudTaskSnapshotStrict(value: unknown): {
   readonly source: "cloud";
   readonly total: number;

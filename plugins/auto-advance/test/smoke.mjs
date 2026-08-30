@@ -7,7 +7,10 @@ import {
   AutoAdvanceService,
   buildTaskAuthHeaders,
   isLoopbackUrl,
+  parseRoundCloseMessage,
+  parseRoundCloseText,
   readTasks,
+  STOP_MARKER,
   splitCloudTaskSnapshotStrict,
 } from "../lib/service.js";
 
@@ -83,11 +86,12 @@ const server = createServer(async (request, response) => {
   received.push({ url: request.url, authorization: request.headers.authorization, accessId: request.headers["cf-access-client-id"] });
   const requestPage = Number(new URL(request.url, "http://127.0.0.1").searchParams.get("page") || 1);
   const pagedItems = requestPage === 1 ? cloudItems.slice(0, 2) : cloudItems.slice(2, 3);
+  const terminalItems = [task("tsk-blocked-final", "blocked", null, { blocked_reason: "等待外部依赖" }, 12), task("tsk-done-final", "done", null, {}, 11)];
   const body = responseMode === "error"
     ? { ok: false, error: { code: "UNAVAILABLE", message: "smoke outage" } }
     : { ok: true, data: responseMode === "paged"
       ? page(pagedItems, requestPage, 3, 2)
-      : page(responseMode === "confirmation" ? cloudItems.slice(2, 3) : responseMode === "empty" ? [] : responseMode === "runnable-many" ? cloudItems.slice(0, 2) : cloudItems.slice(0, 1), 1, responseMode === "empty" ? 0 : responseMode === "runnable-many" ? 2 : 1, 200) };
+      : page(responseMode === "terminal" ? terminalItems : responseMode === "confirmation" ? cloudItems.slice(2, 3) : responseMode === "empty" ? [] : responseMode === "runnable-many" ? cloudItems.slice(0, 2) : cloudItems.slice(0, 1), 1, responseMode === "terminal" ? terminalItems.length : responseMode === "empty" ? 0 : responseMode === "runnable-many" ? 2 : 1, 200) };
   response.writeHead(responseMode === "error" ? 503 : 200, { "content-type": "application/json" });
   response.end(JSON.stringify(body));
 });
@@ -143,6 +147,9 @@ try {
   await runnableHarness.service.onTimer(runnableHarness.state, 1);
   assert.equal(runnableHarness.agent.followups.length, 1);
   assert.match(runnableHarness.agent.followups[0].content[0].text, /tsk-open/u);
+  assert.match(runnableHarness.agent.followups[0].content[0].text, /task_round_close/u);
+  assert.match(runnableHarness.agent.followups[0].content[0].text, /task_confirm/u);
+  assert.deepEqual(runnableHarness.state.activeRound.taskIds, ["tsk-open"]);
   assert.equal(received.at(-1).authorization, "Bearer smoke-token");
 
   // Access-only is sent identically to memory's task transport.
@@ -175,6 +182,7 @@ try {
   assert.match(confirmationHarness.agent.followups[0].content[0].text, /task_id=tsk-pending-done/u);
   assert.match(confirmationHarness.agent.followups[0].content[0].text, /confirmation_id=cnf-tsk-pending-done/u);
   assert.match(confirmationHarness.agent.followups[0].content[0].text, /expected_updated_at=/u);
+  assert.match(confirmationHarness.agent.followups[0].content[0].text, /decision 只能是 accept 或 reopen/u);
 
   // A valid empty cloud snapshot is the only path that auto-stops.
   responseMode = "empty";
@@ -233,3 +241,155 @@ try {
 } finally {
   server.close();
 }
+
+// Stage 5 protocol parser and stop semantics are pure/local and run after the
+// transport server is closed so they cannot accidentally hide network errors.
+const validClose = {
+  task_id: "tsk-open",
+  action: "update",
+  progress: "完成一项可验证推进",
+  next: "继续下一步实现",
+  round_id: "round-smoke-1",
+};
+assert.deepEqual(parseRoundCloseText(JSON.stringify(validClose)), validClose);
+assert.deepEqual(parseRoundCloseText(`\`\`\`json\n${JSON.stringify(validClose)}\n\`\`\``), validClose);
+for (const invalid of [
+  "完成了，下一步继续",
+  `${JSON.stringify(validClose)}${JSON.stringify(validClose)}`,
+  JSON.stringify({ ...validClose, next: undefined }),
+  JSON.stringify({ ...validClose, action: "unknown" }),
+  JSON.stringify({ ...validClose, action: "done" }),
+  JSON.stringify({ ...validClose, action: "blocked", blocked_reason: "" }),
+  `前言\n${JSON.stringify(validClose)}`,
+]) {
+  assert.throws(() => parseRoundCloseText(invalid), (error) => error.code === "close-protocol-error");
+}
+assert.deepEqual(
+  parseRoundCloseMessage({
+    role: "assistant",
+    content: [
+      { type: "text", text: "旁边的文本不是协议" },
+      { type: "tool-call", name: "task_round_close", arguments: validClose },
+    ],
+  }),
+  { kind: "tool", payload: validClose },
+);
+
+function protocolHarness() {
+  const agent = {
+    id: "agent-protocol",
+    status: "idle",
+    inbox: { nextStep: [], nextTurn: [] },
+    followups: [],
+    followup(message) { this.followups.push(message); },
+  };
+  const events = [];
+  const service = Object.create(AutoAdvanceService.prototype);
+  service.ctx = {
+    fiber: { state: 2 },
+    agents: { get: (id) => id === agent.id ? agent : undefined, list: () => [agent], isOwnedBy: () => false },
+    logger: { warn() {}, debug() {} },
+    emit: (_event, payload) => events.push(payload),
+  };
+  service.persistedModes = new Map();
+  service.persistModes = () => {};
+  service.broadcast = (_state, reason) => events.push({ reason });
+  return {
+    service,
+    state: {
+      agent,
+      enabled: true,
+      stoppedByProtocol: false,
+      disposed: false,
+      timer: undefined,
+      timerGeneration: 1,
+      idleSince: null,
+      injectedAt: null,
+      lastAutoMessageId: undefined,
+      requestController: undefined,
+      retryAttempt: 0,
+      retrying: false,
+      degraded: false,
+      degradedReason: null,
+      cloudSnapshot: split,
+      activeRound: {
+        kind: "runnable",
+        taskIds: ["tsk-open"],
+        closePayload: undefined,
+        protocolFailures: 0,
+        repairPromptSent: false,
+      },
+      lastProtocolNotice: null,
+    },
+    events,
+  };
+}
+
+const strictHarness = protocolHarness();
+const strictResult = await strictHarness.service.handleAssistantMessage(strictHarness.state, {
+  role: "assistant",
+  content: [{ type: "tool-call", name: "task_round_close", arguments: validClose }],
+});
+assert.equal(strictResult.ok, true);
+assert.deepEqual(strictHarness.state.activeRound.closePayload, validClose);
+await strictHarness.service.handleAssistantMessage(strictHarness.state, {
+  role: "assistant",
+  content: [{ type: "tool-call", name: "task_round_close", arguments: validClose }],
+});
+assert.ok(strictHarness.events.some((event) => event.reason === "round-close: idempotent-replay"));
+await strictHarness.service.handleAssistantMessage(strictHarness.state, {
+  role: "assistant",
+  content: [{ type: "tool-call", name: "task_round_close", arguments: { ...validClose, progress: "不同内容" } }],
+});
+assert.equal(strictHarness.state.activeRound.closePayload.progress, validClose.progress);
+
+const textHarness = protocolHarness();
+textHarness.service.submitTextRoundClose = async (_state, payload) => payload;
+const textResult = await textHarness.service.handleAssistantMessage(textHarness.state, {
+  role: "assistant",
+  content: [{ type: "text", text: JSON.stringify(validClose) }],
+});
+assert.equal(textResult.ok, true);
+assert.equal(textHarness.state.activeRound.closeSource, "text");
+
+const malformedHarness = protocolHarness();
+await malformedHarness.service.handleAssistantMessage(malformedHarness.state, {
+  role: "assistant",
+  content: [{ type: "text", text: "这不是唯一 JSON 收尾" }],
+});
+assert.equal(malformedHarness.state.activeRound.repairPromptSent, true);
+assert.equal(malformedHarness.state.activeRound.closePayload, undefined);
+assert.equal(malformedHarness.events.filter((event) => event.reason === "close-protocol-error").length, 1);
+const followupsAfterRepair = malformedHarness.state.agent.followups.length;
+await malformedHarness.service.handleAssistantMessage(malformedHarness.state, {
+  role: "assistant",
+  content: [{ type: "text", text: "仍然不是 JSON" }],
+});
+assert.equal(malformedHarness.state.activeRound, undefined);
+assert.equal(malformedHarness.state.agent.followups.length, followupsAfterRepair);
+
+const unclosedHarness = protocolHarness();
+const unclosedResult = unclosedHarness.service.stopByProtocol(unclosedHarness.state);
+assert.equal(unclosedResult, false);
+assert.equal(unclosedHarness.state.enabled, true);
+assert.equal(unclosedHarness.state.lastProtocolNotice, "未收尾停止");
+const markerHarness = protocolHarness();
+await markerHarness.service.handleAssistantMessage(markerHarness.state, { role: "assistant", content: [{ type: "text", text: STOP_MARKER }] });
+assert.equal(markerHarness.state.enabled, true);
+assert.equal(markerHarness.state.lastProtocolNotice, "未收尾停止");
+
+const unfinishedHarness = protocolHarness();
+unfinishedHarness.state.activeRound.closePayload = validClose;
+assert.equal(unfinishedHarness.service.stopByProtocol(unfinishedHarness.state), false);
+assert.equal(unfinishedHarness.state.enabled, true);
+assert.equal(unfinishedHarness.state.lastProtocolNotice, "仍有未完成任务；停止自主推进不合法");
+
+const terminalHarness = protocolHarness();
+terminalHarness.state.activeRound.requireClose = false;
+terminalHarness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
+  pages: [page([task("tsk-blocked-final", "blocked", null, { blocked_reason: "等待外部依赖" }, 12), task("tsk-done-final", "done", null, {}, 11)], 1, 2, 200)],
+});
+assert.equal(terminalHarness.service.stopByProtocol(terminalHarness.state), true);
+assert.equal(terminalHarness.state.enabled, false);
+assert.equal(terminalHarness.state.stoppedByProtocol, true);
+console.log("auto-advance stage5 protocol smoke: PASS (prompt contract, tool priority, JSON/fenced parser, repair cap, unclosed stop, terminal stop guard)");

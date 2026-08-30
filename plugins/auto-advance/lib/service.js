@@ -4,22 +4,31 @@ import { homedir } from "node:os";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { splitCloudTaskSnapshotStrict, validateCloudTaskPage, MAX_PAGE_SIZE } from "./snapshot.js";
+import { parseRoundCloseMessage, parseRoundCloseText, validateRoundClosePayload } from "./round-close.js";
 
 /**
- * This is intentionally copied from the final prompt in
- * auto-continue-module-design.md. Keep line breaks and punctuation intact:
- * it is part of the model-facing protocol.
+ * Model-facing v2 protocol. Keep the explicit state-machine wording here:
+ * this prompt is part of the autonomous continuation contract.
  */
-const AUTONOMOUS_PROMPT = `当前用户处于离开模式，并且希望你自主推进任务。
-请确认是否已经没有任何可以自主推进的任务，即所有任务都卡在必须需要用户来行动，否则无法推进的状态上，并且这个行动无法亲自做出（如在网络上配置东西，或者做视觉验收等能力有限无法做的决定）的阻塞项。
-如果面临决策但是可以自主做出（比如技术选型、具体策略的设计），那么应当作出决策并继续推进；如果只是完成了一个小的任务，那么应当继续推进大项目的下一个任务；如果面临一些危险的操作，可以在确保绝对安全的情况下继续推进（要求随时可复原）；如果面临一些重大的技术分支，可以先记录下来-存档确保可以回档（后续开发不退化）-记录选型供之后讨论和复盘，之后继续开发。
-如果当前不存在 goal 或者 goal 的描述存在阻碍/不符合当前要求导致阻塞，可以编辑 goal 并恢复运行。
-如果未来存在异步调用需要等待回复，并且当前确实没有其他值得推进的事情，那么可以停止并等待被异步唤起。
-**与 codex 应用的协作（2026-08-30 约定）**：自主推进只感知 codex_dispatch 注册的有界工作——
-如果当前存在活跃的 codex 工作（可用 codex_status 查询），说明任务正由 codex 应用执行，且结束/超时会自动回收：
-- 若有其他独立可推进任务，继续推进；若没有，等待 codex 完成（结束会被唤起，或主动 codex_status 检查）；
-- 不要重复派发相同任务、不要打断正在运行的 codex 工作；所有 codex 派发一律走 codex_dispatch 工具。
-如果当前确实所有大任务都进入到阻塞状态，无法继续推进，或者需要等待异步唤起，那么请输出【停止自主推进】，并不要附加多余的解释，自主推进进程将会关闭。`;
+const AUTONOMOUS_PROMPT = `当前用户处于离开模式。你只能依据本消息末尾注入的完整云端 runnable 清单自主推进。
+
+任务选择与新增：
+- 本轮只能选择清单中的 task_id；清单外任务不属于本轮可推进范围。
+- 有新想法时先调用 task_create；创建后必须等待下一次完整云端快照，不能在本轮直接推进新任务。
+- 开始一个任务时先用 task_update(status=in_progress) 明确置为进行中；不要从自然语言猜测任务状态。
+
+每轮收尾（出向协议）：
+- 只要本轮选择了任务，必须调用一次 task_round_close；progress 和 next 必填，round_id 必须是本轮唯一值。
+- action=update 只记录本轮进展，action=done/blocked 只是申请 pending_done/pending_blocked，不是终态；done/blocked 必须带 expected_updated_at，blocked 还必须填写 blocked_reason。
+- 终态只能由 task_confirm(decision=accept|reopen) 确认。task_update 或 task_round_close 的 done/blocked 申请成功后，必须等待确认质询并按其中的 task_id、pending_status、expected_updated_at、confirmation_id 调用 task_confirm；不得用普通 PATCH 或自然语言确认代替。
+- 不要把“完成了”“阻塞了”或其它自然语言当作结构化收尾；规范通道是工具调用。若工具不可用，兼容 JSON 也必须是一个完整且唯一的 round-close 对象，不得夹带解释。
+
+停止条件：
+- 只有云端快照确认所有任务均为 done 或 blocked，且不存在任何 pending 申请时，才允许输出【停止自主推进】。
+- 若本轮选择过任务，必须先完成本轮 task_round_close；没有 close 时不得用停止标记掩盖未收尾。
+- 仍有 open/in_progress/waiting/pending 任务时继续推进、等待下一次确认质询或报告阻塞，不得输出停止标记。
+
+异步工作：若某任务有活跃的有界工作，只等待该任务；其它 task_id 的 runnable 任务仍可推进。不要重复派发或打断正在运行的工作，所有 codex 派发走 codex_dispatch。`;
 
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
@@ -86,6 +95,7 @@ function normalizeTaskApiConfig(config = {}) {
   return {
     workerApiUrl: nonEmptyString(nested.workerApiUrl ?? nested.apiUrl ?? raw.workerApiUrl ?? raw.apiUrl),
     d1ReadToken: nonEmptyString(nested.d1ReadToken ?? nested.authToken ?? raw.d1ReadToken ?? raw.authToken),
+    d1WriteToken: nonEmptyString(nested.d1WriteToken ?? raw.d1WriteToken),
     accessClientId: nonEmptyString(nested.accessClientId ?? raw.accessClientId),
     accessClientSecret: nonEmptyString(nested.accessClientSecret ?? nested.accessSecret ?? raw.accessClientSecret ?? raw.accessSecret)
   };
@@ -101,6 +111,14 @@ function completeTaskApiConfig(config) {
   // （Bearer d1ReadToken，或 Cloudflare Access 双 key——网关放行后免 Bearer）。
   const accessComplete = normalized.accessClientId !== undefined && normalized.accessClientSecret !== undefined;
   return normalized.workerApiUrl !== undefined && (normalized.d1ReadToken !== undefined || accessComplete)
+    ? normalized
+    : undefined;
+}
+
+function completeTaskApiWriteConfig(config) {
+  const normalized = normalizeTaskApiConfig(config);
+  const accessComplete = normalized.accessClientId !== undefined && normalized.accessClientSecret !== undefined;
+  return normalized.workerApiUrl !== undefined && (normalized.d1WriteToken !== undefined || accessComplete)
     ? normalized
     : undefined;
 }
@@ -192,6 +210,21 @@ function isExactStopMessage(message) {
   return message?.role === "assistant" && extractText(message.content).includes(STOP_MARKER);
 }
 
+function isStopOnlyMessage(message) {
+  return isExactStopMessage(message) && extractText(message.content).trim() === STOP_MARKER;
+}
+
+function looksLikeRoundCloseText(message) {
+  return /^\s*(?:\{|```)/u.test(extractText(message?.content));
+}
+
+function isTerminalCloudSnapshot(snapshot) {
+  return snapshot?.source === "cloud" && Array.isArray(snapshot.items) &&
+    snapshot.items.every((task) =>
+      (task?.status === "done" || task?.status === "blocked") && task?.pending_status === null
+    );
+}
+
 function isAutoAdvanceMessage(message, state) {
   return message?.id !== undefined && message.id === state.lastAutoMessageId;
 }
@@ -241,6 +274,8 @@ class AutoAdvanceService extends TypertRemoteService {
       state.retryAttempt = 0;
       state.degraded = false;
       state.degradedReason = null;
+      state.activeRound = undefined;
+      state.lastProtocolNotice = null;
       this.resetTimer(state, "session-start");
     });
     ctx.on("agent/status", ({ agent, status }) => {
@@ -282,8 +317,10 @@ class AutoAdvanceService extends TypertRemoteService {
         }
         return;
       }
-      if (event.type === "assistant/message" && isExactStopMessage(event.data?.message)) {
-        this.stopByProtocol(state);
+      if (event.type === "assistant/message") {
+        void this.handleAssistantMessage(state, event.data?.message).catch((error) => {
+          safeLog(() => this.logger(), "warn", `sagitta-auto-advance: assistant protocol handling failed: ${renderError(error)}`);
+        });
       }
     });
 
@@ -389,7 +426,9 @@ class AutoAdvanceService extends TypertRemoteService {
       retrying: false,
       degraded: false,
       degradedReason: null,
-      cloudSnapshot: undefined
+      cloudSnapshot: undefined,
+      activeRound: undefined,
+      lastProtocolNotice: null
     };
     this.states.set(agent, state);
     return state;
@@ -509,7 +548,7 @@ class AutoAdvanceService extends TypertRemoteService {
       !state.stoppedByProtocol && state.agent.status === "idle" && !hasPendingInbox(state.agent);
   }
 
-  queuePrompt(state, generation, text, summary, reason) {
+  queuePrompt(state, generation, text, summary, reason, round = undefined) {
     if (!this.isCurrentRun(state, generation)) return false;
     const message = createUserMessage({
       content: [{ type: "text", text }],
@@ -523,9 +562,218 @@ class AutoAdvanceService extends TypertRemoteService {
     state.lastAutoMessageId = message.id;
     state.injectedAt = Date.now();
     state.idleSince = null;
+    if (round?.kind === "runnable") {
+      state.activeRound = {
+        kind: "runnable",
+        generation,
+        taskIds: [...new Set(round.taskIds ?? [])],
+        closePayload: undefined,
+        closeSource: undefined,
+        protocolFailures: 0,
+        repairPromptSent: false,
+        lastProtocolError: null,
+      };
+    } else if (round?.kind === "confirmation") {
+      // A confirmation challenge is its own protocol turn. It does not ask
+      // for a second round-close; the preceding runnable round was already
+      // closed before the pending request was created.
+      state.activeRound = {
+        kind: "confirmation",
+        generation,
+        taskIds: [],
+        closePayload: undefined,
+        closeSource: undefined,
+        protocolFailures: 0,
+        repairPromptSent: false,
+        lastProtocolError: null,
+        requireClose: false,
+      };
+    }
     agentFollowup(state.agent, message);
     this.broadcast(state, reason);
     return true;
+  }
+
+  /**
+   * Handle the assistant side of the autonomous round protocol. Tool calls
+   * are only observed here: the memory tool/Worker remains the authoritative
+   * writer. Text JSON is a compatibility path and is submitted only after
+   * the exact same schema and runnable-list checks pass.
+   */
+  async handleAssistantMessage(state, message) {
+    if (state?.disposed === true || state?.enabled !== true) return { ignored: true };
+    const hasStopMarker = isExactStopMessage(message);
+    if (!state?.activeRound) {
+      if (hasStopMarker) return await this.handleStopMarker(state);
+      return { ignored: true };
+    }
+    const round = state.activeRound;
+    if (round.requireClose === false || round.kind === "confirmation") {
+      if (hasStopMarker) return await this.handleStopMarker(state);
+      return { ignored: true };
+    }
+    if (round.closePayload !== undefined && (isStopOnlyMessage(message) || (hasStopMarker && !looksLikeRoundCloseText(message)))) {
+      return await this.handleStopMarker(state);
+    }
+
+    let extracted;
+    try {
+      extracted = parseRoundCloseMessage(message);
+    } catch (error) {
+      // A normal summary after an already accepted strict tool close is not a
+      // second protocol message. Potential JSON/fenced JSON is still checked
+      // so a second malformed close cannot silently pass.
+      if (round.closePayload !== undefined && !hasStopMarker && !looksLikeRoundCloseText(message)) {
+        return { ignored: true };
+      }
+      await this.handleCloseProtocolError(state, error);
+      if (hasStopMarker) this.recordUnclosedStop(state);
+      return { ok: false, error };
+    }
+
+    // A different strict tool call in a message means the model is using the
+    // normal tool channel; never interpret nearby prose as JSON fallback.
+    if (extracted?.kind === "tool-other") {
+      if (hasStopMarker) return await this.handleStopMarker(state);
+      return { ignored: true };
+    }
+
+    if (extracted?.payload !== undefined) {
+      const payload = extracted.payload;
+      if (!round.taskIds.includes(payload.task_id)) {
+        const error = new Error(`close-protocol-error: task_id 不在本轮 runnable 清单中：${payload.task_id}`);
+        error.code = "close-protocol-error";
+        await this.handleCloseProtocolError(state, error);
+        return { ok: false, error };
+      }
+
+      if (round.closePayload !== undefined) {
+        const same = JSON.stringify(round.closePayload) === JSON.stringify(payload);
+        if (!same) {
+          const error = new Error("close-protocol-error: 本轮只能接受一个 task_round_close");
+          error.code = "close-protocol-error";
+          await this.handleCloseProtocolError(state, error);
+          return { ok: false, error };
+        }
+        this.broadcast(state, "round-close: idempotent-replay");
+      } else {
+        if (extracted.kind === "text") {
+          try {
+            await this.submitTextRoundClose(state, payload);
+          } catch (error) {
+            if (error?.code === "task-api-unavailable") {
+              state.degraded = true;
+              state.degradedReason = renderError(error);
+              state.lastProtocolNotice = "round-close 文本兜底尚未写回";
+              this.broadcast(state, "defer: task-api-unavailable");
+              return { ok: false, deferred: true, error };
+            }
+            await this.handleCloseProtocolError(state, error);
+            return { ok: false, error };
+          }
+        }
+        round.closePayload = payload;
+        round.closeSource = extracted.kind;
+        round.protocolFailures = 0;
+        state.lastProtocolNotice = null;
+        this.broadcast(state, `round-close: ${extracted.kind}`);
+      }
+    }
+
+    if (hasStopMarker) return await this.handleStopMarker(state);
+    return extracted?.payload === undefined ? { ignored: true } : { ok: true, payload: extracted.payload };
+  }
+
+  async submitTextRoundClose(state, payload) {
+    const taskApi = this.resolveTaskApiConfig();
+    if (completeTaskApiWriteConfig(taskApi) === undefined) {
+      throw taskApiUnavailable("文本 round-close 兜底需要 Worker 写凭据或成对 Access 凭据");
+    }
+    const body = {
+      ...validateRoundClosePayload(payload),
+      agent_id: String(state.agent?.id ?? "unknown"),
+    };
+    return await requestTaskApiMutation(taskApi, this.config, `/task/${encodeURIComponent(payload.task_id)}/round-close`, body, undefined, this.logger());
+  }
+
+  async handleCloseProtocolError(state, error) {
+    const round = state.activeRound;
+    if (!round) return;
+    round.protocolFailures = Number(round.protocolFailures ?? 0) + 1;
+    round.lastProtocolError = renderError(error);
+    state.lastProtocolNotice = renderError(error);
+    safeLog(() => this.logger(), "warn", `sagitta-auto-advance: ${renderError(error)}`);
+    this.broadcast(state, "close-protocol-error");
+
+    if (round.repairPromptSent !== true) {
+      round.repairPromptSent = true;
+      this.queueProtocolMessage(state, [
+        "round-close 协议错误：本轮尚未形成可接受的结构化收尾。",
+        "请只调用一次 task_round_close，参数必须包含当前 runnable 清单中的 task_id、唯一 round_id、action、progress、next；action=done/blocked 还必须有 expected_updated_at，action=blocked 还必须有 blocked_reason。",
+        "不要用自然语言或多个 JSON 猜测状态；若使用兼容文本，只能输出一个完整且唯一的 JSON 对象或 fenced JSON。终态申请仍须等待 task_confirm。",
+      ].join("\n"), "injected: close-protocol-repair");
+      return;
+    }
+
+    // Repeated malformed closes must not spin forever. End only this round;
+    // autonomous mode stays enabled so the next clean timer cycle can retry.
+    state.activeRound = undefined;
+    state.idleSince = null;
+    this.broadcast(state, "close-protocol-error: round-halted");
+    this.maybeArm(state);
+  }
+
+  queueProtocolMessage(state, text, reason) {
+    if (state?.disposed === true || state?.enabled !== true) return false;
+    const message = createUserMessage({
+      content: [{ type: "text", text }],
+      source: { kind: "plugin", plugin: PLUGIN_ID, form: "notice", summary: "autonomous round protocol" },
+    });
+    state.lastAutoMessageId = message.id;
+    state.injectedAt = Date.now();
+    state.idleSince = null;
+    agentFollowup(state.agent, message);
+    this.broadcast(state, reason);
+    return true;
+  }
+
+  recordUnclosedStop(state) {
+    state.lastProtocolNotice = "未收尾停止";
+    safeLog(() => this.logger(), "warn", "sagitta-auto-advance: 未收尾停止；保留任务 in_progress，不写入 done/blocked");
+  }
+
+  async handleStopMarker(state) {
+    const round = state.activeRound;
+    if (round !== undefined && round.requireClose !== false && round.closePayload === undefined) {
+      this.recordUnclosedStop(state);
+      const error = new Error("close-protocol-error: 仅输出停止标记但本轮没有 task_round_close");
+      error.code = "close-protocol-error";
+      await this.handleCloseProtocolError(state, error);
+      return false;
+    }
+
+    // The snapshot used for injection can be stale after task_update and
+    // task_confirm. Refresh before accepting a stop marker; a failure is
+    // fail-closed and never becomes an empty/terminal conclusion.
+    try {
+      const taskApi = this.resolveTaskApiConfig();
+      if (completeTaskApiConfig(taskApi) === undefined) throw taskApiUnavailable("停止协议需要重新读取完整云端任务快照");
+      const controller = new AbortController();
+      if (state.requestController === undefined) state.requestController = controller;
+      try {
+        const latest = await readCloudTaskSnapshotStrict(taskApi, this.config, controller.signal, this.logger());
+        if (state.disposed === true || state.enabled !== true) return false;
+        state.cloudSnapshot = latest;
+      } finally {
+        if (state.requestController === controller) state.requestController = undefined;
+      }
+    } catch (error) {
+      state.degraded = true;
+      state.degradedReason = renderError(error);
+      this.broadcast(state, "defer: task-api-unavailable");
+      return false;
+    }
+    return this.stopByProtocol(state);
   }
 
   scheduleCloudRetry(state, generation, error) {
@@ -556,6 +804,7 @@ class AutoAdvanceService extends TypertRemoteService {
   autoStopNoRunnableTasks(state) {
     state.enabled = false;
     state.stoppedByProtocol = true;
+    state.activeRound = undefined;
     this.persistedModes.set(state.agent.id, false);
     this.persistModes();
     this.clearTimer(state);
@@ -601,12 +850,14 @@ class AutoAdvanceService extends TypertRemoteService {
           `- task_id=${task.task_id} pending_status=${task.pending_status} confirmation_id=${task.confirmation_id} expected_updated_at=${task.updated_at}`
         );
         const prompt = [
-          "当前云端任务快照包含待确认的终态申请。请只使用 task_confirm 逐项处理，不要把 pending 当成已完成或已阻塞。",
-          "确认清单（必须原样使用 task_id、confirmation_id、expected_updated_at）：",
+          "当前云端任务快照包含待确认的终态申请。确认队列优先于普通推进；本轮只处理下面的确认，不要推进其它任务。",
+          "对每一项必须调用 task_confirm，decision 只能是 accept 或 reopen；不要从自然语言猜测确认结果，也不要把 pending 当成已完成或已阻塞。",
+          "accept：pending_done → done，pending_blocked → blocked；reopen：pending_* → in_progress。",
+          "确认清单（必须原样使用 task_id、pending_status、confirmation_id、expected_updated_at）：",
           ...lines,
-          "除非确认队列已处理完毕，本轮不要推进普通任务。",
+          "调用格式必须同时包含 task_id、decision、expected_pending、expected_updated_at、confirmation_id；确认成功后下一次完整快照才会恢复普通推进。",
         ].join("\n");
-        this.queuePrompt(state, generation, prompt, "cloud task confirmation queue", "injected: confirmation-queue");
+        this.queuePrompt(state, generation, prompt, "cloud task confirmation queue", "injected: confirmation-queue", { kind: "confirmation" });
         return;
       }
 
@@ -624,7 +875,10 @@ class AutoAdvanceService extends TypertRemoteService {
           ...lines,
           "清单外任务本轮不得推进；若要新增工作，先 task_create，并等待下一次完整云端快照。终态只能先申请 pending，再用 task_confirm 完成确认。",
         ].join("\n");
-        this.queuePrompt(state, generation, prompt, "cloud runnable task snapshot", "injected: runnable-tasks");
+        this.queuePrompt(state, generation, prompt, "cloud runnable task snapshot", "injected: runnable-tasks", {
+          kind: "runnable",
+          taskIds: runnable.map((task) => task.task_id),
+        });
         return;
       }
 
@@ -652,14 +906,31 @@ class AutoAdvanceService extends TypertRemoteService {
   }
 
   stopByProtocol(state) {
+    const round = state.activeRound;
+    if (round !== undefined && round.requireClose !== false && round.closePayload === undefined) {
+      this.recordUnclosedStop(state);
+      this.broadcast(state, "stop-protocol-rejected");
+      return false;
+    }
+    if (!isTerminalCloudSnapshot(state.cloudSnapshot)) {
+      state.lastProtocolNotice = "仍有未完成任务；停止自主推进不合法";
+      safeLog(() => this.logger(), "warn", "sagitta-auto-advance: stop marker rejected；仍有未完成任务");
+      this.broadcast(state, "stop-protocol-rejected");
+      if (state.enabled === true) {
+        this.queueProtocolMessage(state, "停止自主推进无效：云端仍有 open/in_progress/waiting/pending 任务。请继续推进，或按协议调用 task_round_close 并等待 task_confirm。", "injected: stop-protocol-repair");
+      }
+      return false;
+    }
     state.enabled = false;
     state.stoppedByProtocol = true;
+    state.activeRound = undefined;
     this.persistedModes.set(state.agent.id, false);
     this.persistModes();
     this.clearTimer(state);
     state.idleSince = null;
     state.retrying = false;
     this.broadcast(state, "stop-protocol");
+    return true;
   }
 
   touchOwners(agent, reason) {
@@ -839,10 +1110,11 @@ function assertTaskTransportPolicy(baseUrl, proxy) {
   }
 }
 
-function buildTaskAuthHeaders(apiConfig) {
+function buildTaskAuthHeaders(apiConfig, operation = "read") {
   const headers = { Accept: "application/json", "Accept-Encoding": "identity" };
-  // Keep the exact memory ordering: a read Bearer wins over Access headers.
-  if (apiConfig?.d1ReadToken) headers.Authorization = `Bearer ${apiConfig.d1ReadToken}`;
+  // Keep the exact memory ordering: the operation's Bearer wins over Access.
+  const token = operation === "write" ? apiConfig?.d1WriteToken : apiConfig?.d1ReadToken;
+  if (token) headers.Authorization = `Bearer ${token}`;
   else if (apiConfig?.accessClientId && apiConfig?.accessClientSecret) {
     headers["CF-Access-Client-Id"] = apiConfig.accessClientId;
     headers["CF-Access-Client-Secret"] = apiConfig.accessClientSecret;
@@ -868,6 +1140,73 @@ function linkedAbortSignal(signal, timeoutMs) {
       signal?.removeEventListener("abort", abort);
     }
   };
+}
+
+async function requestTaskApiMutation(apiConfig, config, path, body, signal, logger) {
+  if (completeTaskApiWriteConfig(apiConfig) === undefined) {
+    throw taskApiUnavailable("Worker API 写入认证或地址配置不完整");
+  }
+  assertTaskTransportPolicy(apiConfig.workerApiUrl, config.proxy);
+  const url = `${apiConfig.workerApiUrl.replace(/\/+$/u, "")}${path}`;
+  const requestHeaders = {
+    ...buildTaskAuthHeaders(apiConfig, "write"),
+    "Content-Type": "application/json",
+  };
+  const timeoutMs = config.taskApiTimeoutMs;
+  const useProxy = typeof config.proxy === "string" && config.proxy.trim().length > 0 && config.proxy.trim().toLowerCase() !== "direct";
+  let status = 0;
+  let bodyText = "";
+  if (useProxy) {
+    const memoryRequest = await memoryHttpRequest();
+    if (typeof memoryRequest !== "function") {
+      throw taskApiUnavailable("proxy 已配置但 @sagitta/memory 的 http.js 不可用（memory 插件缺失/版本过旧）");
+    }
+    try {
+      const response = await memoryRequest({
+        method: "POST",
+        url,
+        headers: requestHeaders,
+        body: JSON.stringify(body),
+        timeoutMs,
+        signal,
+        proxy: config.proxy,
+      });
+      status = Number(response?.status);
+      bodyText = response?.body ? Buffer.from(response.body).toString("utf8") : "";
+    } catch (error) {
+      throw taskApiUnavailable(`请求失败：${renderError(error)}`, error);
+    }
+  } else {
+    const linked = linkedAbortSignal(signal, timeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: requestHeaders,
+        body: JSON.stringify(body),
+        signal: linked.signal,
+      });
+      status = Number(response?.status);
+      bodyText = typeof response.text === "function" ? await response.text() : "";
+    } catch (error) {
+      throw taskApiUnavailable(`请求失败：${renderError(error)}`, error);
+    } finally {
+      linked.dispose();
+    }
+  }
+  if (status < 200 || status >= 300) throw taskApiUnavailable(`HTTP ${Number.isInteger(status) ? status : "未知"}`);
+  let payload;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch (error) {
+    throw taskApiUnavailable("响应不是合法 JSON", error);
+  }
+  if (isRecord(payload) && payload.ok === false) {
+    throw taskApiUnavailable(`Worker 拒绝 round-close：${payload.error?.message ?? payload.error?.code ?? "未知错误"}`);
+  }
+  const result = isRecord(payload) && payload.ok === true && isRecord(payload.data) ? payload.data : payload;
+  if (!isRecord(result)) throw taskApiUnavailable("round-close 响应不是对象");
+  logger?.debug?.(`sagitta-auto-advance: text round-close submitted task=${body.task_id} round=${body.round_id}`);
+  return result;
 }
 
 async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
@@ -1061,6 +1400,9 @@ export {
   readTasksFromApi,
   readCloudTaskSnapshotStrict,
   splitCloudTaskSnapshotStrict,
+  parseRoundCloseText,
+  parseRoundCloseMessage,
+  validateRoundClosePayload,
   buildTaskAuthHeaders,
   isLoopbackUrl,
   resolveConfiguredPaths
