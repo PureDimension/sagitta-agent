@@ -14,6 +14,8 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import z from "@deepseek-ai/schemastery";
 
@@ -137,8 +139,32 @@ class CodexWorkRegistry {
   }
 }
 
+/**
+ * 解析 codex 启动方式。Windows 下 codex 是 npm 全局 shim（codex.cmd），
+ * spawn("codex") 会 ENOENT、spawn("codex.cmd") 会 EINVAL——直接用 node 跑
+ * codex.js（npm 全局安装路径）。非 Windows 直接 spawn codexPath。
+ */
+function resolveCodexLaunch(codexPath) {
+  if (process.platform !== "win32") {
+    return { command: codexPath, args: [] };
+  }
+  const candidates = [
+    process.env.CODEX_JS_PATH,
+    join(process.env.APPDATA ?? "", "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
+    join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) {
+      return { command: process.execPath, args: [candidate] };
+    }
+  }
+  // fallback：尝试 codexPath（如用户显式给了 .exe 路径）
+  return { command: codexPath, args: [] };
+}
+
 function runCodex({ codexPath, args, pidRef }) {
-  const child = spawn(codexPath, args, {
+  const { command, args: prefix } = resolveCodexLaunch(codexPath);
+  const child = spawn(command, [...prefix, ...args], {
     detached: true,          // 与 DSH 生命周期解耦（DSH 重启不杀 codex）
     stdio: "ignore",
     windowsHide: true,
@@ -251,13 +277,14 @@ export function apply(ctx, config) {
         );
       });
 
-      return {
+      const result = {
         workId: work.id,
-        pid: work.pid,
         status: WORK_STATUS.RUNNING,
         task: String(args.task).slice(0, 200),
         model,
       };
+      if (work.pid !== null && work.pid !== undefined) result.pid = work.pid; // 条件添加（lossless）
+      return result;
     },
     presentCall: (args) => `codex_dispatch(model=${args.model ?? "luna"}, task=${JSON.stringify(args.task).slice(0, 60)})`,
   }));
@@ -313,16 +340,20 @@ export function apply(ctx, config) {
         works = [...(registry.byAgent.get(agentId)?.values() ?? [])];
       }
       return {
-        works: works.map((w) => ({
-          id: w.id,
-          kind: w.kind,
-          task: w.task,
-          model: w.model,
-          status: w.status,
-          startedAt: w.startedAt,
-          endedAt: w.endedAt,
-          exitCode: w.exitCode,
-        })),
+        works: works.map((w) => {
+          // 条件添加：undefined 属性会被 snapshot 判 lossless 失败
+          const item = {
+            id: w.id,
+            kind: w.kind,
+            task: w.task,
+            model: w.model,
+            status: w.status,
+            startedAt: w.startedAt,
+          };
+          if (w.endedAt !== null && w.endedAt !== undefined) item.endedAt = w.endedAt;
+          if (w.exitCode !== null && w.exitCode !== undefined) item.exitCode = w.exitCode;
+          return item;
+        }),
       };
     },
     presentCall: (args) => `codex_status(workId=${args.workId ?? "all"})`,

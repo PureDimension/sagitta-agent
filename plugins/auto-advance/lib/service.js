@@ -380,7 +380,14 @@ class AutoAdvanceService extends TypertRemoteService {
 
     // 有界工作注册表（sagitta-codex 插件）：只认"已注册的有界工作"（超时自动回收），
     // 不再用笼统 jobs.list —— 后台 pwsh/ssh 等未注册任务不会永久卡住自主推进（08-30 修复）。
-    const codexService = this.ctx?.["sagitta-codex"];
+    // 注意：cordis 未 inject 声明的服务不能属性访问（会抛 cannot get property without inject），
+    // 必须用 ctx.get(name, false) 可选获取（服务不存在返回 undefined，不抛错不等待）。
+    let codexService;
+    try {
+      codexService = typeof this.ctx.get === "function" ? this.ctx.get("sagitta-codex", false) : undefined;
+    } catch (error) {
+      codexService = undefined;
+    }
     if (codexService && typeof codexService.listActiveWorks === "function") {
       try {
         return codexService.listActiveWorks(agent.id).length > 0;

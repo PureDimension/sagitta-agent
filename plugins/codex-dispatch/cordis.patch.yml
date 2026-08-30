@@ -1,0 +1,5 @@
+# @sagitta/codex-dispatch bundle layer.
+# Declared via the `dsh.bundle.patch` manifest in package.json.
+- insert:
+    - id: sagitta-codex
+      name: '@sagitta/codex-dispatch'
