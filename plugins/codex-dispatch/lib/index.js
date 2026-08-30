@@ -299,7 +299,12 @@ export function apply(ctx, config) {
       if (work.pid !== null && work.pid !== undefined) result.pid = work.pid; // 条件添加（lossless）
       return result;
     },
-    presentCall: (args) => `codex_dispatch(model=${args.model ?? "luna"}, task=${JSON.stringify(args.task).slice(0, 60)})`,
+    presentCall: (args) => ({
+      card: "generic",
+      title: `codex_dispatch(model=${args.model ?? "luna"}, task=${JSON.stringify(args.task).slice(0, 60)})`,
+      kind: "codex",
+      rawInput: JSON.stringify(args),
+    }),
   }));
 
   // ---- 工具：codex_status ----
@@ -369,7 +374,12 @@ export function apply(ctx, config) {
         }),
       };
     },
-    presentCall: (args) => `codex_status(workId=${args.workId ?? "all"})`,
+    presentCall: (args) => ({
+      card: "generic",
+      title: `codex_status(workId=${args.workId ?? "all"})`,
+      kind: "codex",
+      rawInput: JSON.stringify(args),
+    }),
   }));
 }
 
