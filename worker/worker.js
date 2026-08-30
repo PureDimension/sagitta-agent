@@ -111,14 +111,18 @@ function corsHeaders() {
 }
 
 function jsonOk(data, status = 200) {
-  return new Response(JSON.stringify({ ok: true, data }), {
+  return new Response(JSON.stringify({ ok: true, data, request_id: crypto.randomUUID() }), {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
   });
 }
 
-function jsonError(status, code, message) {
-  return new Response(JSON.stringify({ ok: false, error: { code, message } }), {
+function jsonError(status, code, message, details = {}) {
+  return new Response(JSON.stringify({
+    ok: false,
+    error: { code, message, details: details || {} },
+    request_id: crypto.randomUUID(),
+  }), {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
   });
@@ -267,6 +271,10 @@ function checkAuth(request, env, operation) {
   }
   const auth = request.headers.get('Authorization') || '';
   if (auth === 'Bearer ' + expectedToken) return null;
+  const oppositeToken = operation === 'read' ? env.D1_WRITE_TOKEN : operation === 'write' ? env.D1_READ_TOKEN : null;
+  if (oppositeToken && auth === 'Bearer ' + oppositeToken) {
+    return jsonError(403, 'FORBIDDEN', '凭据有效但没有该 task 路由所需的 ' + operation + ' 权限');
+  }
   const tokenHint = operation === 'read' ? 'D1_READ_TOKEN' : operation === 'write' ? 'D1_WRITE_TOKEN' : 'AUTH_TOKEN';
   return jsonError(401, 'UNAUTHORIZED',
     '认证失败：需要 Authorization: Bearer <' + tokenHint + '>（或由 Cloudflare Access 网关放行）。');
@@ -913,49 +921,129 @@ async function getDelegationHandler(db, taskId) {
 
 // ---- task API（docs/task-api-p1.md） ----------------------------------------
 
-// tasks 表自举：幂等建表（CREATE TABLE/INDEX IF NOT EXISTS 均为 no-op）。
-// 用 DB binding 直接执行，无需 D1 API token 权限；模块级 promise 缓存防并发重复执行；
-// 失败置空允许下次重试（此时 task 路由自然 500，/mem 不受影响）。
-let tasksSchemaReady = null;
-function ensureTasksSchema(db) {
-  if (tasksSchemaReady !== null) return tasksSchemaReady;
-  tasksSchemaReady = db.batch([
-    db.prepare(`CREATE TABLE IF NOT EXISTS tasks (
-      id            TEXT PRIMARY KEY,
-      project       TEXT NOT NULL,
-      title         TEXT NOT NULL,
-      status        TEXT NOT NULL DEFAULT 'open',
-      priority      INTEGER NOT NULL DEFAULT 0,
-      checkbox      INTEGER NOT NULL DEFAULT 0,
-      stream        TEXT NOT NULL DEFAULT 'company',
-      body          TEXT DEFAULT '',
-      created_at    TEXT NOT NULL,
-      updated_at    TEXT NOT NULL DEFAULT '',
-      done_at       TEXT DEFAULT '',
-      archived      INTEGER NOT NULL DEFAULT 0
-    )`),
-    db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project)`),
-    db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_stream ON tasks(stream)`),
-    db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`),
-  ]).then(() => true).catch((err) => {
-    console.error('[sagitta-memory] tasks schema bootstrap failed:', err && err.message ? err.message : String(err));
-    tasksSchemaReady = null;
-    return false;
+// tasks/task_events 自举：先复核列，再只对缺失列执行可空 ALTER。
+// D1 的 batch 是原子批次；失败必须抛出，由 task 路由进入不可用态，不能继续服务旧 schema。
+const TASK_SCHEMA_COLUMNS = [
+  ['id', 'TEXT'], ['project', 'TEXT'], ['title', 'TEXT'], ['status', 'TEXT'],
+  ['priority', 'INTEGER'], ['checkbox', 'INTEGER'], ['stream', 'TEXT'], ['body', 'TEXT'],
+  ['created_at', 'TEXT'], ['updated_at', 'TEXT'], ['done_at', 'TEXT'], ['archived', 'INTEGER'],
+  ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'],
+];
+const TASK_EVENT_SCHEMA_COLUMNS = [
+  ['event_id', 'TEXT'], ['task_id', 'TEXT'], ['agent_id', 'TEXT'], ['event_type', 'TEXT'],
+  ['round_id', 'TEXT'], ['action', 'TEXT'], ['progress', 'TEXT'], ['next', 'TEXT'],
+  ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'], ['confirmation_id', 'TEXT'],
+  ['expected_updated_at', 'TEXT'], ['payload_json', 'TEXT'], ['created_at', 'TEXT'],
+];
+const TASK_SYSTEM_AGENT = 'worker';
+const TASK_PENDING_STATUSES = ['pending_done', 'pending_blocked'];
+const TASK_TERMINAL_STATUSES = ['done', 'blocked'];
+const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason'];
+const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
+const TASK_ROUND_ACTIONS = ['update', 'done', 'blocked'];
+const MAX_TASK_EVENT_TEXT = 1000;
+const tasksSchemaReady = new WeakMap();
+
+const TASKS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS tasks (
+  id            TEXT PRIMARY KEY,
+  project       TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'open',
+  priority      INTEGER NOT NULL DEFAULT 0,
+  checkbox      INTEGER NOT NULL DEFAULT 0,
+  stream        TEXT NOT NULL DEFAULT 'company',
+  body          TEXT DEFAULT '',
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL DEFAULT '',
+  done_at       TEXT DEFAULT '',
+  archived      INTEGER NOT NULL DEFAULT 0,
+  blocked_reason TEXT DEFAULT NULL,
+  pending_status TEXT DEFAULT NULL,
+  CHECK (pending_status IS NULL OR pending_status IN ('pending_done', 'pending_blocked'))
+)`;
+
+const TASK_EVENTS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS task_events (
+  event_id           TEXT PRIMARY KEY,
+  task_id           TEXT NOT NULL,
+  agent_id          TEXT NOT NULL,
+  event_type        TEXT NOT NULL,
+  round_id          TEXT DEFAULT NULL,
+  action            TEXT DEFAULT NULL,
+  progress          TEXT DEFAULT NULL,
+  next              TEXT DEFAULT NULL,
+  blocked_reason    TEXT DEFAULT NULL,
+  pending_status    TEXT DEFAULT NULL,
+  confirmation_id   TEXT DEFAULT NULL,
+  expected_updated_at TEXT DEFAULT NULL,
+  payload_json      TEXT NOT NULL,
+  created_at        TEXT NOT NULL
+)`;
+
+async function d1Batch(db, statements) {
+  if (statements.length > 0) await db.batch(statements);
+}
+
+async function tableColumns(db, table) {
+  const statement = db.prepare('PRAGMA table_info(' + table + ')');
+  const result = statement.all ? await statement.all() : await statement.bind().all();
+  return new Set((result.results || []).map((row) => row.name));
+}
+
+async function ensureColumns(db, table, definitions) {
+  const columns = await tableColumns(db, table);
+  const missing = definitions
+    .filter(([name]) => !columns.has(name))
+    // SQLite 不允许 ALTER TABLE ADD COLUMN 加 NOT NULL 无默认值；迁移列统一可空。
+    .map(([name, type]) => db.prepare('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + type));
+  await d1Batch(db, missing);
+  const verified = await tableColumns(db, table);
+  const stillMissing = definitions.filter(([name]) => !verified.has(name)).map(([name]) => name);
+  if (stillMissing.length > 0) {
+    throw new Error(table + ' schema migration incomplete; missing columns: ' + stillMissing.join(', '));
+  }
+}
+
+async function ensureTasksSchema(db) {
+  if (tasksSchemaReady.has(db)) return tasksSchemaReady.get(db);
+  const ready = (async () => {
+    await d1Batch(db, [db.prepare(TASKS_CREATE_DDL)]);
+    await ensureColumns(db, 'tasks', TASK_SCHEMA_COLUMNS);
+    await d1Batch(db, [
+      db.prepare('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project)'),
+      db.prepare('CREATE INDEX IF NOT EXISTS idx_tasks_stream ON tasks(stream)'),
+      db.prepare('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)'),
+      db.prepare(TASK_EVENTS_CREATE_DDL),
+    ]);
+    await ensureColumns(db, 'task_events', TASK_EVENT_SCHEMA_COLUMNS);
+    await d1Batch(db, [
+      db.prepare('CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id)'),
+      db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_round_close ON task_events(task_id, agent_id, round_id) WHERE event_type = 'round_close'"),
+      db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_confirmation ON task_events(confirmation_id) WHERE confirmation_id IS NOT NULL'),
+    ]);
+    return true;
+  })().catch((err) => {
+    console.error('[sagitta-memory] tasks schema migration failed:', err && err.message ? err.message : String(err));
+    tasksSchemaReady.delete(db);
+    throw err;
   });
-  return tasksSchemaReady;
+  tasksSchemaReady.set(db, ready);
+  return ready;
 }
 
 function isTaskBody(body) {
   return body !== null && typeof body === 'object' && !Array.isArray(body);
 }
 
-function serializeTask(row) {
+function serializeTask(row, extra = {}) {
   if (!row) return null;
-  return Object.assign({}, row, {
+  const result = Object.assign({}, row, {
     priority: Number(row.priority),
     checkbox: Number(row.checkbox),
     archived: Number(row.archived),
-  });
+    blocked_reason: row.blocked_reason === undefined ? null : row.blocked_reason,
+    pending_status: row.pending_status === undefined ? null : row.pending_status,
+  }, extra);
+  return result;
 }
 
 function taskId() {
@@ -975,6 +1063,63 @@ function taskString(value, field, required = false) {
 function taskStatus(value) {
   if (!TASK_STATUSES.includes(value)) {
     return jsonError(400, 'INVALID_TASK_STATUS', 'status 必须是：' + TASK_STATUSES.join(' / '));
+  }
+  return null;
+}
+
+function taskExpectedUpdatedAt(value, required = false) {
+  if (value === undefined && !required) return null;
+  if (!isNonEmptyString(value)) {
+    return jsonError(422, 'INVALID_EXPECTED_UPDATED_AT', 'expected_updated_at 必须是非空字符串');
+  }
+  return value;
+}
+
+function taskEventText(value, field, required = true) {
+  if (typeof value !== 'string') {
+    return jsonError(422, field.toUpperCase() + '_REQUIRED', field + ' 必须是字符串');
+  }
+  const trimmed = value.trim();
+  if (required && trimmed.length === 0) {
+    return jsonError(422, field.toUpperCase() + '_REQUIRED', field + ' 必填');
+  }
+  if (Array.from(trimmed).length > MAX_TASK_EVENT_TEXT) {
+    return jsonError(422, field.toUpperCase() + '_TOO_LONG', field + ' 最多 1000 个 Unicode 字符');
+  }
+  if (/[\u0000-\u001f\u007f]/u.test(trimmed)) {
+    return jsonError(422, 'INVALID_' + field.toUpperCase(), field + ' 不得包含控制字符或换行');
+  }
+  return trimmed;
+}
+
+function taskBlockedReason(value) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return jsonError(422, 'BLOCKED_REASON_REQUIRED', 'blocked_reason 必须是非空字符串');
+  }
+  return value.trim();
+}
+
+function taskStateError(row) {
+  if (!row) return null;
+  if (row.pending_status !== null && !TASK_PENDING_STATUSES.includes(row.pending_status)) {
+    return jsonError(409, 'TASK_STATE_INVALID', '任务 pending_status 不合法', { task: serializeTask(row) });
+  }
+  if (row.pending_status === 'pending_done' &&
+      (row.status !== 'in_progress' || isNonEmptyString(row.done_at) || isNonEmptyString(row.blocked_reason))) {
+    return jsonError(409, 'TASK_STATE_INVALID', 'pending_done 任务不满足状态不变量', { task: serializeTask(row) });
+  }
+  if (row.pending_status === 'pending_blocked' &&
+      (row.status !== 'in_progress' || isNonEmptyString(row.done_at) || !isNonEmptyString(row.blocked_reason))) {
+    return jsonError(409, 'TASK_STATE_INVALID', 'pending_blocked 任务不满足状态不变量', { task: serializeTask(row) });
+  }
+  if (row.status === 'in_progress' && isNonEmptyString(row.done_at)) {
+    return jsonError(409, 'TASK_STATE_INVALID', 'in_progress 任务不得已有 done_at', { task: serializeTask(row) });
+  }
+  if (row.status === 'done' && (row.pending_status !== null || !isNonEmptyString(row.done_at))) {
+    return jsonError(409, 'TASK_STATE_INVALID', 'done 任务必须有 done_at 且不能 pending', { task: serializeTask(row) });
+  }
+  if (row.status === 'blocked' && (row.pending_status !== null || !isNonEmptyString(row.blocked_reason))) {
+    return jsonError(409, 'TASK_LEGACY_INVALID', '历史 blocked 任务缺少 blocked_reason，需先补数', { task: serializeTask(row) });
   }
   return null;
 }
@@ -1006,7 +1151,74 @@ function taskQueryFlag(value, name) {
 }
 
 async function getTaskRow(db, id) {
-  return await db.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first();
+  const rows = await db.prepare(`SELECT t.*,
+    (SELECT e.confirmation_id FROM task_events e
+      WHERE e.task_id = t.id AND e.confirmation_id IS NOT NULL
+        AND e.pending_status = t.pending_status
+      ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS confirmation_id,
+    (SELECT e.progress FROM task_events e
+      WHERE e.task_id = t.id AND e.event_type = 'round_close'
+      ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_progress,
+    (SELECT e.next FROM task_events e
+      WHERE e.task_id = t.id AND e.event_type = 'round_close'
+      ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_next
+    FROM tasks t WHERE t.id = ?`).bind(id).first();
+  return rows;
+}
+
+const TASK_SELECT_LIST = `SELECT t.*,
+  (SELECT e.confirmation_id FROM task_events e
+    WHERE e.task_id = t.id AND e.confirmation_id IS NOT NULL
+      AND e.pending_status = t.pending_status
+    ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS confirmation_id,
+  (SELECT e.progress FROM task_events e WHERE e.task_id = t.id AND e.event_type = 'round_close'
+    ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_progress,
+  (SELECT e.next FROM task_events e WHERE e.task_id = t.id AND e.event_type = 'round_close'
+    ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_next
+  FROM tasks t WHERE `;
+
+async function taskResponse(db, id, extra = {}) {
+  const row = await getTaskRow(db, id);
+  return jsonOk(serializeTask(row, { task_id: id, ...extra }));
+}
+
+function taskConflict(message, row) {
+  return jsonError(409, 'TASK_VERSION_CONFLICT', message, row ? { task: serializeTask(row) } : {});
+}
+
+function taskPendingConflict(message, row) {
+  return jsonError(409, 'TASK_PENDING_CONFLICT', message, row ? { task: serializeTask(row) } : {});
+}
+
+async function findRoundEvent(db, taskIdValue, agentId, roundId) {
+  return await db.prepare(
+    "SELECT * FROM task_events WHERE task_id = ? AND agent_id = ? AND round_id = ? AND event_type = 'round_close'"
+  ).bind(taskIdValue, agentId, roundId).first();
+}
+
+async function findTerminalEvent(db, taskIdValue, confirmationId) {
+  return await db.prepare(
+    'SELECT * FROM task_events WHERE task_id = ? AND confirmation_id = ?'
+  ).bind(taskIdValue, confirmationId).first();
+}
+
+async function findConfirmationOutcome(db, taskIdValue, confirmationId) {
+  const rows = await db.prepare(
+    "SELECT * FROM task_events WHERE task_id = ? AND event_type IN ('confirmed', 'reopened') ORDER BY created_at DESC, event_id DESC"
+  ).bind(taskIdValue).all();
+  for (const event of rows.results || []) {
+    try {
+      const payload = JSON.parse(event.payload_json);
+      if (payload && payload.request && payload.request.confirmation_id === confirmationId) return { event, payload };
+    } catch (err) {
+      // 历史坏 payload 不影响其他事件；当前请求仍会按不匹配处理。
+    }
+  }
+  return null;
+}
+
+function eventPayloadMatches(event, expectedPayload) {
+  return !!event && event.payload_json === JSON.stringify(expectedPayload);
 }
 
 // GET /task —— 列表，默认排除 archived；checkbox 过滤供 auto-advance API 使用。
@@ -1030,13 +1242,24 @@ async function listTasksHandler(db, url) {
     params.push(flagError);
   }
   const whereSql = where.join(' AND ');
+  const count = await db.prepare('SELECT COUNT(*) AS total FROM tasks WHERE ' + whereSql).bind(...params).first();
+  const rawPage = url.searchParams.get('page');
+  const rawSize = url.searchParams.get('size');
+  const page = rawPage === null ? 1 : toInt(rawPage, null, 1, 1000000);
+  const size = rawSize === null ? 1000 : toInt(rawSize, null, 1, 1000);
+  if (page === null || size === null) return jsonError(422, 'INVALID_PAGINATION', 'page/size 必须是正整数，size 最大 1000');
+  const total = Number(count && count.total ? count.total : 0);
   const rows = await db.prepare(
-    'SELECT * FROM tasks WHERE ' + whereSql + ' ORDER BY updated_at DESC, created_at DESC, id DESC'
-  ).bind(...params).all();
+    TASK_SELECT_LIST + whereSql + ' ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC LIMIT ? OFFSET ?'
+  ).bind(...params, size, (page - 1) * size).all();
   const items = (rows.results || []).map(serializeTask);
   return jsonOk({
     items,
-    total: items.length,
+    total,
+    page,
+    size,
+    has_more: page * size < total,
+    source: 'cloud',
     project: project || undefined,
     stream: stream || undefined,
     status: status || undefined,
@@ -1055,14 +1278,25 @@ async function getTaskHandler(db, id) {
 async function createTaskHandler(db, body) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
 
+  const has = (field) => Object.prototype.hasOwnProperty.call(body, field);
+  if (has('pending_status') || has('done_at') || has('created_at') || has('updated_at') || has('archived')) {
+    return jsonError(422, 'TASK_CREATE_TERMINAL_FORBIDDEN',
+      'create 不得传入 pending_status、done_at 或其他服务端管理字段');
+  }
+
   const project = taskString(body.project, 'project', true);
   if (project.error) return project.error;
   const title = taskString(body.title, 'title', true);
   if (title.error) return title.error;
 
   const status = body.status === undefined ? 'open' : body.status;
-  const statusError = taskStatus(status);
-  if (statusError) return statusError;
+  if (TASK_TERMINAL_STATUSES.includes(status)) {
+    return jsonError(422, 'TASK_CREATE_TERMINAL_FORBIDDEN', 'create 不得直接创建 done 或 blocked 任务');
+  }
+  if (!['open', 'in_progress', 'waiting'].includes(status)) {
+    const statusError = taskStatus(status);
+    if (statusError) return statusError;
+  }
   const priority = body.priority === undefined ? 0 : body.priority;
   const priorityError = taskPriority(priority);
   if (priorityError) return priorityError;
@@ -1073,41 +1307,103 @@ async function createTaskHandler(db, body) {
   if (streamError) return streamError;
   const taskBody = body.body === undefined ? '' : body.body;
   if (typeof taskBody !== 'string') return jsonError(400, 'INVALID_BODY_TEXT', 'body 必须是字符串');
+  if (has('blocked_reason') && body.blocked_reason !== null && body.blocked_reason !== undefined) {
+    if (!isNonEmptyString(body.blocked_reason)) {
+      return jsonError(422, 'INVALID_BLOCKED_REASON', 'blocked_reason 必须是非空字符串或 null');
+    }
+    return jsonError(422, 'TASK_CREATE_BLOCKED_REASON_FORBIDDEN', 'create 的非终态任务不得设置 blocked_reason');
+  }
 
   const id = taskId();
   const now = nowIso();
-  const doneAt = status === 'done' ? now : '';
   await db.prepare(
     'INSERT INTO tasks (id, project, title, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
     'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(
-    id, project.value, title.value, status, priority, checkbox, stream, taskBody, now, now, doneAt, 0
+    id, project.value, title.value, status, priority, checkbox, stream, taskBody, now, now, '', 0
   ).run();
 
   const row = await getTaskRow(db, id);
   return jsonOk(serializeTask(row), 201);
 }
 
-// PATCH /task/{id} —— 部分更新允许的五个业务字段。
+// PATCH /task/{id} —— 业务字段更新；终态只能生成 pending 申请。
 async function patchTaskHandler(db, id, body) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
-  const allowed = ['status', 'priority', 'body', 'title', 'checkbox'];
-  const present = allowed.filter((field) => Object.prototype.hasOwnProperty.call(body, field));
+  const has = (field) => Object.prototype.hasOwnProperty.call(body, field);
+  const forbidden = Object.keys(body).filter((field) => !TASK_PATCH_FIELDS.includes(field) && field !== 'expected_updated_at');
+  if (forbidden.length > 0) {
+    return jsonError(422, 'TASK_PATCH_FIELD_FORBIDDEN', 'PATCH 字段不在白名单中：' + forbidden.join(', '), { fields: forbidden });
+  }
+  const present = TASK_PATCH_FIELDS.filter(has);
   if (present.length === 0) return jsonError(400, 'PATCH_FIELDS_REQUIRED', 'PATCH 至少需要 status/priority/body/title/checkbox 之一');
 
   const row = await getTaskRow(db, id);
   if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
 
+  const expected = taskExpectedUpdatedAt(body.expected_updated_at, false);
+  if (expected instanceof Response) return expected;
+  if (has('status') && row.pending_status !== null) {
+    return taskPendingConflict('pending 任务不得通过 PATCH status 改变状态，请使用 confirm', row);
+  }
+
+  const nextStatus = has('status') ? body.status : row.status;
+  const statusIsTerminal = TASK_TERMINAL_STATUSES.includes(nextStatus);
+  if (has('status')) {
+    const statusError = taskStatus(body.status);
+    if (statusError) return statusError;
+    if (TASK_TERMINAL_STATUSES.includes(body.status)) {
+      if (row.status !== 'in_progress' || row.pending_status !== null) {
+        return jsonError(422, 'TASK_TERMINAL_REQUIRES_IN_PROGRESS',
+          '只有无 pending 的 in_progress 任务可以申请 done/blocked', { task: serializeTask(row) });
+      }
+      if (body.status === 'blocked' && !isNonEmptyString(body.blocked_reason)) {
+        return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', '申请 blocked 必须提供非空 blocked_reason');
+      }
+      if (body.status === 'done' && has('blocked_reason') && isNonEmptyString(body.blocked_reason)) {
+        return jsonError(422, 'INVALID_BLOCKED_REASON', 'done 申请不得设置 blocked_reason');
+      }
+    }
+    if (row.status === 'done' || row.status === 'blocked') {
+      return jsonError(409, 'TASK_TERMINAL_IMMUTABLE', '终态任务只能通过既有 pending 的 confirm 流程变更', { task: serializeTask(row) });
+    }
+  }
+
+  let blockedReason = row.blocked_reason === undefined ? null : row.blocked_reason;
+  if (has('blocked_reason')) {
+    if (body.blocked_reason !== null && body.blocked_reason !== undefined && !isNonEmptyString(body.blocked_reason)) {
+      return jsonError(422, 'INVALID_BLOCKED_REASON', 'blocked_reason 必须是非空字符串或 null');
+    }
+    if (body.blocked_reason !== null && body.blocked_reason !== undefined) {
+      const validReason = taskBlockedReason(body.blocked_reason);
+      if (validReason instanceof Response) return validReason;
+      blockedReason = validReason;
+    } else {
+      blockedReason = null;
+    }
+  }
+  if (statusIsTerminal && nextStatus === 'blocked' && !isNonEmptyString(blockedReason)) {
+    return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', '申请 blocked 必须提供非空 blocked_reason');
+  }
+  if (!statusIsTerminal && isNonEmptyString(blockedReason) && row.pending_status !== 'pending_blocked' && row.status !== 'blocked') {
+    return jsonError(422, 'INVALID_BLOCKED_REASON', '只有 blocked 或 pending_blocked 任务可以设置 blocked_reason');
+  }
+  if (row.status === 'blocked' && !isNonEmptyString(blockedReason)) {
+    return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', 'blocked 任务必须保留非空 blocked_reason');
+  }
+  if (row.pending_status === 'pending_blocked' && has('blocked_reason') && !isNonEmptyString(blockedReason)) {
+    return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', 'pending_blocked 必须保留非空 blocked_reason');
+  }
+
   const sets = [];
   const params = [];
-  let nextStatus = row.status;
   for (const field of present) {
     if (field === 'status') {
-      const error = taskStatus(body.status);
-      if (error) return error;
-      nextStatus = body.status;
-      sets.push('status = ?');
-      params.push(body.status);
+      // 终态在下面作为 pending 申请处理。
+      if (!statusIsTerminal) {
+        sets.push('status = ?');
+        params.push(body.status);
+      }
     } else if (field === 'priority') {
       const error = taskPriority(body.priority);
       if (error) return error;
@@ -1131,18 +1427,245 @@ async function patchTaskHandler(db, id, body) {
   }
 
   const now = nowIso();
-  sets.push('updated_at = ?');
-  params.push(now);
-  if (present.includes('status')) {
-    let doneAt = row.done_at || '';
-    if (nextStatus === 'done' && row.status !== 'done') doneAt = now;
-    if (nextStatus !== 'done') doneAt = '';
-    sets.push('done_at = ?');
-    params.push(doneAt);
+  if (has('status') && !statusIsTerminal && row.status === 'blocked') {
+    blockedReason = null;
   }
-  params.push(id);
-  await db.prepare('UPDATE tasks SET ' + sets.join(', ') + ' WHERE id = ?').bind(...params).run();
-  return await getTaskHandler(db, id);
+  if (!statusIsTerminal && (has('blocked_reason') || (has('status') && row.status === 'blocked'))) {
+    sets.push('blocked_reason = ?');
+    params.push(blockedReason);
+  }
+
+  if (statusIsTerminal) {
+    const stateError = taskStateError(row);
+    if (stateError) return stateError;
+    const pendingStatus = nextStatus === 'done' ? 'pending_done' : 'pending_blocked';
+    const confirmationId = 'cnf-' + crypto.randomUUID();
+    const eventId = crypto.randomUUID();
+    const eventPayload = {
+      kind: 'terminal_requested',
+      task_id: id,
+      confirmation_id: confirmationId,
+      requested_status: nextStatus,
+      blocked_reason: nextStatus === 'blocked' ? blockedReason : null,
+      expected_updated_at: expected,
+    };
+    const update = db.prepare(
+      'UPDATE tasks SET ' +
+      (sets.length ? sets.join(', ') + ', ' : '') +
+      'status = ?, pending_status = ?, blocked_reason = ?, updated_at = ? ' +
+      'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL' +
+      (expected === null ? '' : ' AND updated_at = ?')
+    ).bind(
+      ...params, 'in_progress', pendingStatus, nextStatus === 'blocked' ? blockedReason : null, now, id,
+      ...(expected === null ? [] : [expected])
+    );
+    const event = db.prepare(
+      'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
+      'SELECT ?, ?, ?, \'terminal_requested\', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ? WHERE changes() = 1'
+    ).bind(
+      eventId, id, TASK_SYSTEM_AGENT, nextStatus === 'blocked' ? blockedReason : null, pendingStatus,
+      confirmationId, expected, JSON.stringify(eventPayload), now
+    );
+    await db.batch([update, event]);
+    const savedEvent = await findTerminalEvent(db, id, confirmationId);
+    if (!savedEvent) {
+      const current = await getTaskRow(db, id);
+      return taskConflict('任务版本已变化，终态申请未提交', current);
+    }
+    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false });
+  }
+
+  sets.push('updated_at = ?');
+  params.push(now, id);
+  let updateSql = 'UPDATE tasks SET ' + sets.join(', ') + ' WHERE id = ?';
+  if (expected !== null) {
+    updateSql += ' AND updated_at = ?';
+    params.push(expected);
+  }
+  const updateResult = await db.prepare(updateSql).bind(...params).run();
+  if (updateResult && updateResult.meta && Number(updateResult.meta.changes) === 0) {
+    return taskConflict('任务版本已变化，请重新读取后重试', await getTaskRow(db, id));
+  }
+  return await taskResponse(db, id);
+}
+
+// POST /task/{id}/confirm —— pending 的唯一确认入口；更新与审计事件同一 batch 原子提交。
+async function confirmTaskHandler(db, id, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  if (!TASK_CONFIRM_DECISIONS.includes(body.decision)) {
+    return jsonError(422, 'INVALID_CONFIRM_DECISION', 'decision 必须是 accept 或 reopen');
+  }
+  if (!TASK_PENDING_STATUSES.includes(body.expected_pending)) {
+    return jsonError(422, 'INVALID_EXPECTED_PENDING', 'expected_pending 必须是 pending_done 或 pending_blocked');
+  }
+  const expected = taskExpectedUpdatedAt(body.expected_updated_at, true);
+  if (expected instanceof Response) return expected;
+  if (!isNonEmptyString(body.confirmation_id)) {
+    return jsonError(422, 'CONFIRMATION_ID_REQUIRED', 'confirmation_id 必填');
+  }
+  const confirmationId = body.confirmation_id.trim();
+  const requestPayload = {
+    decision: body.decision,
+    expected_pending: body.expected_pending,
+    expected_updated_at: expected,
+    confirmation_id: confirmationId,
+  };
+
+  const row = await getTaskRow(db, id);
+  if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+
+  // 已完成确认先按持久化请求内容做幂等判断；这也允许终态任务安全重试。
+  const prior = await findConfirmationOutcome(db, id, confirmationId);
+  if (prior) {
+    const priorRequest = prior.payload && prior.payload.request;
+    if (JSON.stringify(priorRequest) !== JSON.stringify(requestPayload)) {
+      return taskConflict('confirmation_id 已用于不同内容的确认请求', row);
+    }
+    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: true });
+  }
+
+  const terminalEvent = await findTerminalEvent(db, id, confirmationId);
+  if (!terminalEvent || terminalEvent.pending_status !== body.expected_pending) {
+    return taskConflict('confirmation_id 或 expected_pending 与当前申请不匹配', row);
+  }
+  if (row.pending_status !== body.expected_pending || row.updated_at !== expected || row.confirmation_id !== confirmationId) {
+    return taskConflict('任务 pending 或版本已变化，请重新读取确认队列', row);
+  }
+  const stateError = taskStateError(row);
+  if (stateError) return stateError;
+
+  const now = nowIso();
+  const nextStatus = body.decision === 'accept'
+    ? (body.expected_pending === 'pending_done' ? 'done' : 'blocked')
+    : 'in_progress';
+  const nextReason = body.decision === 'accept' && body.expected_pending === 'pending_blocked'
+    ? row.blocked_reason : null;
+  const eventId = crypto.randomUUID();
+  const eventPayload = {
+    request: requestPayload,
+    result: { status: nextStatus, pending_status: null, updated_at: now },
+  };
+  const doneAtSql = nextStatus === 'done' ? ', done_at = ?' : '';
+  const update = db.prepare(
+    'UPDATE tasks SET status = ?, pending_status = NULL, blocked_reason = ?' + doneAtSql + ', updated_at = ? ' +
+    'WHERE id = ? AND pending_status = ? AND updated_at = ? AND EXISTS (' +
+      'SELECT 1 FROM task_events WHERE task_id = ? AND confirmation_id = ? AND pending_status = ?' +
+    ')'
+  ).bind(
+    nextStatus, nextReason, ...(nextStatus === 'done' ? [now] : []), now, id, body.expected_pending, expected,
+    id, confirmationId, body.expected_pending
+  );
+  // confirmed/reopened 事件的 confirmation_id 列留空：申请事件持有唯一 confirmation_id，
+  // 确认事件通过 payload.request.confirmation_id 关联，避免违反非空唯一约束。
+  const event = db.prepare(
+    'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
+    'SELECT ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, NULL, NULL, ?, ?, ? WHERE changes() = 1'
+  ).bind(
+    eventId, id, TASK_SYSTEM_AGENT, body.decision === 'accept' ? 'confirmed' : 'reopened', body.decision,
+    nextReason, expected, JSON.stringify(eventPayload), now
+  );
+  try {
+    await db.batch([update, event]);
+  } catch (err) {
+    const retry = await findConfirmationOutcome(db, id, confirmationId);
+    if (retry && JSON.stringify(retry.payload && retry.payload.request) === JSON.stringify(requestPayload)) {
+      return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: true });
+    }
+    throw err;
+  }
+  const savedEvent = await db.prepare('SELECT event_id FROM task_events WHERE event_id = ?').bind(eventId).first();
+  if (!savedEvent) return taskConflict('任务版本已变化，确认未提交', await getTaskRow(db, id));
+  return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false });
+}
+
+// POST /task/{id}/round-close —— 每个 agent/round 最多一条不可变收尾事件。
+async function roundCloseTaskHandler(db, id, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  if (!isNonEmptyString(body.agent_id)) return jsonError(422, 'AGENT_ID_REQUIRED', 'agent_id 必填');
+  if (!isNonEmptyString(body.round_id)) return jsonError(422, 'ROUND_ID_REQUIRED', 'round_id 必填');
+  if (!TASK_ROUND_ACTIONS.includes(body.action)) {
+    return jsonError(422, 'INVALID_ROUND_ACTION', 'action 必须是 update、done 或 blocked');
+  }
+  const agentId = body.agent_id.trim();
+  const roundId = body.round_id.trim();
+  const progress = taskEventText(body.progress, 'progress', true);
+  if (progress instanceof Response) return progress;
+  const next = taskEventText(body.next, 'next', true);
+  if (next instanceof Response) return next;
+  let blockedReason = null;
+  if (body.action === 'blocked') {
+    blockedReason = taskBlockedReason(body.blocked_reason);
+    if (blockedReason instanceof Response) return blockedReason;
+  } else if (body.blocked_reason !== undefined && body.blocked_reason !== null) {
+    return jsonError(422, 'INVALID_BLOCKED_REASON', 'blocked_reason 只允许用于 action=blocked');
+  }
+  const expected = taskExpectedUpdatedAt(body.expected_updated_at, body.action !== 'update');
+  if (expected instanceof Response) return expected;
+  const payload = {
+    agent_id: agentId,
+    round_id: roundId,
+    action: body.action,
+    progress,
+    next,
+    blocked_reason: blockedReason,
+    expected_updated_at: expected,
+  };
+
+  const row = await getTaskRow(db, id);
+  if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+  const existing = await findRoundEvent(db, id, agentId, roundId);
+  if (existing) {
+    if (eventPayloadMatches(existing, payload)) {
+      return await taskResponse(db, id, { event_id: existing.event_id, round_id: roundId, idempotent: true });
+    }
+    return taskConflict('相同 round_id 已提交不同内容', row);
+  }
+  if (row.pending_status !== null) {
+    return taskPendingConflict('pending 任务不能再次 round-close，请先 confirm 或 reopen', row);
+  }
+  if (row.status !== 'in_progress') {
+    return jsonError(422, 'TASK_ROUND_REQUIRES_IN_PROGRESS', 'round-close 只允许 in_progress 任务', { task: serializeTask(row) });
+  }
+  const stateError = taskStateError(row);
+  if (stateError) return stateError;
+
+  const now = nowIso();
+  const eventId = crypto.randomUUID();
+  const pendingStatus = body.action === 'done' ? 'pending_done' : body.action === 'blocked' ? 'pending_blocked' : null;
+  const confirmationId = pendingStatus ? 'cnf-' + crypto.randomUUID() : null;
+  const update = body.action === 'update'
+    ? db.prepare(
+      'UPDATE tasks SET updated_at = ? WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL' +
+      (expected === null ? '' : ' AND updated_at = ?')
+    ).bind(now, id, ...(expected === null ? [] : [expected]))
+    : db.prepare(
+      'UPDATE tasks SET status = \'in_progress\', pending_status = ?, blocked_reason = ?, updated_at = ? ' +
+      'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL AND updated_at = ?'
+    ).bind(pendingStatus, blockedReason, now, id, expected);
+  const event = db.prepare(
+    'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
+    'SELECT ?, ?, ?, \'round_close\', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1'
+  ).bind(
+    eventId, id, agentId, roundId, body.action, progress, next, blockedReason, pendingStatus,
+    confirmationId, expected, JSON.stringify(payload), now
+  );
+  try {
+    await db.batch([update, event]);
+  } catch (err) {
+    const retry = await findRoundEvent(db, id, agentId, roundId);
+    if (retry && eventPayloadMatches(retry, payload)) {
+      return await taskResponse(db, id, { event_id: retry.event_id, round_id: roundId, idempotent: true });
+    }
+    throw err;
+  }
+  const savedEvent = await findRoundEvent(db, id, agentId, roundId);
+  if (!savedEvent) return taskConflict('任务版本已变化，round-close 未提交', await getTaskRow(db, id));
+  return await taskResponse(db, id, {
+    event_id: eventId,
+    round_id: roundId,
+    confirmation_id: confirmationId,
+    idempotent: false,
+  });
 }
 
 // DELETE /task/{id} —— 软删，保留任务事实与审计字段。
@@ -1176,7 +1699,7 @@ async function searchTasksHandler(db, body) {
   if (stream) { where.push('stream = ?'); params.push(stream); }
   if (status) { where.push('status = ?'); params.push(status); }
   const rows = await db.prepare(
-    'SELECT * FROM tasks WHERE ' + where.join(' AND ') + ' ORDER BY updated_at DESC, created_at DESC, id DESC'
+    TASK_SELECT_LIST + where.join(' AND ') + ' ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC'
   ).bind(...params).all();
   const items = (rows.results || []).map(serializeTask);
   return jsonOk({ query: body.query, items, total: items.length, stream, status });
@@ -1214,8 +1737,12 @@ async function handleRequest(request, env) {
   const db = env.DB;
 
   if (segments[0] === 'task') {
-    // tasks 表自举（幂等）：首次 task 请求前建表；失败不抛错（task 路由保持原 500 行为）
-    await ensureTasksSchema(db);
+    // migration 失败时 fail closed：绝不继续用旧 schema 服务 task。
+    try {
+      await ensureTasksSchema(db);
+    } catch (err) {
+      return jsonError(503, 'TASK_SCHEMA_UNAVAILABLE', '任务 schema migration 失败，task 路由暂不可用');
+    }
     try {
       if (segments.length === 2 && segments[1] === 'search') {
         if (method === 'POST') return await searchTasksHandler(db, await readJson(request));
@@ -1227,6 +1754,14 @@ async function handleRequest(request, env) {
         if (method === 'GET') return await getTaskHandler(db, id);
         if (method === 'PATCH') return await patchTaskHandler(db, id, await readJson(request));
         if (method === 'DELETE') return await deleteTaskHandler(db, id);
+      } else if (segments.length === 3) {
+        const id = decodeURIComponent(segments[1]);
+        if (method === 'POST' && segments[2] === 'confirm') {
+          return await confirmTaskHandler(db, id, await readJson(request));
+        }
+        if (method === 'POST' && segments[2] === 'round-close') {
+          return await roundCloseTaskHandler(db, id, await readJson(request));
+        }
       }
       return jsonError(405, 'METHOD_NOT_ALLOWED', '路径 ' + path + ' 不支持 ' + method);
     } catch (err) {

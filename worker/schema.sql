@@ -86,12 +86,39 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at    TEXT NOT NULL,                   -- ISO8601 UTC
   updated_at    TEXT NOT NULL DEFAULT '',        -- ISO8601 UTC
   done_at       TEXT DEFAULT '',
-  archived      INTEGER NOT NULL DEFAULT 0       -- 1=归档（软删，recall 默认排除同 memory 契约）
+  archived      INTEGER NOT NULL DEFAULT 0,      -- 1=归档（软删，recall 默认排除同 memory 契约）
+  blocked_reason TEXT DEFAULT NULL,               -- blocked/pending_blocked 的外部阻塞原因
+  pending_status TEXT DEFAULT NULL,              -- pending_done | pending_blocked；终态申请载体
+  CHECK (pending_status IS NULL OR pending_status IN ('pending_done', 'pending_blocked'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
 CREATE INDEX IF NOT EXISTS idx_tasks_stream  ON tasks(stream);
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
+
+-- task_events：任务 round-close、终态申请与确认的不可变审计事实
+CREATE TABLE IF NOT EXISTS task_events (
+  event_id           TEXT PRIMARY KEY,
+  task_id            TEXT NOT NULL,
+  agent_id           TEXT NOT NULL,
+  event_type         TEXT NOT NULL,       -- round_close | terminal_requested | confirmed | reopened
+  round_id           TEXT DEFAULT NULL,
+  action             TEXT DEFAULT NULL,  -- update | done | blocked | accept | reopen
+  progress           TEXT DEFAULT NULL,
+  next               TEXT DEFAULT NULL,
+  blocked_reason     TEXT DEFAULT NULL,
+  pending_status     TEXT DEFAULT NULL,
+  confirmation_id    TEXT DEFAULT NULL,
+  expected_updated_at TEXT DEFAULT NULL,
+  payload_json       TEXT NOT NULL,
+  created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_round_close
+  ON task_events(task_id, agent_id, round_id) WHERE event_type = 'round_close';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_confirmation
+  ON task_events(confirmation_id) WHERE confirmation_id IS NOT NULL;
 
 -- delegations：派单任务记录（L2 事实层，指挥者记忆的地基，design-review.md 维度五 P0）
 CREATE TABLE IF NOT EXISTS delegations (
