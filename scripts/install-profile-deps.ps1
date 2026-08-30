@@ -90,6 +90,57 @@ function Get-PatchConfigValue {
     return $null
 }
 
+function Get-PatchBlockConfig {
+    param(
+        [AllowNull()][string]$Text,
+        [string]$PatchId
+    )
+    # 返回指定 id 块的 config 字段（仅单行 key: value，保留原行文本）：id → 行
+    $result = [ordered]@{}
+    if ([string]::IsNullOrEmpty($Text)) { return $result }
+    $lines = @($Text -split "`r?`n")
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ((Get-PatchId $lines[$index]) -ne $PatchId) { continue }
+        $end = $index + 1
+        while ($end -lt $lines.Count -and $null -eq (Get-PatchId $lines[$end])) { $end++ }
+        for ($entryIndex = $index + 1; $entryIndex -lt $end; $entryIndex++) {
+            $line = $lines[$entryIndex]
+            $match = [regex]::Match($line, '^\s{2,}([A-Za-z0-9_-]+)\s*:\s*')
+            if ($match.Success -and $match.Groups[1].Value -notin @('config')) {
+                $result[$match.Groups[1].Value] = $line
+            }
+        }
+        break
+    }
+    return $result
+}
+
+function Merge-BlockLines {
+    param(
+        [string[]]$NewLines,
+        [AllowNull()][string[]]$ExistingLines
+    )
+    # 新块优先；现有块中未在新块提及的 config 字段追加保留（防抹掉手工配置）
+    $newKeys = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($line in $NewLines) {
+        $match = [regex]::Match($line, '^\s{2,}([A-Za-z0-9_-]+)\s*:\s*')
+        if ($match.Success -and $match.Groups[1].Value -notin @('config')) {
+            $null = $newKeys.Add($match.Groups[1].Value)
+        }
+    }
+    $merged = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $NewLines) { $merged.Add($line) }
+    if ($null -ne $ExistingLines) {
+        foreach ($line in $ExistingLines) {
+            $match = [regex]::Match($line, '^\s{2,}([A-Za-z0-9_-]+)\s*:\s*')
+            if ($match.Success -and $match.Groups[1].Value -notin @('config') -and -not $newKeys.Contains($match.Groups[1].Value)) {
+                $merged.Add($line)
+            }
+        }
+    }
+    return $merged.ToArray()
+}
+
 function Upsert-PatchEntries {
     param([string]$Text, [System.Collections.IDictionary]$Entries)
     $eol = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -110,7 +161,10 @@ function Upsert-PatchEntries {
         $end = $index + 1
         while ($end -lt $lines.Count -and $null -eq (Get-PatchId $lines[$end])) { $end++ }
         if (-not $seen.ContainsKey($id)) {
-            foreach ($entryLine in $Entries[$id]) { $null = $output.Add($entryLine) }
+            $existingBlock = @($lines[$index..($end - 1)])
+            foreach ($entryLine in (Merge-BlockLines -NewLines @($Entries[$id]) -ExistingLines $existingBlock)) {
+                $null = $output.Add($entryLine)
+            }
             $seen[$id] = $true
             if ($end -lt $lines.Count) { $null = $output.Add('') }
         }
@@ -276,10 +330,24 @@ $effectiveTasksPath = if (-not [string]::IsNullOrWhiteSpace($TasksPath)) {
 
 $repoPathYaml = Quote-Yaml $RepoPath
 $profilePathYaml = Quote-Yaml (Join-Path $ProfilePath '')
-$statePathYaml = Quote-Yaml (Join-Path $ProfilePath '.sagitta-auto-advance.json')
+# statePath：现值优先（幂等，不改变已有运行语义）；新装才放 profile 内（防 updater pull 冲突）。
+$existingStatePath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-auto-advance' -Key 'statePath'
+$statePath = if (-not [string]::IsNullOrWhiteSpace($existingStatePath)) { $existingStatePath } else { Join-Path $ProfilePath '.sagitta-auto-advance.json' }
+$statePathYaml = Quote-Yaml $statePath
 $tasksPathYaml = Quote-Yaml $effectiveTasksPath
 $dshHomeFromProfile = Split-Path -Parent (Split-Path -Parent $ProfilePath)
 $presetTargetYaml = Quote-Yaml (Join-Path $dshHomeFromProfile '.agent-presets\sagitta')
+
+# memory.proxy：现值优先（幂等）；缺失时默认本机 clash 混合端口 7897——
+# 本机 Node 直连 workers.dev 被墙，必须走代理，空串会解析成 direct 导致 20s 超时（08-30 实证）。
+$existingMemoryProxy = Get-PatchConfigValue -Text $existingPatch -PatchId 'memory' -Key 'proxy'
+$memoryProxy = if (-not [string]::IsNullOrWhiteSpace($existingMemoryProxy)) { $existingMemoryProxy } else { 'http://127.0.0.1:7897' }
+$memoryProxyYaml = Quote-Yaml $memoryProxy
+# sagitta-manager.workerApiUrl：现值优先，缺失给空（由用户在 Settings 里配置）。
+$existingWorkerApiUrl = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-manager' -Key 'workerApiUrl'
+$workerApiUrl = if (-not [string]::IsNullOrWhiteSpace($existingWorkerApiUrl)) { $existingWorkerApiUrl } else { '' }
+$workerApiUrlYaml = Quote-Yaml $workerApiUrl
+
 $patchEntries = [ordered]@{
     'agent-presets' = @(
         '- id: agent-presets'
@@ -289,12 +357,12 @@ $patchEntries = [ordered]@{
     'sagitta-manager' = @(
         '- id: sagitta-manager'
         '  config:'
-        "    workerApiUrl: ''"
+        "    workerApiUrl: $workerApiUrlYaml"
     )
     'memory' = @(
         '- id: memory'
         '  config:'
-        "    proxy: ''"
+        "    proxy: $memoryProxyYaml   # clash 混合端口；'direct' 或空串 = 直连"
         '    timeoutMs: 20000'
     )
     'sagitta-auto-advance' = @(
