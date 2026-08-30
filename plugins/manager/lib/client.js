@@ -17,7 +17,9 @@ window.__ModuleLoader__.load({
       { field: "cfAccountId", label: "CF 账户 ID", hint: "Worker direct PUT 部署使用的 Cloudflare 账户 ID；非 secret。", secret: false },
       { field: "cfScriptName", label: "Worker 脚本名", hint: "Worker direct PUT 部署使用的 Cloudflare Worker 脚本名；非 secret。", secret: false },
       { field: "workerUploadToken", label: "Worker 部署 Token", hint: "仅 updater 部署 Worker 使用；输入框不会回填已存 Token。", secret: true },
-      { field: "d1ReadToken", label: "D1 读 Token", hint: "memory recall/list/search 与 task list/get 使用。", secret: true },
+      { field: "accessClientId", label: "Access Client ID", hint: "Cloudflare Access 服务令牌 Client ID；memory/auto-advance 访问 worker 的网关放行凭据（CF-Access-Client-Id 头）。", secret: true },
+      { field: "accessClientSecret", label: "Access Client Secret", hint: "与 accessClientId 成对的 Secret；网关放行后 worker 免 Bearer。", secret: true },
+      { field: "d1ReadToken", label: "D1 读 Token", hint: "memory recall/list/search 与 task list/get 使用（Bearer 语义；Access 已配时可不填）。", secret: true },
       { field: "d1WriteToken", label: "D1 写 Token", hint: "memory remember/consolidate/verify 与 task 写操作使用。", secret: true }
     ];
     const EMPTY_SCOPE_SNAPSHOT = { status: "unavailable", value: undefined, base: undefined, user: undefined, revision: undefined, writable: false, mode: "memory" };

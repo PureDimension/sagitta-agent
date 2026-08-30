@@ -10,6 +10,8 @@ const API_FIELDS = [
   "workerUploadToken",
   "d1ReadToken",
   "d1WriteToken",
+  "accessClientId",
+  "accessClientSecret",
   "cfAccountId",
   "cfScriptName"
 ];
@@ -22,9 +24,13 @@ export const Config = z.object({
   workerUploadToken: secret()
     .description("Cloudflare Worker script upload token；仅 updater 使用。"),
   d1ReadToken: secret()
-    .description("D1-backed API 读权限 token；memory/task 读操作使用。"),
+    .description("D1-backed API 读权限 token（Bearer）；memory/task 读操作使用。"),
   d1WriteToken: secret()
-    .description("D1-backed API 写权限 token；memory/task 写操作使用。"),
+    .description("D1-backed API 写权限 token（Bearer）；memory/task 写操作使用。"),
+  accessClientId: secret()
+    .description("Cloudflare Access 服务令牌 Client ID（CF-Access-Client-Id 头）；网关放行后免 Bearer，memory/auto-advance 读 worker 使用。"),
+  accessClientSecret: secret()
+    .description("Cloudflare Access 服务令牌 Secret（CF-Access-Client-Secret 头）；与 accessClientId 成对。"),
   cfAccountId: z.string().default("")
     .description("Cloudflare 账户 ID；Worker direct PUT 部署元数据，非 secret。"),
   cfScriptName: z.string().default("")
@@ -37,6 +43,8 @@ function emptyApiConfig() {
     workerUploadToken: "",
     d1ReadToken: "",
     d1WriteToken: "",
+    accessClientId: "",
+    accessClientSecret: "",
     cfAccountId: "",
     cfScriptName: ""
   };

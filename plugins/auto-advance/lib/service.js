@@ -20,7 +20,7 @@ const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
 const STATUS_EVENT = "sagitta-auto-advance/status";
 const DEFAULT_IDLE_TIMEOUT_MS = 300000;
-const DEFAULT_TASK_API_TIMEOUT_MS = 10000;
+const DEFAULT_TASK_API_TIMEOUT_MS = 3000;
 const LEGACY_WORKSPACE_CANDIDATES = [
   "D:\\workspace\\sagitta-experience",
   join(homedir(), ".dsh"),
@@ -71,13 +71,20 @@ function normalizeTaskApiConfig(config = {}) {
   const nested = isRecord(raw.apiConfig) ? raw.apiConfig : isRecord(raw.taskApiConfig) ? raw.taskApiConfig : {};
   return {
     workerApiUrl: nonEmptyString(nested.workerApiUrl ?? nested.apiUrl ?? raw.workerApiUrl ?? raw.apiUrl),
-    d1ReadToken: nonEmptyString(nested.d1ReadToken ?? raw.d1ReadToken)
+    d1ReadToken: nonEmptyString(nested.d1ReadToken ?? raw.d1ReadToken),
+    accessClientId: nonEmptyString(nested.accessClientId ?? raw.accessClientId),
+    accessClientSecret: nonEmptyString(nested.accessClientSecret ?? raw.accessClientSecret)
   };
 }
 
 function completeTaskApiConfig(config) {
   const normalized = normalizeTaskApiConfig(config);
-  return normalized.workerApiUrl !== undefined && normalized.d1ReadToken !== undefined ? normalized : undefined;
+  // API 模式就绪条件：workerApiUrl 非空，且具备任一认证形态
+  // （Bearer d1ReadToken，或 Cloudflare Access 双 key——网关放行后免 Bearer）。
+  const accessComplete = normalized.accessClientId !== undefined && normalized.accessClientSecret !== undefined;
+  return normalized.workerApiUrl !== undefined && (normalized.d1ReadToken !== undefined || accessComplete)
+    ? normalized
+    : undefined;
 }
 
 function readManagerApiConfig(manager) {
@@ -137,6 +144,7 @@ function normalizeConfig(config = {}) {
     taskApiTimeoutMs: Number.isFinite(Number(config.taskApiTimeoutMs)) && Number(config.taskApiTimeoutMs) > 0
       ? Number(config.taskApiTimeoutMs)
       : DEFAULT_TASK_API_TIMEOUT_MS,
+    proxy: typeof config.proxy === "string" && config.proxy.trim().length > 0 ? config.proxy.trim() : "direct",
     // Explicit API settings are intentionally read without adding fields to the
     // v0.1.7 RPC/typert contract. The manager snapshot is a separate source.
     apiConfig: normalizeTaskApiConfig(config),
@@ -598,31 +606,74 @@ function mapApiTaskSnapshot(items, tasksPath) {
   return { path: tasksPath, updatedAt, sections: [], pendingRequests };
 }
 
+// 复用 @sagitta/memory 的 http.js（CONNECT 隧道 + 传输层重试），读云端 /task。
+// 动态 import：memory 插件不可用（未安装/禁用）时回退 Node fetch 直连（旧行为）。
+let memoryRequestModulePromise = null;
+function memoryHttpRequest() {
+  if (memoryRequestModulePromise === null) {
+    memoryRequestModulePromise = import("@sagitta/memory/lib/http.js")
+      .then((mod) => mod.request ?? null)
+      .catch(() => null);
+  }
+  return memoryRequestModulePromise;
+}
+
 async function readTasksFromApi(apiConfig, config, logger) {
   const url = taskApiUrl(apiConfig.workerApiUrl);
-  const signal = typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(config.taskApiTimeoutMs) : undefined;
-  let response;
-  try {
-    response = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${apiConfig.d1ReadToken}`
-      },
-      signal
-    });
-  } catch (error) {
-    throw new Error(`请求失败：${renderError(error)}`);
+  const timeoutMs = config.taskApiTimeoutMs;
+  const useProxy = typeof config.proxy === "string" && config.proxy.trim().length > 0 && config.proxy.trim().toLowerCase() !== "direct";
+  // 认证：优先 Bearer（d1ReadToken）；否则 Cloudflare Access 双 key（网关放行 → CF-Access-Jwt-Assertion → 免 Bearer）
+  const requestHeaders = { Accept: "application/json" };
+  if (apiConfig.d1ReadToken) {
+    requestHeaders.Authorization = `Bearer ${apiConfig.d1ReadToken}`;
+  } else if (apiConfig.accessClientId && apiConfig.accessClientSecret) {
+    requestHeaders["CF-Access-Client-Id"] = apiConfig.accessClientId;
+    requestHeaders["CF-Access-Client-Secret"] = apiConfig.accessClientSecret;
   }
 
-  const status = Number(response?.status);
-  const successful = response?.ok === true || (Number.isInteger(status) && status >= 200 && status < 300);
+  let status = 0;
+  let bodyText = "";
+  if (useProxy) {
+    const memoryRequest = await memoryHttpRequest();
+    if (typeof memoryRequest !== "function") {
+      throw new Error("proxy 已配置但 @sagitta/memory 的 http.js 不可用（memory 插件缺失/版本过旧）");
+    }
+    let response;
+    try {
+      response = await memoryRequest({
+        method: "GET",
+        url: url.toString(),
+        headers: requestHeaders,
+        timeoutMs,
+        proxy: config.proxy,
+      });
+    } catch (error) {
+      throw new Error(`请求失败：${renderError(error)}`);
+    }
+    status = Number(response?.status);
+    bodyText = response?.body ? Buffer.from(response.body).toString("utf8") : "";
+  } else {
+    const signal = typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(timeoutMs) : undefined;
+    let response;
+    try {
+      response = await fetch(url.toString(), {
+        method: "GET",
+        headers: requestHeaders,
+        signal,
+      });
+    } catch (error) {
+      throw new Error(`请求失败：${renderError(error)}`);
+    }
+    status = Number(response?.status);
+    bodyText = typeof response.text === "function" ? await response.text() : "";
+  }
+
+  const successful = status >= 200 && status < 300;
   if (!successful) throw new Error(`HTTP ${Number.isInteger(status) ? status : "未知"}`);
 
   let payload;
   try {
-    const rawBody = typeof response.text === "function" ? await response.text() : await response.json();
-    payload = typeof rawBody === "string" ? JSON.parse(rawBody) : rawBody;
+    payload = JSON.parse(bodyText);
   } catch {
     throw new Error("响应不是合法 JSON");
   }
@@ -743,5 +794,6 @@ export {
   hasPendingInbox,
   isExactStopMessage,
   readTasks,
+  readTasksFromApi,
   resolveConfiguredPaths
 };
