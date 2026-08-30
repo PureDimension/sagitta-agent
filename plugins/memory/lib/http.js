@@ -134,12 +134,48 @@ function decodeChunked(buf) {
 // ---- 请求执行 ---------------------------------------------------------------
 // proxy 形如 "http://host:port"（clash 混合端口）。proxy 为空串/“direct”时直连。
 
+// 传输层自动重试（2026-08-30 增加，网络稳定化）：
+//   · 仅 GET/HEAD（HTTP 语义幂等）重试；POST/PATCH/DELETE 不重试（写操作幂等性风险）。
+//   · 仅重试传输类错误（HttpNetworkError / HttpTimeoutError——clash 抖动、TLS 断连、
+//     云端无响应等瞬时问题）；HttpStatusError（HTTP 响应已到达）不重试。
+//   · 退避 300ms / 800ms，最多 2 次重试；signal 中止时立即放弃。
+const RETRYABLE_METHODS = new Set(["GET", "HEAD"]);
+const RETRY_DELAYS_MS = [300, 800];
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableTransportError(err) {
+  return err instanceof HttpNetworkError || err instanceof HttpTimeoutError;
+}
+
 /**
- * 发送一个 HTTPS 请求（通过可选的 HTTP CONNECT 代理隧道）。
+ * 发送一个 HTTPS 请求（通过可选的 HTTP CONNECT 代理隧道），带传输层重试。
  * @param {object} opts { method, url, headers(对象), body(string|Buffer), timeoutMs, signal, proxy }
  * @returns {Promise<{status,statusText,headers:Map,body:Buffer}>}
  */
 export async function request(opts) {
+  const { method = "GET", signal } = opts;
+  const attempts = RETRYABLE_METHODS.has(method) ? RETRY_DELAYS_MS.length + 1 : 1;
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (signal?.aborted) {
+      throw new Error("请求已中止");
+    }
+    try {
+      return await requestOnce(opts);
+    } catch (err) {
+      lastError = err;
+      const canRetry = attempt < attempts && isRetryableTransportError(err) && !signal?.aborted;
+      if (!canRetry) throw err;
+      await sleepMs(RETRY_DELAYS_MS[attempt - 1]);
+    }
+  }
+  throw lastError;
+}
+
+async function requestOnce(opts) {
   const { method = "GET", url, headers = {}, body, timeoutMs = 20000, signal, proxy } = opts;
   const u = validateUrl(url);
   // https：生产路径（workers.dev，可走 CONNECT 代理隧道）；

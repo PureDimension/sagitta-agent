@@ -497,7 +497,7 @@ window.__ModuleLoader__.load({
         clampAll();
       }
       function row(label, value) {
-        const line = createElement("div");
+        const line = createElement("div", { class: "saa-status-row" });
         line.append(createElement("strong", {}, label), createElement("span", {}, value));
         return line;
       }
