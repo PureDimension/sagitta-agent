@@ -30,7 +30,7 @@ const Config = z.object({
   codexPath: z.string().default("codex").description("codex CLI 可执行文件（或 PATH 名）。"),
   defaultModel: z.string().default(DEFAULT_MODEL).description("默认模型（codex-model-policy.md 当前档位）。"),
   workTimeoutMs: z.number().default(DEFAULT_WORK_TIMEOUT_MS).description("工作超时（毫秒）；超时视为 stale 自动回收。"),
-  maxConcurrent: z.number().default(MAX_CONCURRENT).description("每 agent 并发 codex 工作上限。"),
+  maxConcurrent: z.number().min(1).default(MAX_CONCURRENT).description("每 agent 并发 codex 工作上限（正整数）。"),
   sandbox: z.string().default("danger-full-access").description("codex 沙箱模式。"),
   reasoningEffort: z.string().default("xhigh").description("codex 推理档位。")
 });
@@ -162,14 +162,21 @@ function resolveCodexLaunch(codexPath) {
   return { command: codexPath, args: [] };
 }
 
-function runCodex({ codexPath, args, pidRef }) {
+function runCodex({ codexPath, args, pidRef, cwd }) {
   const { command, args: prefix } = resolveCodexLaunch(codexPath);
   const child = spawn(command, [...prefix, ...args], {
     detached: true,          // 与 DSH 生命周期解耦（DSH 重启不杀 codex）
     stdio: "ignore",
     windowsHide: true,
+    ...(cwd ? { cwd } : {}),
   });
-  pidRef.current = child.pid ?? null;
+  // spawn 失败（如 ENOENT）时 pid 为 undefined——同步判定"未真正启动"，避免假 running 状态
+  if (child.pid === undefined) {
+    const error = new Error("codex 启动失败（spawn 未产生进程，命令不可执行）");
+    error.code = "SPAWN_NO_PID";
+    throw error;
+  }
+  pidRef.current = child.pid;
   child.unref();
   return child;
 }
@@ -212,6 +219,7 @@ export function apply(ctx, config) {
       task: { type: "string", required: true, description: "codex 任务描述（完整、自包含，codex 无本会话上下文）。" },
       model: { type: "string", description: `模型（默认 ${DEFAULT_MODEL}；档位见 codex-model-policy.md）。` },
       timeoutMs: { type: "integer", description: `本工作超时（毫秒，默认 ${DEFAULT_WORK_TIMEOUT_MS}）。` },
+      cwd: { type: "string", description: "codex 工作目录（默认继承 DSH 进程 cwd；建议传目标仓库/项目目录）。" },
     },
     output: {
       schema: {
@@ -257,7 +265,12 @@ export function apply(ctx, config) {
       const pidRef = { current: null };
       let child;
       try {
-        child = runCodex({ codexPath: resolved.codexPath ?? "codex", args: codexArgs, pidRef });
+        child = runCodex({
+          codexPath: resolved.codexPath ?? "codex",
+          args: codexArgs,
+          pidRef,
+          cwd: typeof args.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : undefined,
+        });
       } catch (error) {
         registry.markEnded(agentId, work.id, WORK_STATUS.FAILED, null);
         throw new Error(`codex 启动失败：${error.message}`);

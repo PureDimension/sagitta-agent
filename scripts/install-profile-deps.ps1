@@ -249,8 +249,18 @@ Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @
 if (-not $DryRun) {
     foreach ($relativePluginPath in $plugins.Values) {
         $pluginPath = Join-Path $RepoPath $relativePluginPath
-        if (-not (Test-Path -LiteralPath (Join-Path $pluginPath 'package.json') -PathType Leaf)) {
+        $manifestPath = Join-Path $pluginPath 'package.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             throw "Missing plugin package.json: $pluginPath"
+        }
+        # 校验 dsh.bundle manifest（DSH 启动前置要求，缺失会直接 dump-config 失败）
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $bundlePatch = $manifest.dsh.bundle.patch
+        if ([string]::IsNullOrWhiteSpace($bundlePatch)) {
+            throw "Plugin $($manifest.name) declares no dsh.bundle.patch in package.json — DSH 启动会失败（codex 审查 08-30 实证）。"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $pluginPath $bundlePatch) -PathType Leaf)) {
+            throw "Plugin $($manifest.name) dsh.bundle.patch 指向的文件不存在：$bundlePatch"
         }
     }
 } else {
