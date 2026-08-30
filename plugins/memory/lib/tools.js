@@ -24,6 +24,7 @@ import {
   ORIGINS,
   CONSOLIDATE_ACTIONS,
 } from "./config.js";
+import { pickTask, taskContractError, validateRoundText, validateTaskUpdate } from "./task-contract.js";
 
 const CONTENT_EXCERPT_MAX = 1200;
 
@@ -745,10 +746,18 @@ export function registerMemoryTools(ctx, client) {
   // 任务管理（个人/公司项目待办）走云端 D1 tasks 表，与 memory 条目独立。
   // 状态机：open | in_progress | blocked | waiting | done；priority 0普通/1高/2紧急；
   // checkbox=1 表示"涟漪待处理"项（auto-advance 悬浮窗"待处理需求"区读 GET /task?checkbox=1&status=open）。
-  // archived=1 为软删（列表/搜索默认排除）；status=done 表示完成（保留事实，不软删）。
+  // archived=1 为软删（列表/搜索默认排除）；done/blocked 通过 pending + confirm 才成为终态。
 
+  const nullableString = () => ({ oneOf: [{ type: "string" }, { type: "null" }] });
+  const nullablePendingStatus = () => ({
+    oneOf: [
+      { type: "string", enum: ["pending_done", "pending_blocked"] },
+      { type: "null" },
+    ],
+  });
   const TASK_FIELDS = {
     id: { type: "string", required: true },
+    task_id: { type: "string" },
     project: { type: "string", required: true },
     title: { type: "string", required: true },
     status: { type: "string", required: true },
@@ -757,18 +766,25 @@ export function registerMemoryTools(ctx, client) {
     stream: { type: "string", required: true },
     body: { type: "string" },
     created_at: { type: "string", required: true },
-    updated_at: { type: "string" },
-    done_at: { type: "string" },
+    updated_at: nullableString(),
+    done_at: nullableString(),
+    blocked_reason: nullableString(),
+    pending_status: nullablePendingStatus(),
+    confirmation_id: nullableString(),
+    idempotent: { type: "boolean" },
     archived: { type: "integer", required: true },
   };
   const TASK_STATUSES = ["open", "in_progress", "blocked", "waiting", "done"];
+  const TASK_CREATE_STATUSES = ["open", "in_progress", "waiting"];
   const TASK_STREAMS = [...STREAMS, "company"];
 
   ctx.tools.register(defineTool({
     name: "task_list",
     description:
       "任务列表（云端 D1 tasks 表，docs/task-api-p1.md）：按 project/stream/status/checkbox 过滤；" +
-      "默认排除 archived（软删）。checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。",
+      "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/updated_at/done_at；" +
+      "done/blocked 只有 pending_done/pending_blocked 申请并经 task_confirm accept 后才是终态，pending 时带 confirmation_id；" +
+      "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。",
     parameters: {
       project: { type: "string", description: "项目过滤（如 research/lmy-diffusion-accel、sagitta-agent）。" },
       stream: { type: "string", enum: TASK_STREAMS, description: "流过滤：personal-projects | company-projects | sagitta | ripple | company。" },
@@ -792,7 +808,8 @@ export function registerMemoryTools(ctx, client) {
         const lines = value.items.map((t) => {
           const cb = t.checkbox === 1 ? "☐" : "·";
           const st = t.status === "done" ? "✅" : t.status === "blocked" ? "🚩" : t.status === "in_progress" ? "🔄" : t.status === "waiting" ? "⏳" : "□";
-          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}）`;
+          const pending = t.pending_status ? ` · ${t.pending_status}待确认` : "";
+          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}${pending}）`;
         });
         return [{ type: "text", text: head + lines.join("\n") }];
       },
@@ -825,7 +842,7 @@ export function registerMemoryTools(ctx, client) {
     parameters: {
       project: { type: "string", required: true, description: "所属项目（与 TASKS.md §1 分类对齐，如 research/lmy-diffusion-accel）。" },
       title: { type: "string", required: true, description: "条目一行描述。" },
-      status: { type: "string", enum: TASK_STATUSES, description: "默认 open。" },
+      status: { type: "string", enum: TASK_CREATE_STATUSES, description: "默认 open；done/blocked 必须通过 task_update 或 task_round_close 申请后再 task_confirm。" },
       priority: { type: "integer", description: "0 普通 / 1 高 / 2 紧急（默认 0）。" },
       checkbox: { type: "boolean", description: "true=涟漪待处理项（默认 false）。" },
       stream: { type: "string", enum: TASK_STREAMS, description: "默认 company。" },
@@ -861,8 +878,10 @@ export function registerMemoryTools(ctx, client) {
   ctx.tools.register(defineTool({
     name: "task_update",
     description:
-      "更新任务（PATCH /task/{id}）：只允许业务字段（title/status/priority/body/checkbox）；" +
-      "status=done 表示完成（done_at 由服务端填写，保留事实）。task_id 可从 task_list 获取。",
+      "更新任务（PATCH /task/{id}）：参数白名单仅为 status/priority/body/title/checkbox/blocked_reason，" +
+      "可带 expected_updated_at；不得传 done_at、pending_status 或 confirm。" +
+      "status=done/blocked 只是申请 pending_done/pending_blocked，返回 confirmation_id 与 updated_at，" +
+      "必须再用 task_confirm accept 才进入终态；status=blocked 时 blocked_reason 必填。task_id 可从 task_list 获取。",
     parameters: {
       task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
       title: { type: "string" },
@@ -870,6 +889,8 @@ export function registerMemoryTools(ctx, client) {
       priority: { type: "integer" },
       body: { type: "string" },
       checkbox: { type: "boolean" },
+      blocked_reason: { type: "string", description: "申请 blocked 时必填的非空阻塞原因；done 申请不得设置。" },
+      expected_updated_at: { type: "string", description: "可选版本条件；必须等于当前 updated_at。" },
     },
     output: {
       schema: {
@@ -877,31 +898,178 @@ export function registerMemoryTools(ctx, client) {
         additionalProperties: false,
         properties: { ...TASK_FIELDS, message: { type: "string", required: true } },
       },
-      render: (_args, value) => [{ type: "text", text: `## 任务已更新\n\n**${value.title}**（${value.id} · ${value.status}${value.done_at ? ` · ✅ ${value.done_at}` : ""}）` }],
+      render: (_args, value) => {
+        if (value.pending_status) {
+          return [{
+            type: "text",
+            text: `## 已提交终态申请（待确认）\n\n**${value.title}**（${value.id} · ${value.pending_status}）\n` +
+              `当前仍是 ${value.status}，尚未${value.pending_status === "pending_blocked" ? "阻塞" : "完成"}；` +
+              `请使用 task_confirm accept（confirmation_id=${value.confirmation_id || "缺失"}，updated_at=${value.updated_at || "缺失"}）。`,
+          }];
+        }
+        return [{ type: "text", text: `## 任务已更新\n\n**${value.title}**（${value.id} · ${value.status}）` }];
+      },
       presentationMeta: (_args, value) => ({ id: value.id, status: value.status }),
     },
     timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
+      validateTaskUpdate(args);
       const body = {
         ...(args.title !== undefined ? { title: args.title } : {}),
         ...(args.status !== undefined ? { status: args.status } : {}),
         ...(args.priority !== undefined ? { priority: args.priority } : {}),
         ...(args.body !== undefined ? { body: args.body } : {}),
         ...(args.checkbox !== undefined ? { checkbox: args.checkbox === true ? 1 : 0 } : {}),
+        ...(args.blocked_reason !== undefined ? { blocked_reason: args.blocked_reason } : {}),
+        ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
       };
       if (Object.keys(body).length === 0) throw new Error("task_update 至少需要更新一个字段。");
       const updated = await client.patchTask(args.task_id, body, exec.signal);
-      return { ...pickTask(updated), message: `已更新任务 ${updated.id}` };
+      const task = pickTask(updated);
+      const message = task.pending_status
+        ? `已提交 ${task.pending_status} 申请（任务仍为 ${task.status}，未进入终态）；请用 task_confirm accept 确认，confirmation_id=${task.confirmation_id || "缺失"}，updated_at=${task.updated_at || "缺失"}`
+        : `已更新任务 ${task.id}`;
+      return { ...task, message };
     },
     presentCall: (args) => presentCall("task_update", args, `id=${args.task_id} status=${args.status || ""}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_confirm",
+    description:
+      "确认任务终态申请（POST /task/{id}/confirm）：只接受 accept 或 reopen，" +
+      "必须同时提供 expected_pending、expected_updated_at、confirmation_id。accept 才会把 pending_done/pending_blocked " +
+      "落为 done/blocked；reopen 会回到 in_progress；同一 confirmation_id 的相同重试幂等。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "任务 id。" },
+      decision: { type: "string", required: true, enum: ["accept", "reopen"] },
+      expected_pending: { type: "string", required: true, enum: ["pending_done", "pending_blocked"] },
+      expected_updated_at: { type: "string", required: true, description: "必须等于 pending 当前 updated_at。" },
+      confirmation_id: { type: "string", required: true, description: "pending 返回的 confirmation_id。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          task_id: { type: "string", required: true },
+          status: { type: "string", required: true },
+          pending_status: nullablePendingStatus(),
+          blocked_reason: nullableString(),
+          done_at: nullableString(),
+          updated_at: nullableString(),
+          confirmation_id: { type: "string", required: true },
+          idempotent: { type: "boolean", required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text: value.idempotent
+          ? `## 任务确认幂等重试\n\n${value.task_id} 当前状态：${value.status}（confirmation_id=${value.confirmation_id}）`
+          : `## 任务确认结果\n\n${value.task_id} → ${value.status}${value.pending_status ? `（${value.pending_status}，仍待确认）` : "（已确认）"}`,
+      }],
+      presentationMeta: (_args, value) => ({ task_id: value.task_id, status: value.status, idempotent: value.idempotent }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const result = await client.confirmTask(args.task_id, {
+        decision: args.decision,
+        expected_pending: args.expected_pending,
+        expected_updated_at: args.expected_updated_at,
+        confirmation_id: args.confirmation_id,
+      }, exec.signal);
+      const task = pickTask(result);
+      return {
+        task_id: String(result.task_id ?? task.id ?? args.task_id),
+        status: task.status,
+        pending_status: task.pending_status,
+        blocked_reason: task.blocked_reason,
+        done_at: task.done_at,
+        updated_at: task.updated_at,
+        confirmation_id: String(result.confirmation_id ?? args.confirmation_id),
+        idempotent: result.idempotent === true,
+      };
+    },
+    presentCall: (args) => presentCall("task_confirm", args, `id=${args.task_id} decision=${args.decision}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_round_close",
+    description:
+      "关闭一个自主推进 round（POST /task/{id}/round-close）：progress 与 next 必填，" +
+      "trim 后各 1–1000 个 Unicode 字符且不得含 NUL/控制字符/CR/LF；action 仅 update/done/blocked。" +
+      "done/blocked 只申请 pending_done/pending_blocked，必须再 task_confirm；blocked_reason 仅 action=blocked 时必填。" +
+      "同 task_id + 执行 agent + round_id 的相同内容重试幂等，不同内容返回冲突。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "任务 id。" },
+      round_id: { type: "string", required: true, description: "本轮唯一 id；同 task/agent 下用于幂等。" },
+      action: { type: "string", required: true, enum: ["update", "done", "blocked"] },
+      progress: { type: "string", required: true, description: "本轮进展摘要，trim 后 1–1000 字符，无控制字符或换行。" },
+      next: { type: "string", required: true, description: "下一步摘要，trim 后 1–1000 字符，无控制字符或换行。" },
+      blocked_reason: { type: "string", description: "action=blocked 时必填；其他 action 禁止设置。" },
+      expected_updated_at: { type: "string", description: "done/blocked 必填；update 可选的版本条件。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ...TASK_FIELDS,
+          event_id: { type: "string", required: true },
+          round_id: { type: "string", required: true },
+          idempotent: { type: "boolean", required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text: `## Round 已关闭${value.idempotent ? "（幂等重试）" : ""}\n\n` +
+          `round_id=${value.round_id} · event_id=${value.event_id} · task=${value.id} · status=${value.status}` +
+          `${value.pending_status ? ` · ${value.pending_status}（待 task_confirm，confirmation_id=${value.confirmation_id || "缺失"}）` : ""}`,
+      }],
+      presentationMeta: (_args, value) => ({ id: value.id, round_id: value.round_id, event_id: value.event_id, idempotent: value.idempotent }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const progress = validateRoundText(args.progress, "progress");
+      const next = validateRoundText(args.next, "next");
+      if (args.action === "blocked" && (typeof args.blocked_reason !== "string" || args.blocked_reason.trim().length === 0)) {
+        throw taskContractError("BLOCKED_REASON_REQUIRED", "blocked_reason 必须是非空字符串");
+      }
+      if (args.action !== "blocked" && args.blocked_reason !== undefined) {
+        throw taskContractError("INVALID_BLOCKED_REASON", "blocked_reason 只允许用于 action=blocked");
+      }
+      if (args.action !== "update" && (typeof args.expected_updated_at !== "string" || args.expected_updated_at.trim().length === 0)) {
+        throw taskContractError("INVALID_EXPECTED_UPDATED_AT", "done/blocked 的 expected_updated_at 必填且必须是非空字符串");
+      }
+      const body = {
+        agent_id: String(exec?.agent?.id ?? "unknown"),
+        round_id: args.round_id,
+        action: args.action,
+        progress,
+        next,
+        ...(args.blocked_reason !== undefined ? { blocked_reason: args.blocked_reason.trim() } : {}),
+        ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
+      };
+      const result = await client.roundCloseTask(args.task_id, body, exec.signal);
+      return {
+        ...pickTask(result),
+        event_id: String(result.event_id ?? ""),
+        round_id: String(result.round_id ?? args.round_id),
+        idempotent: result.idempotent === true,
+      };
+    },
+    presentCall: (args) => presentCall("task_round_close", args, `id=${args.task_id} round=${args.round_id} action=${args.action}`),
   }));
 
   ctx.tools.register(defineTool({
     name: "task_archive",
     description:
       "软删除任务（DELETE /task/{id} → archived=1）：列表/搜索默认不再返回，保留事实与审计字段。" +
-      "完成的任务用 task_update status=done（不软删）；只有确实不再需要跟踪的才 archive。",
+      "完成的任务须先经 task_update/task_round_close 申请 pending_done，再由 task_confirm accept 进入 done（不软删）；" +
+      "只有确实不再需要跟踪的才 archive。",
     parameters: {
       task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
     },
@@ -927,7 +1095,8 @@ export function registerMemoryTools(ctx, client) {
     name: "task_search",
     description:
       "关键词检索任务（POST /task/search，LIKE 匹配 title/body/project）：默认排除 archived。" +
-      "可选 project/stream/status 过滤。",
+      "可选 project/stream/status 过滤；返回 pending_status/blocked_reason/updated_at/done_at，" +
+      "done/blocked 的 pending 申请须经 task_confirm 才是终态。",
     parameters: {
       query: { type: "string", required: true, description: "关键词（匹配 title/body/project）。" },
       project: { type: "string" },
@@ -946,7 +1115,7 @@ export function registerMemoryTools(ctx, client) {
         },
       },
       render: (_args, value) => [
-        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}）`).join("\n") },
+        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}${t.pending_status ? ` · ${t.pending_status}待确认` : ""}）`).join("\n") },
       ],
       presentationMeta: (_args, value) => ({ total: value.total }),
     },
@@ -963,24 +1132,6 @@ export function registerMemoryTools(ctx, client) {
   }));
 }
 
-function pickTask(task) {
-  if (!task) return null;
-  return {
-    id: task.id,
-    project: task.project,
-    title: task.title,
-    status: task.status,
-    priority: Number(task.priority ?? 0),
-    checkbox: Number(task.checkbox ?? 0),
-    stream: task.stream,
-    body: task.body,
-    created_at: task.created_at,
-    updated_at: task.updated_at,
-    done_at: task.done_at,
-    archived: Number(task.archived ?? 0),
-  };
-}
-
 // ---- 系统提示词引导（工具使用纪律 + §4 v1.3 分数驱动信任轨道） ----------------
 
 export const MEMORY_PROMPT_GUIDANCE = `记忆工具（sagitta-memory）——设计 §10 四个工具落地为 DSH 工具（v1.3 分数驱动）：
@@ -990,4 +1141,8 @@ export const MEMORY_PROMPT_GUIDANCE = `记忆工具（sagitta-memory）——设
 - memory_consolidate：治理动作集（v1.3：升级已由 ack 自动联动，consolidate 不再是升级唯一通道）：validate 事件化（**blind_spot 必填**，缺失整体 422；explanation 可作召回 few-shot；linked_delegation_id 关联验证）；replace 整体更换（**分数按新 origin 重置**：ripple→2/sagitta→0；旧内容写 replaced 事件仅审计，不参与 recall；可改写软归档条目为相反经验）；archive 治理归档（pinned 拒绝）；digest/corroborate 兜底。任一失败整体 422 不写入。
 - memory_verify：三态信任信号登记（explicit 涟漪明确开口 +2；unobjected 我陈述后涟漪未反对 +1，**必须带 statement_source**，不得虚构"我陈述过"；oppose 涟漪明确反对 −3，score<0 自动软归档——涟漪拍板软归档而非硬删）与 delegation 验证结果复核。
 
-信任轨道（v1.3 分数驱动，防过拟合）：score 0~3 钳制；score≥1→digested、≥2→corroborated（ack 提交自动联动，无需手动升级）；validated 由验证事件承载（不是认可次数堆出来的）；score=3 固化档（"已固化，若不与当前场景冲突建议遵循"）；score=2 无提示；score 0~1 "尚未经过多次强化，不一定可信"。delegatee=ripple 仅涟漪实际输入背书时记录，AI 无权代填。密钥/明文永不写入任何记忆条目（L1 硬规则）。`;
+信任轨道（v1.3 分数驱动，防过拟合）：score 0~3 钳制；score≥1→digested、≥2→corroborated（ack 提交自动联动，无需手动升级）；validated 由验证事件承载（不是认可次数堆出来的）；score=3 固化档（"已固化，若不与当前场景冲突建议遵循"）；score=2 无提示；score 0~1 "尚未经过多次强化，不一定可信"。delegatee=ripple 仅涟漪实际输入背书时记录，AI 无权代填。密钥/明文永不写入任何记忆条目（L1 硬规则）。
+
+任务工具（task API v2）：task_update 的参数仅限 status/priority/body/title/checkbox/blocked_reason（可带 expected_updated_at），不得传 done_at/pending_status/confirm。done/blocked 只提交 pending_done/pending_blocked 申请并返回 confirmation_id，必须 task_confirm accept 才进入终态；blocked 必须有 blocked_reason。每轮用 task_round_close 写 progress/next，二者 trim 后各 1–1000 字符且不得有控制字符或换行；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。`;
+
+export { pickTask };

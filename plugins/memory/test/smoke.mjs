@@ -48,7 +48,7 @@ import { resolveConfig, maskTokenSummary } from "../lib/config.js";
 import { SagittaMemoryClient, MemoryApiError } from "../lib/client.js";
 
 const TARGET = process.env.DSH_MEMORY_SMOKE_TARGET === "online" ? "online" : "local";
-const WORKER_DIR = fileURLToPath(new URL("../../cloudflare-worker", import.meta.url));
+const WORKER_DIR = fileURLToPath(new URL("../../../worker", import.meta.url));
 const LOCAL_TOKEN = "smoke-local-token-2026"; // 仅本地桩使用的测试令牌，非真实凭据
 
 let failures = 0;

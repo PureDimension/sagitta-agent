@@ -123,17 +123,16 @@ function truncateForError(text) {
 }
 
 /**
- * 组装认证头。兼容 fallback 可发送成对的 Access headers；manager 提供的
- * D1 read/write token 走 Bearer。任何情况下都不打印明文。
+ * 组装认证头。认证优先级与 auto-advance 一致：有对应 Bearer token 时只发
+ * Bearer；否则发成对的 Cloudflare Access headers。任何情况下都不打印明文。
  */
 export function buildAuthHeaders(auth) {
   const headers = {};
-  if (auth.accessPresent) {
-    headers["CF-Access-Client-Id"] = auth.accessClientId;
-    headers["CF-Access-Client-Secret"] = auth.accessClientSecret;
-  }
   if (auth.bearerPresent) {
     headers["Authorization"] = `Bearer ${auth.authToken}`;
+  } else if (auth.accessPresent) {
+    headers["CF-Access-Client-Id"] = auth.accessClientId;
+    headers["CF-Access-Client-Secret"] = auth.accessClientSecret;
   }
   return headers;
 }
@@ -160,6 +159,8 @@ function normalizedApiConfig(config = {}) {
     workerApiUrl: textValue(config.workerApiUrl).replace(/\/+$/, ""),
     d1ReadToken: textValue(config.d1ReadToken),
     d1WriteToken: textValue(config.d1WriteToken),
+    accessClientId: textValue(config.accessClientId),
+    accessClientSecret: textValue(config.accessClientSecret),
   };
 }
 
@@ -169,6 +170,41 @@ function managerConfig(manager) {
     return normalizedApiConfig(manager.getApiConfig());
   } catch {
     return undefined;
+  }
+}
+
+function hasConfiguredApiValue(config) {
+  return !!config && [
+    config.workerApiUrl,
+    config.d1ReadToken,
+    config.d1WriteToken,
+    config.accessClientId,
+    config.accessClientSecret,
+  ].some((value) => value.length > 0);
+}
+
+function isLoopbackHostname(hostname) {
+  const value = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  return value === "localhost" || value === "::1" || /^127\./u.test(value);
+}
+
+/** True for the local endpoints allowed to use direct transport. */
+export function isLoopbackUrl(value) {
+  try {
+    return isLoopbackHostname(new URL(value).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function assertTransportPolicy(baseUrl, proxy) {
+  const configuredProxy = typeof proxy === "string" ? proxy.trim() : "";
+  const direct = configuredProxy.length === 0 || configuredProxy.toLowerCase() === "direct";
+  if (direct && !isLoopbackUrl(baseUrl)) {
+    throw new Error(
+      "配置错误：访问非 loopback Worker 禁止使用 direct；请配置 DSH_MEMORY_PROXY 或插件 proxy（HTTP CONNECT 代理），" +
+      "未配置代理时已 fail closed。"
+    );
   }
 }
 
@@ -207,15 +243,19 @@ export class SagittaMemoryClient {
     const current = managerConfig(this.manager);
     const baseUrl = current?.workerApiUrl || this.fallback.baseUrl;
     const token = operation === "read" ? current?.d1ReadToken : current?.d1WriteToken;
-    const auth = token
-      ? normalizedAuth({ authToken: token })
+    const auth = hasConfiguredApiValue(current)
+      ? normalizedAuth({
+        authToken: token,
+        accessClientId: current.accessClientId,
+        accessClientSecret: current.accessClientSecret,
+      })
       : this.fallback.auth;
     const runtime = {
       baseUrl,
       proxy: this.config.proxy,
       timeoutMs: this.config.timeoutMs,
       auth,
-      source: current && (current.workerApiUrl || current.d1ReadToken || current.d1WriteToken) ? "manager" : "fallback",
+      source: hasConfiguredApiValue(current) ? "manager" : "fallback",
     };
     this.baseUrl = runtime.baseUrl;
     return runtime;
@@ -229,6 +269,7 @@ export class SagittaMemoryClient {
     let url;
     try {
       const baseUrl = validateBaseUrl(runtime.baseUrl).toString().replace(/\/+$/, "");
+      assertTransportPolicy(baseUrl, runtime.proxy);
       url = baseUrl + path + (query ? buildQuery(query) : "");
     } catch (err) {
       throw translateFailure(err, { proxy: runtime.proxy, timeoutMs: runtime.timeoutMs });
@@ -350,6 +391,24 @@ export class SagittaMemoryClient {
 
   async patchTask(id, payload, signal) {
     return await this.request(`/task/${encodeURIComponent(id)}`, { method: "PATCH", operation: "write", body: payload, signal });
+  }
+
+  async confirmTask(id, payload, signal) {
+    return await this.request(`/task/${encodeURIComponent(id)}/confirm`, {
+      method: "POST",
+      operation: "write",
+      body: payload,
+      signal,
+    });
+  }
+
+  async roundCloseTask(id, payload, signal) {
+    return await this.request(`/task/${encodeURIComponent(id)}/round-close`, {
+      method: "POST",
+      operation: "write",
+      body: payload,
+      signal,
+    });
   }
 
   async deleteTask(id, signal) {

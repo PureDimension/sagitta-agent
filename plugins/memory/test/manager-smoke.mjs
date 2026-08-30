@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { resolveConfig } from "../lib/config.js";
-import { SagittaMemoryClient } from "../lib/client.js";
+import { SagittaMemoryClient, isLoopbackUrl } from "../lib/client.js";
 
 const requests = [];
 const server = createServer(async (req, res) => {
@@ -78,7 +78,53 @@ try {
   assert.equal(requests.at(-1).url, "/mem/sagitta");
   assert.equal(requests.at(-1).headers.authorization, "Bearer manager-write-token-smoke");
 
-  console.log("memory manager smoke: PASS (empty/fallback, manager URL, read/write Bearer routing, visible unconfigured error)");
+  // Access-only manager 配置必须直接供 task/memory client 使用；不回退到旧 fallback，
+  // 且行为与 auto-advance 的 Access-only 分支一致（只发成对 Access headers）。
+  managerState = {
+    workerApiUrl: workerUrl,
+    d1ReadToken: "",
+    d1WriteToken: "",
+    accessClientId: "access-id-smoke",
+    accessClientSecret: "access-secret-smoke",
+  };
+  assert.equal(fallbackClient.getRuntimeConfig("read").source, "manager");
+  assert.equal(fallbackClient.getRuntimeConfig("read").auth.accessPresent, true);
+  await fallbackClient.listTasks({ status: "open" });
+  assert.equal(requests.at(-1).headers.authorization, undefined);
+  assert.equal(requests.at(-1).headers["cf-access-client-id"], "access-id-smoke");
+  assert.equal(requests.at(-1).headers["cf-access-client-secret"], "access-secret-smoke");
+  await fallbackClient.createTask({ project: "smoke", title: "access-only write" });
+  assert.equal(requests.at(-1).headers.authorization, undefined);
+  assert.equal(requests.at(-1).headers["cf-access-client-id"], "access-id-smoke");
+  assert.equal(requests.at(-1).headers["cf-access-client-secret"], "access-secret-smoke");
+
+  // 同时存在两种凭据时，Bearer 优先级与 auto-advance 一致。
+  managerState = {
+    workerApiUrl: workerUrl,
+    d1ReadToken: "manager-read-token-smoke-2",
+    d1WriteToken: "manager-write-token-smoke-2",
+    accessClientId: "access-id-smoke-2",
+    accessClientSecret: "access-secret-smoke-2",
+  };
+  await fallbackClient.listTasks();
+  assert.equal(requests.at(-1).headers.authorization, "Bearer manager-read-token-smoke-2");
+  assert.equal(requests.at(-1).headers["cf-access-client-id"], undefined);
+  assert.equal(requests.at(-1).headers["cf-access-client-secret"], undefined);
+
+  // 线上非 loopback Worker 不允许 silent direct；loopback 仍保留本地 smoke 用法。
+  assert.equal(isLoopbackUrl(workerUrl), true);
+  assert.equal(isLoopbackUrl("https://worker.example.test"), false);
+  const directProductionClient = new SagittaMemoryClient(resolveConfig({
+    baseUrl: "https://worker.example.test",
+    authToken: "production-token-smoke",
+    proxy: "direct",
+  }));
+  await assert.rejects(
+    directProductionClient.listTasks(),
+    (error) => error instanceof Error && /配置错误.*非 loopback Worker.*direct.*fail closed/u.test(error.message)
+  );
+
+  console.log("memory manager smoke: PASS (fallback, Bearer/Access-only routing, Bearer precedence, loopback direct policy)");
 } finally {
   server.close();
 }

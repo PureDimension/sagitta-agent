@@ -47,7 +47,13 @@ function apply(ctx, config) {
       return {};
     }
   })() : {};
-  const managerConfigured = [managerConfig.workerApiUrl, managerConfig.d1ReadToken, managerConfig.d1WriteToken]
+  const managerConfigured = [
+    managerConfig.workerApiUrl,
+    managerConfig.d1ReadToken,
+    managerConfig.d1WriteToken,
+    managerConfig.accessClientId,
+    managerConfig.accessClientSecret,
+  ]
     .some((value) => typeof value === "string" && value.trim().length > 0);
   const source = managerConfigured
     ? "manager"
