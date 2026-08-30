@@ -140,20 +140,34 @@ class CodexWorkRegistry {
 }
 
 /**
- * 解析 codex 启动方式。Windows 下 codex 是 npm 全局 shim（codex.cmd），
- * spawn("codex") 会 ENOENT、spawn("codex.cmd") 会 EINVAL——直接用 node 跑
- * codex.js（npm 全局安装路径）。非 Windows 直接 spawn codexPath。
+ * 解析 codex 启动方式。Windows 下优先直接定位原生 codex.exe（vendor 目录），
+ * 跳过 codex.js 包装层：codex.js 内部再 spawn 二进制且 stdio: "inherit"，
+ * 会触发 Windows 为第二层控制台程序新建窗口（黑框弹窗）。直接 spawn
+ * codex.exe + windowsHide:true + stdio:"ignore" 则完全无窗口。
+ * 找不到原生二进制时回退老逻辑（node 跑 codex.js）；非 Windows 直接 spawn codexPath。
  */
 function resolveCodexLaunch(codexPath) {
   if (process.platform !== "win32") {
     return { command: codexPath, args: [] };
   }
-  const candidates = [
+  const winTriple = "x86_64-pc-windows-msvc";
+  const vendorExe = join("node_modules", "@openai", "codex-win32-x64", "vendor", winTriple, "bin", "codex.exe");
+  const exeCandidates = [
+    process.env.CODEX_EXE_PATH,
+    join(process.env.APPDATA ?? "", "npm", vendorExe),
+    join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", vendorExe),
+  ];
+  for (const candidate of exeCandidates) {
+    if (candidate && existsSync(candidate)) {
+      return { command: candidate, args: [] };
+    }
+  }
+  const jsCandidates = [
     process.env.CODEX_JS_PATH,
     join(process.env.APPDATA ?? "", "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
     join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
   ];
-  for (const candidate of candidates) {
+  for (const candidate of jsCandidates) {
     if (candidate && existsSync(candidate)) {
       return { command: process.execPath, args: [candidate] };
     }
@@ -167,7 +181,7 @@ function runCodex({ codexPath, args, pidRef, cwd }) {
   const child = spawn(command, [...prefix, ...args], {
     detached: true,          // 与 DSH 生命周期解耦（DSH 重启不杀 codex）
     stdio: "ignore",
-    windowsHide: true,
+    windowsHide: true,       // 必须：Windows 下不弹控制台黑框
     ...(cwd ? { cwd } : {}),
   });
   // spawn 失败（如 ENOENT）时 pid 为 undefined——同步判定"未真正启动"，避免假 running 状态
