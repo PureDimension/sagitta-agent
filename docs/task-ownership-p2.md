@@ -25,12 +25,13 @@
 ## 3. 数据模型（tasks 表新增）
 
 ```sql
-owner_agent_id  TEXT NULL,   -- 认领者 agent id（不对外暴露明文；仅服务端使用）
-claimed_at      TEXT NULL,   -- 认领时间（ISO8601 UTC）
-claim_token     TEXT NULL,   -- 认领凭证（不透明 token，持有者=认领者；对模型可见但不可猜）
+owner_agent_id  TEXT NULL,     -- 认领者 agent id（不对外暴露明文；仅服务端使用）
+claimed_at      TEXT NULL,     -- 认领时间（ISO8601 UTC）
+claim_token     TEXT NULL,     -- 认领凭证（不透明 token，持有者=认领者；只在 claim 响应下发一次）
+lease_seconds   INTEGER NULL,  -- 认领租约秒数（1~604800；claim body 逐认领持久化，null=全局默认 24h）
 ```
 
-租约时长：`lease_seconds` 默认 24h（可配置；进程退出后 24h 内任务不回收，超时自动释放）。
+租约时长：`lease_seconds` 逐认领持久化（claim body 可传，1~604800 秒，非法 422）；未传存 NULL = 全局默认 24h。进程退出后租约自然过期（惰性判定，无定时清理）。
 
 ## 4. API 契约
 

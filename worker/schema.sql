@@ -89,6 +89,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   archived      INTEGER NOT NULL DEFAULT 0,      -- 1=归档（软删，recall 默认排除同 memory 契约）
   blocked_reason TEXT DEFAULT NULL,               -- blocked/pending_blocked 的外部阻塞原因
   pending_status TEXT DEFAULT NULL,              -- pending_done | pending_blocked；终态申请载体
+  -- task-ownership-p2 §3：任务认领制四列（可空；owner 对模型无感知，永不下发明文）
+  owner_agent_id TEXT DEFAULT NULL,              -- 认领者 agent id（仅服务端使用；调用方标识如 X-Agent-Id，缺省 'unknown'）
+  claimed_at     TEXT DEFAULT NULL,              -- 认领时间（ISO8601 UTC；租约起点 = claimed_at + lease_seconds）
+  claim_token    TEXT DEFAULT NULL,              -- 认领凭证（不透明 token；只在 claim 成功响应下发一次，列表/详情不下发）
+  lease_seconds  INTEGER DEFAULT NULL,           -- 认领租约秒数（1~604800；claim body 逐认领持久化，null=全局默认 24h）
   CHECK (pending_status IS NULL OR pending_status IN ('pending_done', 'pending_blocked'))
 );
 

@@ -28,6 +28,25 @@
 // 部署：Dashboard → Edit code 直接粘贴本文件（详见 worker/README.md）。
 //   D1 binding 名必须为 DB；/mem 使用 AUTH_TOKEN 兜底，task 可按读写使用
 //   D1_READ_TOKEN / D1_WRITE_TOKEN（均未配置时返回 503）。
+// v1.3 → v1.4 变更（task-ownership-p2 阶段 1：Worker 侧任务认领制，设计稿 commit 69944a8）：
+//   A. tasks 表新增 owner_agent_id/claimed_at/claim_token/lease_seconds 四列（可空；
+//      ensureColumns 的 PRAGMA+ALTER 幂等迁移，与 blocked_reason/pending_status 同机制）
+//   B. 认领 POST /task/{id}/claim：单条条件 UPDATE 原子认领（status='open' 或
+//      in_progress 且 owner 过期/为空）→ 置 in_progress + owner + claimed_at + claim_token +
+//      lease_seconds（body 可选 1~604800 秒，逐认领持久化，未传 NULL=全局默认 24h）；
+//      owner_agent_id 永不下发（owner 对模型无感知）；claim_token 只在认领成功响应
+//      下发一次（列表/详情剥离，防泄露）；过期判定在 SQL 侧按行内租约
+//      COALESCE(lease_seconds, 86400) 用 strftime（与 toISOString 同格式）计算
+//   C. 释放 POST /task/{id}/release：校验 claim_token 匹配后清空 owner/claimed_at/
+//      claim_token/lease_seconds，in_progress 且无 pending 时 status 回 open；token 不匹配 403
+//   D. 惰性回收：读取/PATCH/claim 时按行内租约（null 用全局默认 24h，
+//      TASK_DEFAULT_LEASE_SECONDS）判定过期=未认领（查询投影 claim_state=unclaimed；
+//      认领接管条件覆盖过期场景）；不做定时清理——进程退出后租约自然过期，新对话可接管
+//   E. 终态自动释放：confirm accept（done/blocked）与 PATCH 到 waiting/open 清除 owner
+//      （含 lease_seconds）；round-close 与 PATCH 终态申请（pending）不影响 owner
+//      （认领持续到终态或释放）
+//   F. PATCH status=in_progress 防绕过认领：他人认领（租约内）时 409 TASK_ALREADY_CLAIMED；
+//      owner 本人（X-Agent-Id 匹配）或未认领任务允许直接置 in_progress
 // 格式说明：本文件使用 **ES Module 格式**（export default { fetch(request, env) }），
 //   这是硬要求：Cloudflare 的 D1 binding 只支持 ES Module 格式，经典 Service Worker
 //   格式（addEventListener('fetch')）会报 `Binding 'DB' of type 'd1' requires a Worker
@@ -39,7 +58,7 @@
 
 'use strict';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 
 // ---- 枚举常量（服务端强制；管理字段由服务端填写，AI 无权编造） -------------
 
@@ -928,6 +947,8 @@ const TASK_SCHEMA_COLUMNS = [
   ['priority', 'INTEGER'], ['checkbox', 'INTEGER'], ['stream', 'TEXT'], ['body', 'TEXT'],
   ['created_at', 'TEXT'], ['updated_at', 'TEXT'], ['done_at', 'TEXT'], ['archived', 'INTEGER'],
   ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'],
+  // task-ownership-p2 §3：认领制四列（可空；惰性回收，无需定时清理）
+  ['owner_agent_id', 'TEXT'], ['claimed_at', 'TEXT'], ['claim_token', 'TEXT'], ['lease_seconds', 'INTEGER'],
 ];
 const TASK_EVENT_SCHEMA_COLUMNS = [
   ['event_id', 'TEXT'], ['task_id', 'TEXT'], ['agent_id', 'TEXT'], ['event_type', 'TEXT'],
@@ -942,6 +963,15 @@ const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'b
 const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
 const TASK_ROUND_ACTIONS = ['update', 'done', 'blocked'];
 const MAX_TASK_EVENT_TEXT = 1000;
+// task-ownership-p2 §3/§4：认领租约与调用方标识。
+//   · 租约默认 24h（进程退出后自然过期回收，新对话可接管）；claim body 的
+//     lease_seconds（1~604800 秒）逐认领持久化到 tasks.lease_seconds（第 4 列），
+//     null = 用全局默认 TASK_DEFAULT_LEASE_SECONDS；读取/接管按行内租约判定过期。
+//   · 调用方标识头可配置：env.TASK_AGENT_ID_HEADER（缺省 X-Agent-Id）；该标识只存
+//     服务端（owner_agent_id），永不下发。
+const TASK_DEFAULT_LEASE_SECONDS = 24 * 3600; // 默认租约 24h
+const TASK_MAX_LEASE_SECONDS = 168 * 3600;    // 租约上限 168h（7 天）
+const TASK_DEFAULT_AGENT_ID_HEADER = 'X-Agent-Id';
 const tasksSchemaReady = new WeakMap();
 
 const TASKS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS tasks (
@@ -959,6 +989,10 @@ const TASKS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   archived      INTEGER NOT NULL DEFAULT 0,
   blocked_reason TEXT DEFAULT NULL,
   pending_status TEXT DEFAULT NULL,
+  owner_agent_id TEXT DEFAULT NULL,
+  claimed_at     TEXT DEFAULT NULL,
+  claim_token    TEXT DEFAULT NULL,
+  lease_seconds  INTEGER DEFAULT NULL,
   CHECK (pending_status IS NULL OR pending_status IN ('pending_done', 'pending_blocked'))
 )`;
 
@@ -1034,6 +1068,10 @@ function isTaskBody(body) {
   return body !== null && typeof body === 'object' && !Array.isArray(body);
 }
 
+// task-ownership-p2 §4.3：任务读取投影。
+//   · owner_agent_id：永不下发（设计 §1：owner 对模型无感知——本地阅读任务时看不到 owner 明文）
+//   · claim_state：'unclaimed' | 'claimed'（惰性判定租约过期=未认领；设计 §4.3/§4.4）
+//   · claim_token：默认不下发（防泄露）；仅在 claim 成功响应经 extra.claim_token 注入一次
 function serializeTask(row, extra = {}) {
   if (!row) return null;
   const result = Object.assign({}, row, {
@@ -1045,7 +1083,34 @@ function serializeTask(row, extra = {}) {
     // legacy 兼容：旧 schema 的 done_at 默认是空字符串 ''，新不变量要求 null。
     done_at: isNonEmptyString(row.done_at) ? row.done_at : null,
   }, extra);
+  result.claim_state = taskClaimState(row);
+  delete result.owner_agent_id;
+  if (extra.claim_token === undefined) delete result.claim_token;
   return result;
+}
+
+// 认领状态派生（设计 §4.3/§4.4）：owner 非空且租约未过期 → 'claimed'；否则 'unclaimed'。
+// 惰性回收：claimed_at + 行内 lease_seconds（null 用全局默认 24h）过期即视为未认领
+// （不依赖定时清理；进程退出后无人续租，租约自然过期，新对话可接管）。
+function taskClaimState(row, now = Date.now()) {
+  if (!row || !isNonEmptyString(row.owner_agent_id)) return 'unclaimed';
+  if (!isNonEmptyString(row.claimed_at)) return 'unclaimed';
+  const claimedAt = Date.parse(row.claimed_at);
+  if (!Number.isFinite(claimedAt)) return 'unclaimed';
+  const leaseSeconds = Number.isInteger(row.lease_seconds) && row.lease_seconds > 0
+    ? row.lease_seconds
+    : TASK_DEFAULT_LEASE_SECONDS;
+  return now - claimedAt > leaseSeconds * 1000 ? 'unclaimed' : 'claimed';
+}
+
+// 调用方标识（设计 §4.1）：从请求头取（env.TASK_AGENT_ID_HEADER 可配置，缺省 X-Agent-Id）；
+// 缺省 'unknown'。该标识只存服务端（owner_agent_id），永不下发。
+function callerAgentId(request, env) {
+  const headerName = (env && typeof env.TASK_AGENT_ID_HEADER === 'string' && env.TASK_AGENT_ID_HEADER)
+    ? env.TASK_AGENT_ID_HEADER
+    : TASK_DEFAULT_AGENT_ID_HEADER;
+  const value = request ? request.headers.get(headerName) : null;
+  return isNonEmptyString(value) ? value.trim() : 'unknown';
 }
 
 function taskId() {
@@ -1330,7 +1395,7 @@ async function createTaskHandler(db, body) {
 }
 
 // PATCH /task/{id} —— 业务字段更新；终态只能生成 pending 申请。
-async function patchTaskHandler(db, id, body) {
+async function patchTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
   const has = (field) => Object.prototype.hasOwnProperty.call(body, field);
   const forbidden = Object.keys(body).filter((field) => !TASK_PATCH_FIELDS.includes(field) && field !== 'expected_updated_at');
@@ -1369,6 +1434,17 @@ async function patchTaskHandler(db, id, body) {
     if (row.status === 'done' || row.status === 'blocked') {
       return jsonError(409, 'TASK_TERMINAL_IMMUTABLE', '终态任务只能通过既有 pending 的 confirm 流程变更', { task: serializeTask(row) });
     }
+  }
+
+  // task-ownership-p2 §7：PATCH status=in_progress 防绕过认领——任务已被他人认领
+  // （租约未过期）时 409；owner 本人（X-Agent-Id 匹配 owner_agent_id）或未认领任务
+  // 允许直接置 in_progress（本阶段不自动认领，见 memory 阶段）。
+  if (has('status') && body.status === 'in_progress' && row.pending_status === null
+      && taskClaimState(row) === 'claimed'
+      && callerAgentId(request, env) !== row.owner_agent_id) {
+    return jsonError(409, 'TASK_ALREADY_CLAIMED',
+      '任务已被其他调用方认领（租约未过期），不能绕过认领直接置 in_progress；请使用 POST /task/{id}/claim 接管或等待租约过期',
+      { task: serializeTask(row) });
   }
 
   let blockedReason = row.blocked_reason === undefined ? null : row.blocked_reason;
@@ -1426,6 +1502,12 @@ async function patchTaskHandler(db, id, body) {
       sets.push('body = ?');
       params.push(body.body);
     }
+  }
+
+  // task-ownership-p2 §6/§7：PATCH 到 waiting/open 释放 owner（waiting/blocked 不占用，设计 §7）。
+  // 仅非终态路径落地；终态（pending 申请）保留 owner——认领持续到 confirm accept 或显式释放。
+  if (has('status') && !statusIsTerminal && (nextStatus === 'waiting' || nextStatus === 'open')) {
+    sets.push('owner_agent_id = NULL', 'claimed_at = NULL', 'claim_token = NULL', 'lease_seconds = NULL');
   }
 
   const now = nowIso();
@@ -1491,6 +1573,81 @@ async function patchTaskHandler(db, id, body) {
   return await taskResponse(db, id);
 }
 
+// POST /task/{id}/claim —— 原子认领（task-ownership-p2 §4.1）
+// 条件（单条条件 UPDATE，不可先读后写——先读后写会在并发下重复认领）：
+//   status='open'，或（status='in_progress' 且 owner 过期/为空）→
+//   置 in_progress + owner_agent_id=调用方标识 + claimed_at=now + claim_token=随机 +
+//   lease_seconds（body 可选 1~604800 秒，逐认领持久化；未传存 NULL = 全局默认 24h）。
+// 响应：完整任务投影 + claim_token（唯一一次下发）；owner_agent_id 永不下发。
+// 失败：被占用未过期 → 409 TASK_ALREADY_CLAIMED；pending 任务 → 409 TASK_PENDING_CONFLICT。
+async function claimTaskHandler(db, id, body, request, env) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  let leaseSeconds = null; // 未传 → 行内 NULL，读取/接管按全局默认 TASK_DEFAULT_LEASE_SECONDS（24h）判定
+  if (body.lease_seconds !== undefined && body.lease_seconds !== null) {
+    if (!Number.isInteger(body.lease_seconds) || body.lease_seconds < 1 || body.lease_seconds > TASK_MAX_LEASE_SECONDS) {
+      return jsonError(422, 'INVALID_LEASE_SECONDS',
+        'lease_seconds 必须是 1~' + TASK_MAX_LEASE_SECONDS + ' 之间的整数秒（默认 ' + TASK_DEFAULT_LEASE_SECONDS + '）');
+    }
+    leaseSeconds = body.lease_seconds;
+  }
+  const agentId = callerAgentId(request, env);
+  const now = nowIso();
+  const token = 'clm-' + crypto.randomUUID();
+  // 过期判定在 SQL 侧按行内租约（COALESCE(lease_seconds, 全局默认)）计算：
+  // strftime('%Y-%m-%dT%H:%M:%fZ','now','-N seconds') 与 claimed_at（toISOString）
+  // 同格式（24 字符、毫秒、Z 结尾），字典序比较 = 时间比较。单条 UPDATE 内完成
+  // "租约内被占用 → 不接管"的原子判定，无先读后写。
+  const update = await db.prepare(
+    'UPDATE tasks SET status = \'in_progress\', owner_agent_id = ?, claimed_at = ?, claim_token = ?, lease_seconds = ?, updated_at = ? ' +
+    'WHERE id = ? AND archived = 0 AND pending_status IS NULL AND (' +
+    "  status = 'open'" +
+    "  OR (status = 'in_progress' AND (owner_agent_id IS NULL OR claimed_at IS NULL" +
+    "    OR claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(lease_seconds, ?) || ' seconds')))" +
+    ')'
+  ).bind(agentId, now, token, leaseSeconds, now, id, TASK_DEFAULT_LEASE_SECONDS).run();
+  if (Number(update.meta.changes) === 0) {
+    const row = await getTaskRow(db, id);
+    if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+    if (row.pending_status !== null) {
+      return taskPendingConflict('pending 任务不可认领（已有终态申请在途，请先 confirm 或 reopen）', row);
+    }
+    return jsonError(409, 'TASK_ALREADY_CLAIMED',
+      '任务当前不可认领：已被其他调用方认领（租约未过期）或状态不允许（status=' + row.status + '）',
+      { task: serializeTask(row) });
+  }
+  return await taskResponse(db, id, { claim_token: token });
+}
+
+// POST /task/{id}/release —— 释放认领（task-ownership-p2 §4.2）
+// 仅持有正确 claim_token 的调用方可释放：owner/claimed_at/claim_token/lease_seconds 清空；
+// 若任务仍是 in_progress 且无 pending → status 回 open（终态/waiting 已自动释放 owner）。
+// token 不匹配 → 403 CLAIM_TOKEN_MISMATCH。
+async function releaseTaskHandler(db, id, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  if (!isNonEmptyString(body.claim_token)) {
+    return jsonError(422, 'CLAIM_TOKEN_REQUIRED', 'release 必须携带 claim_token（认领时的凭证）');
+  }
+  const token = body.claim_token.trim();
+  const row = await getTaskRow(db, id);
+  if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
+  if (row.claim_token === null || row.claim_token !== token) {
+    return jsonError(403, 'CLAIM_TOKEN_MISMATCH',
+      'claim_token 不匹配：该任务未被认领，或凭证不属于当前调用方（认领凭证只在 claim 响应下发一次）');
+  }
+  const now = nowIso();
+  const reopenOpen = (row.status === 'in_progress' && row.pending_status === null) ? ", status = 'open'" : '';
+  // 条件带 claim_token 防 TOCTOU：仅当凭证仍匹配时清除（并发释放/终态确认的竞态安全）
+  const update = await db.prepare(
+    'UPDATE tasks SET owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL' + reopenOpen + ', updated_at = ? ' +
+    'WHERE id = ? AND claim_token = ?'
+  ).bind(now, id, token).run();
+  if (Number(update.meta.changes) === 0) {
+    // 竞态：凭证已被清除（他方已释放/终态确认）——幂等返回当前状态（不含 claim_token）
+    return await taskResponse(db, id);
+  }
+  return await taskResponse(db, id);
+}
+
 // POST /task/{id}/confirm —— pending 的唯一确认入口；更新与审计事件同一 batch 原子提交。
 async function confirmTaskHandler(db, id, body) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
@@ -1548,8 +1705,13 @@ async function confirmTaskHandler(db, id, body) {
     result: { status: nextStatus, pending_status: null, updated_at: now },
   };
   const doneAtSql = nextStatus === 'done' ? ', done_at = ?' : '';
+  // task-ownership-p2 §6：confirm accept（done/blocked）终态自动释放 owner（含租约）；
+  // reopen 回到 in_progress 保留 owner（认领者继续推进）。
+  const clearOwnerSql = (nextStatus === 'done' || nextStatus === 'blocked')
+    ? ', owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL'
+    : '';
   const update = db.prepare(
-    'UPDATE tasks SET status = ?, pending_status = NULL, blocked_reason = ?' + doneAtSql + ', updated_at = ? ' +
+    'UPDATE tasks SET status = ?, pending_status = NULL, blocked_reason = ?' + doneAtSql + clearOwnerSql + ', updated_at = ? ' +
     'WHERE id = ? AND pending_status = ? AND updated_at = ? AND EXISTS (' +
       'SELECT 1 FROM task_events WHERE task_id = ? AND confirmation_id = ? AND pending_status = ?' +
     ')'
@@ -1754,7 +1916,7 @@ async function handleRequest(request, env) {
       } else if (segments.length === 2) {
         const id = decodeURIComponent(segments[1]);
         if (method === 'GET') return await getTaskHandler(db, id);
-        if (method === 'PATCH') return await patchTaskHandler(db, id, await readJson(request));
+        if (method === 'PATCH') return await patchTaskHandler(db, id, await readJson(request), request, env);
         if (method === 'DELETE') return await deleteTaskHandler(db, id);
       } else if (segments.length === 3) {
         const id = decodeURIComponent(segments[1]);
@@ -1763,6 +1925,12 @@ async function handleRequest(request, env) {
         }
         if (method === 'POST' && segments[2] === 'round-close') {
           return await roundCloseTaskHandler(db, id, await readJson(request));
+        }
+        if (method === 'POST' && segments[2] === 'claim') {
+          return await claimTaskHandler(db, id, await readJson(request), request, env);
+        }
+        if (method === 'POST' && segments[2] === 'release') {
+          return await releaseTaskHandler(db, id, await readJson(request));
         }
       }
       return jsonError(405, 'METHOD_NOT_ALLOWED', '路径 ' + path + ' 不支持 ' + method);
