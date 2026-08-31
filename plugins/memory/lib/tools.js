@@ -24,7 +24,7 @@ import {
   ORIGINS,
   CONSOLIDATE_ACTIONS,
 } from "./config.js";
-import { pickTask, taskContractError, validateRoundText, validateTaskUpdate } from "./task-contract.js";
+import { pickTask, taskContractError, validateRoundText, validateTaskUpdate, validateClaimLease } from "./task-contract.js";
 
 const CONTENT_EXCERPT_MAX = 1200;
 
@@ -747,6 +747,9 @@ export function registerMemoryTools(ctx, client) {
   // 状态机：open | in_progress | blocked | waiting | done；priority 0普通/1高/2紧急；
   // checkbox=1 表示"涟漪待处理"项（auto-advance 悬浮窗"待处理需求"区读 GET /task?checkbox=1&status=open）。
   // archived=1 为软删（列表/搜索默认排除）；done/blocked 通过 pending + confirm 才成为终态。
+  // 认领制（task-ownership-p2 §6）：task_list 投影 claim_state（unclaimed|claimed，"mine" 由模型按
+  // 已持有 claim_token 本地判断）；task_claim 认领（成功唯一一次下发 claim_token，模型持有）；
+  // task_release 释放（需 task_id+claim_token）；owner_agent_id/claim_token 不进 TASK_FIELDS 投影。
 
   const nullableString = () => ({ oneOf: [{ type: "string" }, { type: "null" }] });
   const nullablePendingStatus = () => ({
@@ -773,6 +776,10 @@ export function registerMemoryTools(ctx, client) {
     confirmation_id: nullableString(),
     idempotent: { type: "boolean" },
     archived: { type: "integer", required: true },
+    // task-ownership-p2 §6：认领状态（unclaimed=未认领可认领；claimed=他人认领中、租约内）。
+    // "mine" 由调用方按已持有 claim_token 本地判断，Worker 不下发、工具不声明；
+    // owner_agent_id / claim_token 刻意不进投影（owner 对模型无感知；token 只在 claim 响应下发一次）。
+    claim_state: { type: "string", enum: ["unclaimed", "claimed"] },
   };
   const TASK_STATUSES = ["open", "in_progress", "blocked", "waiting", "done"];
   const TASK_CREATE_STATUSES = ["open", "in_progress", "waiting"];
@@ -784,7 +791,10 @@ export function registerMemoryTools(ctx, client) {
       "任务列表（云端 D1 tasks 表，docs/task-api-p1.md）：按 project/stream/status/checkbox 过滤；" +
       "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/updated_at/done_at；" +
       "done/blocked 只有 pending_done/pending_blocked 申请并经 task_confirm accept 后才是终态，pending 时带 confirmation_id；" +
-      "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。",
+      "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。\n" +
+      "每条任务带 claim_state（task-ownership-p2）：unclaimed=未认领（可认领）；claimed=他人认领中（租约内），" +
+      "未认领才可认领。若你持有某任务的 claim_token（task_claim 成功响应唯一一次下发），该任务即视为你自己认领的（mine），" +
+      "可继续推进或 task_release 释放；token 不在此列表中出现，请勿向任何日志/记忆写入 token。",
     parameters: {
       project: { type: "string", description: "项目过滤（如 research/lmy-diffusion-accel、sagitta-agent）。" },
       stream: { type: "string", enum: TASK_STREAMS, description: "流过滤：personal-projects | company-projects | sagitta | ripple | company。" },
@@ -809,7 +819,8 @@ export function registerMemoryTools(ctx, client) {
           const cb = t.checkbox === 1 ? "☐" : "·";
           const st = t.status === "done" ? "✅" : t.status === "blocked" ? "🚩" : t.status === "in_progress" ? "🔄" : t.status === "waiting" ? "⏳" : "□";
           const pending = t.pending_status ? ` · ${t.pending_status}待确认` : "";
-          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}${pending}）`;
+          const claim = t.claim_state === "claimed" ? " · 🔒他人认领中" : "";
+          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}${pending}${claim}）`;
         });
         return [{ type: "text", text: head + lines.join("\n") }];
       },
@@ -881,7 +892,9 @@ export function registerMemoryTools(ctx, client) {
       "更新任务（PATCH /task/{id}）：参数白名单仅为 status/priority/body/title/checkbox/blocked_reason，" +
       "可带 expected_updated_at；不得传 done_at、pending_status 或 confirm。" +
       "status=done/blocked 只是申请 pending_done/pending_blocked，返回 confirmation_id 与 updated_at，" +
-      "必须再用 task_confirm accept 才进入终态；status=blocked 时 blocked_reason 必填。task_id 可从 task_list 获取。",
+      "必须再用 task_confirm accept 才进入终态；status=blocked 时 blocked_reason 必填。task_id 可从 task_list 获取。\n" +
+      "认领制（task-ownership-p2）：任务被他人认领（claim_state=claimed，租约内）时，PATCH status=in_progress " +
+      "会被服务端 409 TASK_ALREADY_CLAIMED 拒绝——需先 task_claim 认领（或等待租约过期后再更新）。",
     parameters: {
       task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
       title: { type: "string" },
@@ -933,6 +946,108 @@ export function registerMemoryTools(ctx, client) {
       return { ...task, message };
     },
     presentCall: (args) => presentCall("task_update", args, `id=${args.task_id} status=${args.status || ""}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_claim",
+    description:
+      "原子认领任务（task-ownership-p2 §4.1；POST /task/{id}/claim）：仅当任务未认领（claim_state=unclaimed，" +
+      "即 status='open'，或 in_progress 且租约已过期/无 owner）时成功；认领后任务置 in_progress 并进入你的租约，" +
+      "他人不可再认领/绕过直接推进。成功响应**唯一一次**下发 claim_token（模型获得 token 的唯一途径）——" +
+      "请在本会话内存中保管，后续 task_release 释放需要它；token 绝不出现在任何列表/日志/记忆条目。\n" +
+      "失败原样透出：409 TASK_ALREADY_CLAIMED（他人认领中/状态不允许）、409 TASK_PENDING_CONFLICT（已有终态申请在途）、" +
+      "422 INVALID_LEASE_SECONDS（lease_seconds 非法）。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
+      lease_seconds: { type: "integer", description: "认领租约秒数（1~604800；缺省=全局默认 24h）。租约过期自动释放，进程退出即自然回收。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ...TASK_FIELDS,
+          // claim_token 只在 claim 响应出现一次：不在 TASK_FIELDS（列表/详情投影），
+          // 由本工具从原始响应显式取出并随返回值下发（模型持有）。
+          claim_token: { type: "string", required: true },
+          message: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text:
+          `## 任务已认领\n\n**${value.title}**（${value.id} · ${value.project} · status=${value.status}）\n` +
+          `- claim_state=${value.claim_state ?? "claimed"}（租约内，他人不可认领）\n` +
+          `- ⚠ 已向你下发 claim_token（不在列表/日志/记忆回显）；本会话内保管，task_release 释放时需要它`,
+      }],
+      presentationMeta: (_args, value) => ({ id: value.id, status: value.status, claim_state: value.claim_state ?? "claimed" }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      // 本地先拦明显非法的租约（省一次往返；服务端仍把关，错误码一致）
+      const leaseSeconds = validateClaimLease(args.lease_seconds);
+      const claimed = await client.claimTask(args.task_id, { leaseSeconds }, exec.signal);
+      const task = pickTask(claimed);
+      const token = typeof claimed.claim_token === "string" && claimed.claim_token.length > 0 ? claimed.claim_token : null;
+      if (!token) {
+        throw new Error(
+          `task_claim：认领成功但响应缺少 claim_token（任务 ${task.id} 已置 in_progress）——` +
+          `请重试 task_claim，或直接用 task_update 推进并依赖服务端租约判定。`
+        );
+      }
+      return {
+        ...task,
+        claim_token: token,
+        message: `已认领任务 ${task.id}（claim_state=${task.claim_state ?? "claimed"}）；claim_token 仅本次返回，请在本会话内存中保管（task_release 释放需要它）。`,
+      };
+    },
+    presentCall: (args) => presentCall("claim", args, `id=${args.task_id} lease=${args.lease_seconds ?? "default"}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_release",
+    description:
+      "释放任务认领（task-ownership-p2 §4.2；POST /task/{id}/release）：仅持有正确 claim_token 的调用方可释放。" +
+      "成功：清空认领（claim_state=unclaimed），in_progress 且无 pending 时 status 回 open。\n" +
+      "失败原样透出：403 CLAIM_TOKEN_MISMATCH（token 不匹配/该任务未被你认领——认领凭证只在 claim 响应下发一次，" +
+      "丢失则失去对该任务的继续操作权，可等租约过期后重新认领）、422 CLAIM_TOKEN_REQUIRED（token 缺失）、" +
+      "404 TASK_NOT_FOUND。token 属敏感凭证：只传 task_id+claim_token，绝不写入日志/记忆/任何持久化。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
+      claim_token: { type: "string", required: true, description: "认领时唯一一次下发的凭证（task_claim 成功响应返回，只存本会话内存）。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { ...TASK_FIELDS, message: { type: "string", required: true } },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text:
+          `## 认领已释放\n\n**${value.title}**（${value.id} · ${value.project} · status=${value.status}）\n` +
+          `- claim_state=${value.claim_state ?? "unclaimed"}（未认领，可被重新认领）`,
+      }],
+      presentationMeta: (_args, value) => ({ id: value.id, status: value.status, claim_state: value.claim_state ?? "unclaimed" }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const released = await client.releaseTask(args.task_id, args.claim_token, exec.signal);
+      const task = pickTask(released);
+      return {
+        ...task,
+        message: `已释放任务 ${task.id} 的认领（claim_state=${task.claim_state ?? "unclaimed"}${task.status === "open" ? "，任务已回到未认领" : `，status=${task.status}`}）。`,
+      };
+    },
+    // 自定义 presentCall：rawInput 刻意不含 claim_token（凭证不进任何输出/展示）
+    presentCall: (args) => ({
+      card: "generic",
+      title: `memory: task_release — id=${args.task_id}`,
+      kind: "memory",
+      rawInput: JSON.stringify({ task_id: args.task_id }),
+    }),
   }));
 
   ctx.tools.register(defineTool({
@@ -1115,7 +1230,7 @@ export function registerMemoryTools(ctx, client) {
         },
       },
       render: (_args, value) => [
-        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}${t.pending_status ? ` · ${t.pending_status}待确认` : ""}）`).join("\n") },
+        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}${t.pending_status ? ` · ${t.pending_status}待确认` : ""}${t.claim_state === "claimed" ? " · 🔒他人认领中" : ""}）`).join("\n") },
       ],
       presentationMeta: (_args, value) => ({ total: value.total }),
     },
@@ -1143,6 +1258,8 @@ export const MEMORY_PROMPT_GUIDANCE = `记忆工具（sagitta-memory）——设
 
 信任轨道（v1.3 分数驱动，防过拟合）：score 0~3 钳制；score≥1→digested、≥2→corroborated（ack 提交自动联动，无需手动升级）；validated 由验证事件承载（不是认可次数堆出来的）；score=3 固化档（"已固化，若不与当前场景冲突建议遵循"）；score=2 无提示；score 0~1 "尚未经过多次强化，不一定可信"。delegatee=ripple 仅涟漪实际输入背书时记录，AI 无权代填。密钥/明文永不写入任何记忆条目（L1 硬规则）。
 
-任务工具（task API v2）：task_update 的参数仅限 status/priority/body/title/checkbox/blocked_reason（可带 expected_updated_at），不得传 done_at/pending_status/confirm。done/blocked 只提交 pending_done/pending_blocked 申请并返回 confirmation_id，必须 task_confirm accept 才进入终态；blocked 必须有 blocked_reason。每轮用 task_round_close 写 progress/next，二者 trim 后各 1–1000 字符且不得有控制字符或换行；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。`;
+任务工具（task API v2）：task_update 的参数仅限 status/priority/body/title/checkbox/blocked_reason（可带 expected_updated_at），不得传 done_at/pending_status/confirm。done/blocked 只提交 pending_done/pending_blocked 申请并返回 confirmation_id，必须 task_confirm accept 才进入终态；blocked 必须有 blocked_reason。每轮用 task_round_close 写 progress/next，二者 trim 后各 1–1000 字符且不得有控制字符或换行；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。
+
+认领制（task-ownership-p2 §6）：任务带 claim_state——unclaimed=未认领（可 task_claim）；claimed=他人认领中（租约内），未认领才可认领。task_claim 成功是模型获得 claim_token 的唯一途径（唯一一次下发，不进列表/日志）；你持有某任务的 token 即视为自己认领的（mine），可继续推进或 task_release 释放；token 丢失=失去对该任务的继续操作权（可等租约过期重新认领）。task_release 需 task_id+claim_token，token 不匹配 403；他人认领中的任务 PATCH in_progress 会 409 拒绝——先 task_claim。claim_token 属敏感凭证，绝不写入任何日志/记忆/持久化。`;
 
 export { pickTask };

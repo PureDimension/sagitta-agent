@@ -29,6 +29,26 @@ export function validateTaskUpdate(args = {}) {
   }
 }
 
+// task-ownership-p2 §3/§4.1：认领租约秒数（与 Worker TASK_MAX_LEASE_SECONDS 对齐）
+export const TASK_LEASE_MAX = 604800;
+
+/**
+ * 校验认领租约秒数（task_claim 的 lease_seconds）。
+ * 未传/传 null → 返回 null（服务端存 NULL = 全局默认 24h）。
+ * 非法 → 抛 422 INVALID_LEASE_SECONDS（错误码与服务端一致）。
+ * @returns {number|null}
+ */
+export function validateClaimLease(value) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isInteger(value) || value < 1 || value > TASK_LEASE_MAX) {
+    throw taskContractError(
+      "INVALID_LEASE_SECONDS",
+      `lease_seconds 必须是 1~${TASK_LEASE_MAX} 之间的整数秒（缺省=全局默认 24h）`
+    );
+  }
+  return value;
+}
+
 export function pickTask(task) {
   if (!task) return null;
   const result = {
@@ -47,6 +67,10 @@ export function pickTask(task) {
     pending_status: task.pending_status ?? null,
     archived: Number(task.archived ?? 0),
   };
+  // task-ownership-p2 §6：claim_state 派生（unclaimed | claimed）投影进列表/详情；
+  // "mine" 由调用方按已持有 claim_token 本地判断（Worker 不下发 mine）。
+  // owner_agent_id / claim_token 永不投影（owner 对模型无感知；token 只在 claim 响应下发一次）。
+  if (task.claim_state !== undefined && task.claim_state !== null) result.claim_state = String(task.claim_state);
   if (task.task_id !== undefined && task.task_id !== null) result.task_id = String(task.task_id);
   if (task.confirmation_id !== undefined && task.confirmation_id !== null) result.confirmation_id = String(task.confirmation_id);
   if (task.idempotent !== undefined) result.idempotent = task.idempotent === true;
