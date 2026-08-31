@@ -75,12 +75,14 @@ function registerAsyncWorkTools(ctx, service) {
       desc: { type: "string", required: true, description: "工作的一行描述。" },
       timeoutMs: { type: "integer", required: true, description: `超时毫秒数（${MIN_TIMEOUT_MS}–${MAX_TIMEOUT_MS}）。` },
     },
-    output: { schema: WORK_SCHEMA },
-    render: (_args, value) => [{
-      type: "text",
-      text: `## 异步工作已登记\n\n- work_id：${value.work_id}\n- task_id：${value.task_id}\n- 状态：${value.status}\n- 超时：${value.timeout_ms}ms\n- 描述：${value.desc}`,
-    }],
-    presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+    output: {
+      schema: WORK_SCHEMA,
+      render: (_args, value) => [{
+        type: "text",
+        text: `## 异步工作已登记\n\n- work_id：${value.work_id}\n- task_id：${value.task_id}\n- 状态：${value.status}\n- 超时：${value.timeout_ms}ms\n- 描述：${value.desc}`,
+      }],
+      presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+    },
     async execute(args, exec) {
       return service.register({
         ownerId: ownerIdOf(exec),
@@ -108,16 +110,16 @@ function registerAsyncWorkTools(ctx, service) {
         additionalProperties: false,
         properties: { works: { type: "array", items: WORK_SCHEMA, required: true } },
       },
+      render: (_args, value) => [{
+        type: "text",
+        text: value.works.length === 0
+          ? "## 异步工作状态\n\n（没有 active 工作）"
+          : "## 异步工作状态\n\n" + value.works.map((work) =>
+            `- **${work.work_id}** [${work.status}] task=${work.task_id} ${work.desc}`
+          ).join("\n"),
+      }],
+      presentationMeta: (_args, value) => ({ count: value.works.length }),
     },
-    render: (_args, value) => [{
-      type: "text",
-      text: value.works.length === 0
-        ? "## 异步工作状态\n\n（没有 active 工作）"
-        : "## 异步工作状态\n\n" + value.works.map((work) =>
-          `- **${work.work_id}** [${work.status}] task=${work.task_id} ${work.desc}`
-        ).join("\n"),
-    }],
-    presentationMeta: (_args, value) => ({ count: value.works.length }),
     async execute(args, exec) {
       const ownerId = ownerIdOf(exec);
       if (args.work_id !== undefined) {
@@ -145,12 +147,14 @@ function registerAsyncWorkTools(ctx, service) {
         task_id: { type: "string", required: true, description: "必须与工作登记时的 task_id 完全一致。" },
         ...(operation.reason ? { reason: { type: "string", description: "失败原因（可选）。" } } : {}),
       },
-      output: { schema: WORK_SCHEMA },
-      render: (_args, value) => [{
-        type: "text",
-        text: `## 异步工作${operation.label}\n\n- work_id：${value.work_id}\n- task_id：${value.task_id}\n- 状态：${value.status}${value.reason ? `\n- 原因：${value.reason}` : ""}`,
-      }],
-      presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+      output: {
+        schema: WORK_SCHEMA,
+        render: (_args, value) => [{
+          type: "text",
+          text: `## 异步工作${operation.label}\n\n- work_id：${value.work_id}\n- task_id：${value.task_id}\n- 状态：${value.status}${value.reason ? `\n- 原因：${value.reason}` : ""}`,
+        }],
+        presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+      },
       async execute(args, exec) {
         const ownerId = ownerIdOf(exec);
         if (operation.reason) return service[operation.method](ownerId, args.work_id, args.reason, args.task_id);

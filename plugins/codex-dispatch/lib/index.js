@@ -306,12 +306,14 @@ function registerCodexTools(ctx, options) {
       timeoutMs: { type: "integer", description: "本工作超时（毫秒，1 秒至 24 小时）。" },
       cwd: { type: "string", description: "codex 工作目录（默认继承 DSH 进程 cwd）。" },
     },
-    output: { schema: CODEX_WORK_SCHEMA },
-    render: (_args, value) => [{
-      type: "text",
-      text: `## codex 已派发（${value.work_id}）\n\n- task_id：${value.task_id}\n- 模型：${value.model}\n- 状态：${value.status}\n- 任务：${value.task.slice(0, 120)}${value.task.length > 120 ? "…" : ""}\n\n可用 codex_status 查询。`,
-    }],
-    presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+    output: {
+      schema: CODEX_WORK_SCHEMA,
+      render: (_args, value) => [{
+        type: "text",
+        text: `## codex 已派发（${value.work_id}）\n\n- task_id：${value.task_id}\n- 模型：${value.model}\n- 状态：${value.status}\n- 任务：${value.task.slice(0, 120)}${value.task.length > 120 ? "…" : ""}\n\n可用 codex_status 查询。`,
+      }],
+      presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+    },
     timeoutMs: 30000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
@@ -422,14 +424,14 @@ function registerCodexTools(ctx, options) {
         additionalProperties: false,
         properties: { works: { type: "array", items: CODEX_WORK_SCHEMA, required: true } },
       },
+      render: (_args, value) => [{
+        type: "text",
+        text: value.works.length === 0
+          ? "## codex 工作状态\n\n（无匹配工作）"
+          : "## codex 工作状态\n\n" + value.works.map((work) => `- **${work.work_id}** [${work.status}] task=${work.task_id} ${work.task}`).join("\n"),
+      }],
+      presentationMeta: (_args, value) => ({ count: value.works.length }),
     },
-    render: (_args, value) => [{
-      type: "text",
-      text: value.works.length === 0
-        ? "## codex 工作状态\n\n（无匹配工作）"
-        : "## codex 工作状态\n\n" + value.works.map((work) => `- **${work.work_id}** [${work.status}] task=${work.task_id} ${work.task}`).join("\n"),
-    }],
-    presentationMeta: (_args, value) => ({ count: value.works.length }),
     timeoutMs: 15000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
