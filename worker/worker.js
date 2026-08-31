@@ -1042,6 +1042,8 @@ function serializeTask(row, extra = {}) {
     archived: Number(row.archived),
     blocked_reason: row.blocked_reason === undefined ? null : row.blocked_reason,
     pending_status: row.pending_status === undefined ? null : row.pending_status,
+    // legacy 兼容：旧 schema 的 done_at 默认是空字符串 ''，新不变量要求 null。
+    done_at: isNonEmptyString(row.done_at) ? row.done_at : null,
   }, extra);
   return result;
 }

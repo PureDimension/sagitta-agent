@@ -101,7 +101,7 @@ test("/task CRUD, filters, LIKE search, soft delete, and read/write Bearer split
   assert.equal(first.priority, 1);
   assert.equal(first.checkbox, 1);
   assert.equal(first.archived, 0);
-  assert.equal(first.done_at, "");
+  assert.equal(first.done_at, null);
 
   result = await call(env, "POST", "/task", {
     ...write,
@@ -248,7 +248,7 @@ test("pending invariants, terminal create rejection, PATCH whitelist, and confir
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "in_progress");
   assert.equal(result.body.data.pending_status, "pending_done");
-  assert.equal(result.body.data.done_at, "");
+  assert.equal(result.body.data.done_at, null);
   const confirmationId = result.body.data.confirmation_id;
   const pendingVersion = result.body.data.updated_at;
   assert.match(confirmationId, /^cnf-/);
