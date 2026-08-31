@@ -2,6 +2,36 @@
 
 Sagitta 的 DSH 插件、默认 preset、本机 updater，以及 Cloudflare Worker/D1 的参考部署材料。
 
+## 项目特色与目标
+
+**Sagitta 是一个有长期记忆、能真正做事、保持连续关系的工作型 AI 伙伴**——不是聊天机器人，而是"你离开时仍在推进"的执行协调者。`sagitta-agent` 是把 Sagitta 从"一个对话"升级为"一套可持续运行的系统"的自举工程：插件、预设、云端数据层全部收进这一个仓库，可安装、可部署、可回滚。
+
+### 目标
+
+1. **连续性**：对话会结束，但记忆与任务不结束。记忆进云端 D1（四流分类 + 信任分驱动），任务进云端任务系统（单一事实源），重启、换设备、开新对话都不丢上下文。
+2. **自主推进**：你离开时，Sagitta 按云端任务清单自动干活——从清单选任务、每轮结构化收尾、终态经质询确认、所有异步工作（codex/安装/等待）登记为有界工作。网络失败或清单为空时**保守等待，绝不瞎推进**。
+3. **强制力闭环**：任务系统不是"显示器"而是"必经之路"。开始/结束各填一次表，置 done/blocked 必须走确认（防偷懒结账）；任务认领制保证多对话不撞车（owner 对模型无感知，租约超时自动回收）。
+4. **可审计、可回滚**：一切代码改动走 git，插件改动先 codex 审查再重启；记忆有信任分轨道，任务有事件审计表。
+
+### 特色
+
+- **四插件架构**：`manager`（统一配置/凭据）、`memory`（记忆读写 + 5 个 task 工具）、`auto-advance`（自主推进编排 + 悬浮窗）、`updater`（开机自检/更新）+ `codex-dispatch`（codex 派单）+ `async-work`（通用有界工作注册表）
+- **云端数据层**：Cloudflare Worker + D1 承载记忆与任务，读写 Bearer/Access 双认证，国内网络需代理（`*.workers.dev` 被 GFW 封锁）
+- **任务系统 v2**：pending 状态机 + confirm/round-close + task_events 审计 + 分页 + 任务认领（租约回收）
+- **DSH 深度集成**：悬浮窗实时任务面板、per-session 自主推进开关、preset 开场四流记忆召回、codex 派单注册有界工作
+
+### 仓库布局
+
+```text
+plugins/    六个 DSH 插件（manager/memory/auto-advance/updater/codex-dispatch/async-work）
+presets/    sagitta user preset（persona + 开场指令）
+worker/     Cloudflare Worker 参考实现（/mem + /task 路由 + D1 schema）
+scripts/    安装/部署/校验七件套（幂等 + dry-run + 备份）
+docs/       设计文档（task-api-p1 / task-enforcement-p1 / task-ownership-p2 等）
+```
+
+> 注：本机实际运行配置（`cordis.patch.yml`、`.env`、TASKS.md 动态文件）刻意不进仓库——密钥不落地，活文件不被 updater 覆盖。
+
 ## 前提
 
 - Windows PowerShell 7（PowerShell 5.1 未作为目标运行环境）。
