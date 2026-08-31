@@ -16,6 +16,7 @@ const AUTONOMOUS_PROMPT = `当前用户处于离开模式。你只能依据本�
 - 本轮只能选择清单中的 task_id；清单外任务不属于本轮可推进范围。
 - 有新想法时先调用 task_create；创建后必须等待下一次完整云端快照，不能在本轮直接推进新任务。
 - 开始一个任务时先用 task_update(status=in_progress) 明确置为进行中；不要从自然语言猜测任务状态。
+- 认领说明：清单任务均为未认领（claim_state=unclaimed），可直接用 task_claim 认领后推进；他人认领中的任务不会出现在清单。
 
 每轮收尾（出向协议）：
 - 只要本轮选择了任务，必须调用一次 task_round_close；progress 和 next 必填，round_id 必须是本轮唯一值。

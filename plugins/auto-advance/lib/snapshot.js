@@ -161,7 +161,11 @@ export function splitCloudTaskSnapshotStrict(value) {
   const waiting = [];
   const terminal = [];
   for (const item of publicItems) {
-    if ((item.status === "open" || item.status === "in_progress") && item.pending_status === null) runnable.push(item);
+    // Stage 3 claim integration: a task claimed by another worker's lease is
+    // never runnable. claim_state is optional (older Worker omits it) and
+    // only "claimed" is excluded; unclaimed/missing stay runnable.
+    if ((item.status === "open" || item.status === "in_progress") && item.pending_status === null && item.claim_state !== "claimed") runnable.push(item);
+    else if ((item.status === "open" || item.status === "in_progress") && item.pending_status === null) continue; // claimed：他人租约内，不进任何推进集合
     else if (item.pending_status === "pending_done" || item.pending_status === "pending_blocked") confirmationQueue.push(item);
     else if (item.status === "waiting") waiting.push(item);
     else if (item.status === "blocked" || item.status === "done") terminal.push(item);

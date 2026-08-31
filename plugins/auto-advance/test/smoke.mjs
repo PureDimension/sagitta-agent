@@ -72,6 +72,23 @@ assert.throws(
   (error) => error.code === "task-api-unavailable"
 );
 
+// Stage 3 claim integration: claimed tasks never enter runnable but stay in
+// the full snapshot; unclaimed and missing claim_state (old Worker) stay
+// runnable; confirmation collection is unaffected by claim_state.
+const claimItems = [
+  task("tsk-claimed", "open", null, { claim_state: "claimed" }, 22),
+  task("tsk-unclaimed", "open", null, { claim_state: "unclaimed" }, 21),
+  task("tsk-legacy", "open", null, {}, 20),
+];
+const claimSplit = splitCloudTaskSnapshotStrict({ pages: [page(claimItems, 1, 3, 3)] });
+assert.deepEqual(claimSplit.runnable.map((item) => item.task_id), ["tsk-unclaimed", "tsk-legacy"]);
+assert.deepEqual(claimSplit.items.map((item) => item.task_id), ["tsk-claimed", "tsk-unclaimed", "tsk-legacy"]);
+assert.deepEqual(claimSplit.confirmationQueue, []);
+const claimedPendingSplit = splitCloudTaskSnapshotStrict({
+  pages: [page([task("tsk-claimed-pending", "in_progress", "pending_done", { claim_state: "claimed" }, 22)], 1, 1, 1)],
+});
+assert.deepEqual(claimedPendingSplit.confirmationQueue.map((item) => item.task_id), ["tsk-claimed-pending"]);
+
 // Auth and transport policy match memory: Bearer wins; Access-only sends both;
 // production direct is rejected while loopback direct is allowed.
 assert.deepEqual(buildTaskAuthHeaders({ d1ReadToken: "read", accessClientId: "id", accessClientSecret: "secret" }).Authorization, "Bearer read");
@@ -237,7 +254,7 @@ try {
   assert.match(stale.error, /task-api-unavailable/u);
   rmSync(directory, { recursive: true, force: true });
   assert.ok(received.length >= 5);
-  console.log("auto-advance smoke: PASS (strict split/pagination, runnable+confirmation+empty branches, cloud defer/backoff, generation race, stale UI fallback, auth/policy)");
+  console.log("auto-advance smoke: PASS (strict split/pagination + claim filter, runnable+confirmation+empty branches, cloud defer/backoff, generation race, stale UI fallback, auth/policy)");
 } finally {
   server.close();
 }
