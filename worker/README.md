@@ -40,6 +40,7 @@ node --check .\worker\worker.js
 - `claimed_at`：认领时间（ISO8601 UTC），租约起点
 - `claim_token`：认领凭证，**只在 claim 成功响应下发一次**（列表/详情剥离）
 - `lease_seconds`：认领租约秒数（1~604800，claim body 逐认领持久化；null = 全局默认 24h）
+- `claim_state`：读取投影为 `unclaimed` / `claimed` / `mine`；带 `X-Agent-Id` 且与有效租约 owner 匹配时仅该调用方看到 `mine`，owner 明文仍不下发
 
 ### 认领 POST /task/{id}/claim
 

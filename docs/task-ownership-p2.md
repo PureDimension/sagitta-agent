@@ -64,8 +64,9 @@ POST /task/{id}/release   body: { "claim_token": "..." }
 
 serializeTask 派生：
 - `claim_state`: `"unclaimed" | "claimed" | "mine"`
-  - mine：claim_token 匹配调用方当前持有（需要请求带 claim_token 或按 session 上下文判断）
-  - 简化：读取时不校验 token，返回 `claim_state: "unclaimed"|"claimed"`；"mine" 由 auto-advance 本地通过已持有 token 判断
+  - mine：请求带 `X-Agent-Id` 且与 owner_agent_id 匹配，并且行内租约未过期；仅调用方看到 mine
+  - claimed：行内租约未过期，但调用方未带匹配的 `X-Agent-Id`
+  - unclaimed：无 owner、租约已过期或租约字段非法
 - `owner_agent_id`：**永不下发**
 - `claim_token`：**只在 claim 响应中返回一次**；列表/详情读取不下发（防泄露）
 
@@ -77,8 +78,8 @@ serializeTask 派生：
 
 ## 5. auto-advance 集成
 
-- `splitCloudTaskSnapshotStrict`：runnable 过滤 `claim_state != "claimed"`（未认领的 open/in_progress 才进清单；"别人认领的 in_progress" 不进 runnable，可进"占用"展示区）
-- 自己认领的任务：auto-advance 本地保存 claim_token（内存 + statePath 持久化），对应任务继续推进
+- `splitCloudTaskSnapshotStrict`：runnable 过滤 `claim_state != "claimed"`（未认领或 mine 的 open/in_progress 才进清单；"别人认领的 in_progress" 不进 runnable，可进"占用"展示区）
+- 自己认领的任务：auto-advance 按 per-agent session 读取 `/task` 并携带 `X-Agent-Id=state.agent.id`；Worker 的 mine 投影与本地认领记录共同驱动对应任务继续推进
 - 认领动作：auto-advance 选择任务时调用 claim（或 task_update(status=in_progress) 自动 claim）
 - 进程退出：不主动释放（租约自动过期）——符合涟漪"最好写在 worker 里"的指示
 

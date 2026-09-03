@@ -36,7 +36,7 @@ window.__ModuleLoader__.load({
           namespace: "sagittaAutoAdvance",
           method: "getTasks",
           invocation: { kind: "direct" },
-          parameters: [],
+          parameters: [{ name: "agent", wire: "agentId", source: "lookup", lookup: "agent", codec: { mode: "strict", typeSymbol: "@deepseek-ai/dsh-session/types#SessionId", schema: stringSchema() } }],
           result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema() }
         },
         {
@@ -674,7 +674,7 @@ window.__ModuleLoader__.load({
           if (result?.ok === false) throw new Error(result.error?.message ?? "状态读取失败");
           lastState = result?.value ?? result;
           if (forceTasks || tasks === undefined) {
-            const taskResult = await remoteApi.getTasks();
+            const taskResult = await remoteApi.getTasks(sessionId);
             if (taskResult?.ok === false) throw new Error(taskResult.error?.message ?? "任务读取失败");
             tasks = taskResult?.value ?? taskResult;
           }

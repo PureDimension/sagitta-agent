@@ -41,6 +41,7 @@
 //      claim_token/lease_seconds，in_progress 且无 pending 时 status 回 open；token 不匹配 403
 //   D. 惰性回收：读取/PATCH/claim 时按行内租约（null 用全局默认 24h，
 //      TASK_DEFAULT_LEASE_SECONDS）判定过期=未认领（查询投影 claim_state=unclaimed；
+//      有效租约且请求 X-Agent-Id 匹配 owner 时投影为 mine；
 //      认领接管条件覆盖过期场景）；不做定时清理——进程退出后租约自然过期，新对话可接管
 //   E. 终态自动释放：confirm accept（done/blocked）与 PATCH 到 waiting/open 清除 owner
 //      （含 lease_seconds）；round-close 与 PATCH 终态申请（pending）不影响 owner
@@ -1101,9 +1102,10 @@ function isTaskBody(body) {
 
 // task-ownership-p2 §4.3：任务读取投影。
 //   · owner_agent_id：永不下发（设计 §1：owner 对模型无感知——本地阅读任务时看不到 owner 明文）
-//   · claim_state：'unclaimed' | 'claimed'（惰性判定租约过期=未认领；设计 §4.3/§4.4）
+//   · claim_state：'unclaimed' | 'claimed' | 'mine'（惰性判定租约过期=未认领；
+//     带 X-Agent-Id 且与 owner 匹配的调用方看到 mine；设计 §4.3/§4.4）
 //   · claim_token：默认不下发（防泄露）；仅在 claim 成功响应经 extra.claim_token 注入一次
-function serializeTask(row, extra = {}) {
+function serializeTask(row, extra = {}, callerAgentIdValue) {
   if (!row) return null;
   const openNeedHumanCount = Number(row.open_need_human_count || 0);
   const openNotifyCount = Number(row.open_notify_count || 0);
@@ -1120,16 +1122,17 @@ function serializeTask(row, extra = {}) {
     open_need_human_count: openNeedHumanCount,
     open_notify_count: openNotifyCount,
   }, extra);
-  result.claim_state = taskClaimState(row);
+  result.claim_state = taskClaimState(row, Date.now(), callerAgentIdValue);
   delete result.owner_agent_id;
   if (extra.claim_token === undefined) delete result.claim_token;
   return result;
 }
 
-// 认领状态派生（设计 §4.3/§4.4）：owner 非空且租约未过期 → 'claimed'；否则 'unclaimed'。
+// 认领状态派生（设计 §4.3/§4.4）：owner 非空且租约未过期 → 'claimed'；
+// 带 X-Agent-Id 且与 owner 匹配的调用方 → 'mine'；否则 'unclaimed'。
 // 惰性回收：claimed_at + 行内 lease_seconds（null 用全局默认 24h）过期即视为未认领
 // （不依赖定时清理；进程退出后无人续租，租约自然过期，新对话可接管）。
-function taskClaimState(row, now = Date.now()) {
+function taskClaimState(row, now = Date.now(), callerAgentIdValue) {
   if (!row || !isNonEmptyString(row.owner_agent_id)) return 'unclaimed';
   if (!isNonEmptyString(row.claimed_at)) return 'unclaimed';
   const claimedAt = Date.parse(row.claimed_at);
@@ -1137,17 +1140,24 @@ function taskClaimState(row, now = Date.now()) {
   const leaseSeconds = Number.isInteger(row.lease_seconds) && row.lease_seconds > 0
     ? row.lease_seconds
     : TASK_DEFAULT_LEASE_SECONDS;
-  return now - claimedAt > leaseSeconds * 1000 ? 'unclaimed' : 'claimed';
+  if (now - claimedAt > leaseSeconds * 1000) return 'unclaimed';
+  return callerAgentIdValue !== undefined && callerAgentIdValue === row.owner_agent_id ? 'mine' : 'claimed';
+}
+
+// 读取投影只在请求实际带有 X-Agent-Id 且匹配 owner 时显示 mine；不带头不使用
+// callerAgentId 的 unknown 兜底值，避免无头调用方意外获得 mine。
+function requestAgentId(request, env) {
+  const headerName = (env && typeof env.TASK_AGENT_ID_HEADER === 'string' && env.TASK_AGENT_ID_HEADER)
+    ? env.TASK_AGENT_ID_HEADER
+    : TASK_DEFAULT_AGENT_ID_HEADER;
+  const value = request ? request.headers.get(headerName) : null;
+  return isNonEmptyString(value) ? value.trim() : undefined;
 }
 
 // 调用方标识（设计 §4.1）：从请求头取（env.TASK_AGENT_ID_HEADER 可配置，缺省 X-Agent-Id）；
 // 缺省 'unknown'。该标识只存服务端（owner_agent_id），永不下发。
 function callerAgentId(request, env) {
-  const headerName = (env && typeof env.TASK_AGENT_ID_HEADER === 'string' && env.TASK_AGENT_ID_HEADER)
-    ? env.TASK_AGENT_ID_HEADER
-    : TASK_DEFAULT_AGENT_ID_HEADER;
-  const value = request ? request.headers.get(headerName) : null;
-  return isNonEmptyString(value) ? value.trim() : 'unknown';
+  return requestAgentId(request, env) ?? 'unknown';
 }
 
 function taskId() {
@@ -1210,27 +1220,27 @@ function taskBlockedReason(value) {
   return value.trim();
 }
 
-function taskStateError(row) {
+function taskStateError(row, callerAgentIdValue) {
   if (!row) return null;
   if (row.pending_status !== null && !TASK_PENDING_STATUSES.includes(row.pending_status)) {
-    return jsonError(409, 'TASK_STATE_INVALID', '任务 pending_status 不合法', { task: serializeTask(row) });
+    return jsonError(409, 'TASK_STATE_INVALID', '任务 pending_status 不合法', { task: serializeTask(row, {}, callerAgentIdValue) });
   }
   if (row.pending_status === 'pending_done' &&
       (row.status !== 'in_progress' || isNonEmptyString(row.done_at) || isNonEmptyString(row.blocked_reason))) {
-    return jsonError(409, 'TASK_STATE_INVALID', 'pending_done 任务不满足状态不变量', { task: serializeTask(row) });
+    return jsonError(409, 'TASK_STATE_INVALID', 'pending_done 任务不满足状态不变量', { task: serializeTask(row, {}, callerAgentIdValue) });
   }
   if (row.pending_status === 'pending_blocked' &&
       (row.status !== 'in_progress' || isNonEmptyString(row.done_at) || !isNonEmptyString(row.blocked_reason))) {
-    return jsonError(409, 'TASK_STATE_INVALID', 'pending_blocked 任务不满足状态不变量', { task: serializeTask(row) });
+    return jsonError(409, 'TASK_STATE_INVALID', 'pending_blocked 任务不满足状态不变量', { task: serializeTask(row, {}, callerAgentIdValue) });
   }
   if (row.status === 'in_progress' && isNonEmptyString(row.done_at)) {
-    return jsonError(409, 'TASK_STATE_INVALID', 'in_progress 任务不得已有 done_at', { task: serializeTask(row) });
+    return jsonError(409, 'TASK_STATE_INVALID', 'in_progress 任务不得已有 done_at', { task: serializeTask(row, {}, callerAgentIdValue) });
   }
   if (row.status === 'done' && (row.pending_status !== null || !isNonEmptyString(row.done_at))) {
-    return jsonError(409, 'TASK_STATE_INVALID', 'done 任务必须有 done_at 且不能 pending', { task: serializeTask(row) });
+    return jsonError(409, 'TASK_STATE_INVALID', 'done 任务必须有 done_at 且不能 pending', { task: serializeTask(row, {}, callerAgentIdValue) });
   }
   if (row.status === 'blocked' && (row.pending_status !== null || !isNonEmptyString(row.blocked_reason))) {
-    return jsonError(409, 'TASK_LEGACY_INVALID', '历史 blocked 任务缺少 blocked_reason，需先补数', { task: serializeTask(row) });
+    return jsonError(409, 'TASK_LEGACY_INVALID', '历史 blocked 任务缺少 blocked_reason，需先补数', { task: serializeTask(row, {}, callerAgentIdValue) });
   }
   return null;
 }
@@ -1296,17 +1306,17 @@ const TASK_SELECT_LIST = `SELECT t.*,
     WHERE n.task_id = t.id AND n.status = 'open' AND n.type = 'notify') AS open_notify_count
   FROM tasks t WHERE `;
 
-async function taskResponse(db, id, extra = {}) {
+async function taskResponse(db, id, extra = {}, callerAgentIdValue) {
   const row = await getTaskRow(db, id);
-  return jsonOk(serializeTask(row, { task_id: id, ...extra }));
+  return jsonOk(serializeTask(row, { task_id: id, ...extra }, callerAgentIdValue));
 }
 
-function taskConflict(message, row) {
-  return jsonError(409, 'TASK_VERSION_CONFLICT', message, row ? { task: serializeTask(row) } : {});
+function taskConflict(message, row, callerAgentIdValue) {
+  return jsonError(409, 'TASK_VERSION_CONFLICT', message, row ? { task: serializeTask(row, {}, callerAgentIdValue) } : {});
 }
 
-function taskPendingConflict(message, row) {
-  return jsonError(409, 'TASK_PENDING_CONFLICT', message, row ? { task: serializeTask(row) } : {});
+function taskPendingConflict(message, row, callerAgentIdValue) {
+  return jsonError(409, 'TASK_PENDING_CONFLICT', message, row ? { task: serializeTask(row, {}, callerAgentIdValue) } : {});
 }
 
 function needHumanId() {
@@ -1351,10 +1361,10 @@ async function hasOpenNeedHuman(db, taskIdValue) {
   return !!row;
 }
 
-function taskNeedHumanOpenError(row) {
+function taskNeedHumanOpenError(row, callerAgentIdValue) {
   return jsonError(409, 'TASK_NEED_HUMAN_OPEN',
     '存在 open need-human（type=need），可标 blocked 或先 resolve need-human 后再申请 done',
-    { task: serializeTask(row) });
+    { task: serializeTask(row, {}, callerAgentIdValue) });
 }
 
 // GET /need-human —— 跨任务汇聚；默认只返回待涟漪处理的 open 条目。
@@ -1466,6 +1476,7 @@ function eventPayloadMatches(event, expectedPayload) {
 // GET /task —— 列表，默认排除 archived 和 temp；kind=temp 可显式查看 temp。
 // include_temp=1 为自主推进/门禁读取自己当前认领的 temp 提供投影。
 async function listTasksHandler(db, url, request, env) {
+  const readAgentId = requestAgentId(request, env);
   const project = url.searchParams.get('project');
   const stream = url.searchParams.get('stream');
   const status = url.searchParams.get('status');
@@ -1523,7 +1534,7 @@ async function listTasksHandler(db, url, request, env) {
   const rows = await db.prepare(
     TASK_SELECT_LIST + whereSql + ' ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC LIMIT ? OFFSET ?'
   ).bind(...params, size, (page - 1) * size).all();
-  const items = (rows.results || []).map(serializeTask);
+  const items = (rows.results || []).map((row) => serializeTask(row, {}, readAgentId));
   return jsonOk({
     items,
     total,
@@ -1542,10 +1553,10 @@ async function listTasksHandler(db, url, request, env) {
 }
 
 // GET /task/{id} —— 单条；软归档任务可按 id 读取，列表/搜索默认不返回。
-async function getTaskHandler(db, id) {
+async function getTaskHandler(db, id, request, env) {
   const row = await getTaskRow(db, id);
   if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
-  return jsonOk(serializeTask(row));
+  return jsonOk(serializeTask(row, {}, requestAgentId(request, env)));
 }
 
 // POST /task —— 创建任务；管理字段由服务端填写。
@@ -1614,6 +1625,7 @@ async function createTaskHandler(db, body) {
 // PATCH /task/{id} —— 业务字段更新；终态只能生成 pending 申请。
 async function patchTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const readAgentId = requestAgentId(request, env);
   const has = (field) => Object.prototype.hasOwnProperty.call(body, field);
   const forbidden = Object.keys(body).filter((field) => !TASK_PATCH_FIELDS.includes(field) && field !== 'expected_updated_at');
   if (forbidden.length > 0) {
@@ -1628,7 +1640,7 @@ async function patchTaskHandler(db, id, body, request, env) {
   const expected = taskExpectedUpdatedAt(body.expected_updated_at, false);
   if (expected instanceof Response) return expected;
   if (has('status') && row.pending_status !== null) {
-    return taskPendingConflict('pending 任务不得通过 PATCH status 改变状态，请使用 confirm', row);
+    return taskPendingConflict('pending 任务不得通过 PATCH status 改变状态，请使用 confirm', row, readAgentId);
   }
 
   const nextStatus = has('status') ? body.status : row.status;
@@ -1639,7 +1651,7 @@ async function patchTaskHandler(db, id, body, request, env) {
     if (TASK_TERMINAL_STATUSES.includes(body.status)) {
       if (row.status !== 'in_progress' || row.pending_status !== null) {
         return jsonError(422, 'TASK_TERMINAL_REQUIRES_IN_PROGRESS',
-          '只有无 pending 的 in_progress 任务可以申请 done/blocked', { task: serializeTask(row) });
+          '只有无 pending 的 in_progress 任务可以申请 done/blocked', { task: serializeTask(row, {}, readAgentId) });
       }
       if (body.status === 'blocked' && !isNonEmptyString(body.blocked_reason)) {
         return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', '申请 blocked 必须提供非空 blocked_reason');
@@ -1649,7 +1661,7 @@ async function patchTaskHandler(db, id, body, request, env) {
       }
     }
     if (row.status === 'done' || row.status === 'blocked') {
-      return jsonError(409, 'TASK_TERMINAL_IMMUTABLE', '终态任务只能通过既有 pending 的 confirm 流程变更', { task: serializeTask(row) });
+      return jsonError(409, 'TASK_TERMINAL_IMMUTABLE', '终态任务只能通过既有 pending 的 confirm 流程变更', { task: serializeTask(row, {}, readAgentId) });
     }
   }
 
@@ -1661,7 +1673,7 @@ async function patchTaskHandler(db, id, body, request, env) {
       && callerAgentId(request, env) !== row.owner_agent_id) {
     return jsonError(409, 'TASK_ALREADY_CLAIMED',
       '任务已被其他调用方认领（租约未过期），不能绕过认领直接置 in_progress；请使用 POST /task/{id}/claim 接管或等待租约过期',
-      { task: serializeTask(row) });
+      { task: serializeTask(row, {}, readAgentId) });
   }
 
   let blockedReason = row.blocked_reason === undefined ? null : row.blocked_reason;
@@ -1737,10 +1749,10 @@ async function patchTaskHandler(db, id, body, request, env) {
   }
 
   if (statusIsTerminal) {
-    const stateError = taskStateError(row);
+    const stateError = taskStateError(row, readAgentId);
     if (stateError) return stateError;
     if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
-      return taskNeedHumanOpenError(row);
+      return taskNeedHumanOpenError(row, readAgentId);
     }
     const pendingStatus = nextStatus === 'done' ? 'pending_done' : 'pending_blocked';
     const confirmationId = 'cnf-' + crypto.randomUUID();
@@ -1779,11 +1791,11 @@ async function patchTaskHandler(db, id, body, request, env) {
     if (!savedEvent) {
       const current = await getTaskRow(db, id);
       if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
-        return taskNeedHumanOpenError(current);
+        return taskNeedHumanOpenError(current, readAgentId);
       }
-      return taskConflict('任务版本已变化，终态申请未提交', current);
+      return taskConflict('任务版本已变化，终态申请未提交', current, readAgentId);
     }
-    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false });
+    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false }, readAgentId);
   }
 
   sets.push('updated_at = ?');
@@ -1795,9 +1807,9 @@ async function patchTaskHandler(db, id, body, request, env) {
   }
   const updateResult = await db.prepare(updateSql).bind(...params).run();
   if (updateResult && updateResult.meta && Number(updateResult.meta.changes) === 0) {
-    return taskConflict('任务版本已变化，请重新读取后重试', await getTaskRow(db, id));
+    return taskConflict('任务版本已变化，请重新读取后重试', await getTaskRow(db, id), readAgentId);
   }
-  return await taskResponse(db, id);
+  return await taskResponse(db, id, {}, readAgentId);
 }
 
 // POST /task/{id}/claim —— 原子认领（task-ownership-p2 §4.1）
@@ -1809,6 +1821,7 @@ async function patchTaskHandler(db, id, body, request, env) {
 // 失败：被占用未过期 → 409 TASK_ALREADY_CLAIMED；pending 任务 → 409 TASK_PENDING_CONFLICT。
 async function claimTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const readAgentId = requestAgentId(request, env);
   let leaseSeconds = null; // 未传 → 行内 NULL，读取/接管按全局默认 TASK_DEFAULT_LEASE_SECONDS（24h）判定
   if (body.lease_seconds !== undefined && body.lease_seconds !== null) {
     if (!Number.isInteger(body.lease_seconds) || body.lease_seconds < 1 || body.lease_seconds > TASK_MAX_LEASE_SECONDS) {
@@ -1836,21 +1849,22 @@ async function claimTaskHandler(db, id, body, request, env) {
     const row = await getTaskRow(db, id);
     if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
     if (row.pending_status !== null) {
-      return taskPendingConflict('pending 任务不可认领（已有终态申请在途，请先 confirm 或 reopen）', row);
+      return taskPendingConflict('pending 任务不可认领（已有终态申请在途，请先 confirm 或 reopen）', row, readAgentId);
     }
     return jsonError(409, 'TASK_ALREADY_CLAIMED',
       '任务当前不可认领：已被其他调用方认领（租约未过期）或状态不允许（status=' + row.status + '）',
-      { task: serializeTask(row) });
+      { task: serializeTask(row, {}, readAgentId) });
   }
-  return await taskResponse(db, id, { claim_token: token });
+  return await taskResponse(db, id, { claim_token: token }, readAgentId);
 }
 
 // POST /task/{id}/release —— 释放认领（task-ownership-p2 §4.2）
 // 仅持有正确 claim_token 的调用方可释放：owner/claimed_at/claim_token/lease_seconds 清空；
 // 若任务仍是 in_progress 且无 pending → status 回 open（终态/waiting 已自动释放 owner）。
 // token 不匹配 → 403 CLAIM_TOKEN_MISMATCH。
-async function releaseTaskHandler(db, id, body) {
+async function releaseTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const readAgentId = requestAgentId(request, env);
   if (!isNonEmptyString(body.claim_token)) {
     return jsonError(422, 'CLAIM_TOKEN_REQUIRED', 'release 必须携带 claim_token（认领时的凭证）');
   }
@@ -1870,14 +1884,15 @@ async function releaseTaskHandler(db, id, body) {
   ).bind(now, id, token).run();
   if (Number(update.meta.changes) === 0) {
     // 竞态：凭证已被清除（他方已释放/终态确认）——幂等返回当前状态（不含 claim_token）
-    return await taskResponse(db, id);
+    return await taskResponse(db, id, {}, readAgentId);
   }
-  return await taskResponse(db, id);
+  return await taskResponse(db, id, {}, readAgentId);
 }
 
 // POST /task/{id}/confirm —— pending 的唯一确认入口；更新与审计事件同一 batch 原子提交。
-async function confirmTaskHandler(db, id, body) {
+async function confirmTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const readAgentId = requestAgentId(request, env);
   if (!TASK_CONFIRM_DECISIONS.includes(body.decision)) {
     return jsonError(422, 'INVALID_CONFIRM_DECISION', 'decision 必须是 accept 或 reopen');
   }
@@ -1905,24 +1920,24 @@ async function confirmTaskHandler(db, id, body) {
   if (prior) {
     const priorRequest = prior.payload && prior.payload.request;
     if (JSON.stringify(priorRequest) !== JSON.stringify(requestPayload)) {
-      return taskConflict('confirmation_id 已用于不同内容的确认请求', row);
+      return taskConflict('confirmation_id 已用于不同内容的确认请求', row, readAgentId);
     }
-    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: true });
+    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: true }, readAgentId);
   }
 
   const terminalEvent = await findTerminalEvent(db, id, confirmationId);
   if (!terminalEvent || terminalEvent.pending_status !== body.expected_pending) {
-    return taskConflict('confirmation_id 或 expected_pending 与当前申请不匹配', row);
+    return taskConflict('confirmation_id 或 expected_pending 与当前申请不匹配', row, readAgentId);
   }
   if (row.pending_status !== body.expected_pending || row.updated_at !== expected || row.confirmation_id !== confirmationId) {
-    return taskConflict('任务 pending 或版本已变化，请重新读取确认队列', row);
+    return taskConflict('任务 pending 或版本已变化，请重新读取确认队列', row, readAgentId);
   }
-  const stateError = taskStateError(row);
+  const stateError = taskStateError(row, readAgentId);
   if (stateError) return stateError;
 
   if (body.decision === 'accept' && body.expected_pending === 'pending_done' &&
       await hasOpenNeedHuman(db, id)) {
-    return taskNeedHumanOpenError(row);
+    return taskNeedHumanOpenError(row, readAgentId);
   }
 
   const now = nowIso();
@@ -1967,7 +1982,7 @@ async function confirmTaskHandler(db, id, body) {
   } catch (err) {
     const retry = await findConfirmationOutcome(db, id, confirmationId);
     if (retry && JSON.stringify(retry.payload && retry.payload.request) === JSON.stringify(requestPayload)) {
-      return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: true });
+      return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: true }, readAgentId);
     }
     throw err;
   }
@@ -1975,16 +1990,17 @@ async function confirmTaskHandler(db, id, body) {
   if (!savedEvent) {
     const current = await getTaskRow(db, id);
     if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
-      return taskNeedHumanOpenError(current);
+      return taskNeedHumanOpenError(current, readAgentId);
     }
-    return taskConflict('任务版本已变化，确认未提交', current);
+    return taskConflict('任务版本已变化，确认未提交', current, readAgentId);
   }
-  return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false });
+  return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false }, readAgentId);
 }
 
 // POST /task/{id}/round-close —— 每个 agent/round 最多一条不可变收尾事件。
-async function roundCloseTaskHandler(db, id, body) {
+async function roundCloseTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const readAgentId = requestAgentId(request, env);
   if (!isNonEmptyString(body.agent_id)) return jsonError(422, 'AGENT_ID_REQUIRED', 'agent_id 必填');
   if (!isNonEmptyString(body.round_id)) return jsonError(422, 'ROUND_ID_REQUIRED', 'round_id 必填');
   if (!TASK_ROUND_ACTIONS.includes(body.action)) {
@@ -2020,20 +2036,20 @@ async function roundCloseTaskHandler(db, id, body) {
   const existing = await findRoundEvent(db, id, agentId, roundId);
   if (existing) {
     if (eventPayloadMatches(existing, payload)) {
-      return await taskResponse(db, id, { event_id: existing.event_id, round_id: roundId, idempotent: true });
+      return await taskResponse(db, id, { event_id: existing.event_id, round_id: roundId, idempotent: true }, readAgentId);
     }
-    return taskConflict('相同 round_id 已提交不同内容', row);
+    return taskConflict('相同 round_id 已提交不同内容', row, readAgentId);
   }
   if (row.pending_status !== null) {
-    return taskPendingConflict('pending 任务不能再次 round-close，请先 confirm 或 reopen', row);
+    return taskPendingConflict('pending 任务不能再次 round-close，请先 confirm 或 reopen', row, readAgentId);
   }
   if (row.status !== 'in_progress') {
-    return jsonError(422, 'TASK_ROUND_REQUIRES_IN_PROGRESS', 'round-close 只允许 in_progress 任务', { task: serializeTask(row) });
+    return jsonError(422, 'TASK_ROUND_REQUIRES_IN_PROGRESS', 'round-close 只允许 in_progress 任务', { task: serializeTask(row, {}, readAgentId) });
   }
-  const stateError = taskStateError(row);
+  const stateError = taskStateError(row, readAgentId);
   if (stateError) return stateError;
   if (body.action === 'done' && await hasOpenNeedHuman(db, id)) {
-    return taskNeedHumanOpenError(row);
+    return taskNeedHumanOpenError(row, readAgentId);
   }
 
   const now = nowIso();
@@ -2064,7 +2080,7 @@ async function roundCloseTaskHandler(db, id, body) {
   } catch (err) {
     const retry = await findRoundEvent(db, id, agentId, roundId);
     if (retry && eventPayloadMatches(retry, payload)) {
-      return await taskResponse(db, id, { event_id: retry.event_id, round_id: roundId, idempotent: true });
+      return await taskResponse(db, id, { event_id: retry.event_id, round_id: roundId, idempotent: true }, readAgentId);
     }
     throw err;
   }
@@ -2072,20 +2088,20 @@ async function roundCloseTaskHandler(db, id, body) {
   if (!savedEvent) {
     const current = await getTaskRow(db, id);
     if (body.action === 'done' && await hasOpenNeedHuman(db, id)) {
-      return taskNeedHumanOpenError(current);
+      return taskNeedHumanOpenError(current, readAgentId);
     }
-    return taskConflict('任务版本已变化，round-close 未提交', current);
+    return taskConflict('任务版本已变化，round-close 未提交', current, readAgentId);
   }
   return await taskResponse(db, id, {
     event_id: eventId,
     round_id: roundId,
     confirmation_id: confirmationId,
     idempotent: false,
-  });
+  }, readAgentId);
 }
 
 // DELETE /task/{id} —— 软删，保留任务事实与审计字段。
-async function deleteTaskHandler(db, id) {
+async function deleteTaskHandler(db, id, request, env) {
   const row = await getTaskRow(db, id);
   if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
   if (Number(row.archived) === 0) {
@@ -2093,7 +2109,7 @@ async function deleteTaskHandler(db, id) {
       .bind(1, nowIso(), id).run();
   }
   const updated = await getTaskRow(db, id);
-  return jsonOk(serializeTask(updated));
+  return jsonOk(serializeTask(updated, {}, requestAgentId(request, env)));
 }
 
 // POST /task/search —— 关键词 LIKE；默认排除 archived。
@@ -2133,7 +2149,7 @@ async function searchTasksHandler(db, body, request, env) {
   const rows = await db.prepare(
     TASK_SELECT_LIST + where.join(' AND ') + ' ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC'
   ).bind(...params).all();
-  const items = (rows.results || []).map(serializeTask);
+  const items = (rows.results || []).map((row) => serializeTask(row, {}, requestAgentId(request, env)));
   return jsonOk({ query: body.query, items, total: items.length, stream, status, kind, include_temp: includeTemp });
 }
 
@@ -2184,22 +2200,22 @@ async function handleRequest(request, env) {
         if (method === 'POST') return await createTaskHandler(db, await readJson(request));
       } else if (segments.length === 2) {
         const id = decodeURIComponent(segments[1]);
-        if (method === 'GET') return await getTaskHandler(db, id);
+        if (method === 'GET') return await getTaskHandler(db, id, request, env);
         if (method === 'PATCH') return await patchTaskHandler(db, id, await readJson(request), request, env);
-        if (method === 'DELETE') return await deleteTaskHandler(db, id);
+        if (method === 'DELETE') return await deleteTaskHandler(db, id, request, env);
       } else if (segments.length === 3) {
         const id = decodeURIComponent(segments[1]);
         if (method === 'POST' && segments[2] === 'confirm') {
-          return await confirmTaskHandler(db, id, await readJson(request));
+          return await confirmTaskHandler(db, id, await readJson(request), request, env);
         }
         if (method === 'POST' && segments[2] === 'round-close') {
-          return await roundCloseTaskHandler(db, id, await readJson(request));
+          return await roundCloseTaskHandler(db, id, await readJson(request), request, env);
         }
         if (method === 'POST' && segments[2] === 'claim') {
           return await claimTaskHandler(db, id, await readJson(request), request, env);
         }
         if (method === 'POST' && segments[2] === 'release') {
-          return await releaseTaskHandler(db, id, await readJson(request));
+          return await releaseTaskHandler(db, id, await readJson(request), request, env);
         }
         if (method === 'POST' && segments[2] === 'need-human') {
           return await createNeedHumanHandler(db, id, await readJson(request));

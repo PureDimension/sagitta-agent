@@ -455,9 +455,14 @@ class AutoAdvanceService extends TypertRemoteService {
     return this.snapshot(state);
   }
 
-  getTasks() {
+  getTasks(agent) {
     const taskApi = this.resolveTaskApiConfig();
-    return readTasksFromApi(taskApi, this.config, this.logger()).catch((error) => {
+    // The panel reads the global task list, but it is opened in the current
+    // session. Carry that session id so the Worker can project its owned rows
+    // as claim_state=mine. Keep a first-agent fallback for older direct RPC
+    // callers that still invoke getTasks() without the lookup argument.
+    const taskAgentId = nonEmptyString(agent?.id) ?? this.primaryTaskAgentId();
+    return readTasksFromApi(taskApi, this.config, this.logger(), taskAgentId).catch((error) => {
       // This is deliberately the UI-only path. No caller used by
       // auto-advance qualification reaches readTasks/readTasksFromApi.
       this.logger()?.warn?.(`sagitta-auto-advance: task API unavailable; using stale tasksPath for UI: ${renderError(error)}`);
@@ -470,6 +475,15 @@ class AutoAdvanceService extends TypertRemoteService {
         error: `任务 API 暂时不可用（${renderError(error)}）；当前为 file-stale 文件快照${stale.error ? `；${stale.error}` : ""}`
       };
     });
+  }
+
+  primaryTaskAgentId() {
+    try {
+      const first = this.ctx?.agents?.list?.()[0];
+      return nonEmptyString(first?.id);
+    } catch {
+      return undefined;
+    }
   }
 
   async resolveNeedHuman(needHumanId) {
@@ -870,7 +884,7 @@ class AutoAdvanceService extends TypertRemoteService {
         if (completeTaskApiConfig(taskApi) === undefined) {
           throw taskApiUnavailable(taskApi === undefined ? "Worker API 未配置" : "Worker API 认证或地址配置不完整");
         }
-        snapshot = await readCloudTaskSnapshotStrict(taskApi, this.config, controller.signal, this.logger());
+        snapshot = await readCloudTaskSnapshotStrict(taskApi, this.config, controller.signal, this.logger(), state.agent.id);
       } finally {
         if (state.requestController === controller) state.requestController = undefined;
       }
@@ -1189,6 +1203,8 @@ async function requestTaskApiJson(apiConfig, config, url, signal, options = {}) 
   }
   assertTaskTransportPolicy(apiConfig.workerApiUrl, config.proxy);
   const requestHeaders = buildTaskAuthHeaders(apiConfig, operation);
+  const taskAgentId = nonEmptyString(options.agentId);
+  if (taskAgentId !== undefined) requestHeaders["X-Agent-Id"] = taskAgentId;
   const requestBodyText = options.body === undefined ? undefined : JSON.stringify(options.body);
   if (requestBodyText !== undefined) requestHeaders["Content-Type"] = "application/json";
   const timeoutMs = config.taskApiTimeoutMs;
@@ -1238,12 +1254,12 @@ async function requestTaskApiJson(apiConfig, config, url, signal, options = {}) 
   return payload;
 }
 
-async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
+async function requestTaskApiPage(apiConfig, config, page, signal, logger, agentId) {
   if (completeTaskApiConfig(apiConfig) === undefined) {
     throw taskApiUnavailable("Worker API 认证或地址配置不完整");
   }
   const url = taskApiUrl(apiConfig.workerApiUrl, page, config.taskPageSize);
-  const payload = await requestTaskApiJson(apiConfig, config, url, signal);
+  const payload = await requestTaskApiJson(apiConfig, config, url, signal, { agentId });
   try {
     const pageData = validateCloudTaskPage(payload);
     logger?.debug?.(`sagitta-auto-advance: task API returned page=${pageData.page} items=${pageData.items.length} total=${pageData.total}`);
@@ -1282,8 +1298,8 @@ function mapNeedHumanItem(item) {
   };
 }
 
-async function readOpenNeedHumanFromApi(apiConfig, config) {
-  const payload = await requestTaskApiJson(apiConfig, config, needHumanApiUrl(apiConfig.workerApiUrl), undefined);
+async function readOpenNeedHumanFromApi(apiConfig, config, agentId) {
+  const payload = await requestTaskApiJson(apiConfig, config, needHumanApiUrl(apiConfig.workerApiUrl), undefined, { agentId });
   const data = unwrapTaskApiPayload(payload);
   const rawItems = data?.items ?? data?.need_humans ?? data?.needHuman;
   if (!Array.isArray(rawItems)) throw taskApiUnavailable("/need-human 响应缺少 items 列表");
@@ -1294,13 +1310,13 @@ async function readOpenNeedHumanFromApi(apiConfig, config) {
     .sort((first, second) => (second.createdAt ?? Number.NEGATIVE_INFINITY) - (first.createdAt ?? Number.NEGATIVE_INFINITY));
 }
 
-async function readCloudTaskSnapshotStrict(apiConfig, config, signal, logger) {
+async function readCloudTaskSnapshotStrict(apiConfig, config, signal, logger, agentId) {
   try {
-    const first = await requestTaskApiPage(apiConfig, config, 1, signal, logger);
+    const first = await requestTaskApiPage(apiConfig, config, 1, signal, logger, agentId);
     const pageCount = Math.max(1, Math.ceil(first.total / first.size));
     const pages = [first];
     for (let page = 2; page <= pageCount; page++) {
-      pages.push(await requestTaskApiPage(apiConfig, config, page, signal, logger));
+      pages.push(await requestTaskApiPage(apiConfig, config, page, signal, logger, agentId));
     }
     return splitCloudTaskSnapshotStrict({ pages });
   } catch (error) {
@@ -1308,12 +1324,12 @@ async function readCloudTaskSnapshotStrict(apiConfig, config, signal, logger) {
   }
 }
 
-async function readTasksFromApi(apiConfig, config, logger) {
-  const snapshot = await readCloudTaskSnapshotStrict(apiConfig, config, undefined, logger);
+async function readTasksFromApi(apiConfig, config, logger, agentId) {
+  const snapshot = await readCloudTaskSnapshotStrict(apiConfig, config, undefined, logger, agentId);
   let pendingRequests = [];
   let pendingRequestsError;
   try {
-    pendingRequests = await readOpenNeedHumanFromApi(apiConfig, config);
+    pendingRequests = await readOpenNeedHumanFromApi(apiConfig, config, agentId);
   } catch (error) {
     pendingRequestsError = renderError(error);
     logger?.warn?.(`sagitta-auto-advance: open need-human unavailable; showing an empty pending list: ${pendingRequestsError}`);

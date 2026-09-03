@@ -78,7 +78,7 @@ export const TYPERT = {
   invocations: [
     remoteMethod("getState", "getState", [lookupAgent], { typeSymbol: "@sagitta/auto-advance/client#AutoAdvanceState", schema: stateSchema }, { file: "lib/service.js", line: 227, column: 3 }),
     remoteMethod("setMode", "setMode", [lookupAgent, jsonBoolean], { typeSymbol: "@sagitta/auto-advance/client#AutoAdvanceState", schema: stateSchema }, { file: "lib/service.js", line: 231, column: 3 }),
-    remoteMethod("getTasks", "getTasks", [], { typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema }, { file: "lib/service.js", line: 248, column: 3 }),
+    remoteMethod("getTasks", "getTasks", [lookupAgent], { typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema }, { file: "lib/service.js", line: 248, column: 3 }),
     remoteMethod("resolveNeedHuman", "resolveNeedHuman", [jsonNeedHumanId], { typeSymbol: "@sagitta/auto-advance/client#NeedHumanResolution", schema: needHumanResolutionSchema }, { file: "lib/service.js", line: 449, column: 3 })
   ],
   model: {
@@ -92,7 +92,7 @@ export const TYPERT = {
       members: [
         { kind: "method", name: "getState", signature: "@Remote('getState') getState(agent: Agent): AutoAdvanceState", summary: "Read one session's current autonomous-continuation state." },
         { kind: "method", name: "setMode", signature: "@Remote('setMode') setMode(agent: Agent, enabled: boolean): AutoAdvanceState", summary: "Persist and apply the session's autonomous-continuation mode." },
-        { kind: "method", name: "getTasks", signature: "@Remote('getTasks') getTasks(): TaskSnapshot", summary: "Read the configured Markdown task list." },
+        { kind: "method", name: "getTasks", signature: "@Remote('getTasks') getTasks(agent: Agent): TaskSnapshot", summary: "Read the configured task list as the selected session." },
         { kind: "method", name: "resolveNeedHuman", signature: "@Remote('resolveNeedHuman') resolveNeedHuman(needHumanId: string): NeedHumanResolution", summary: "Resolve a notify need-human from the Ripple floating panel." }
       ],
       types: [

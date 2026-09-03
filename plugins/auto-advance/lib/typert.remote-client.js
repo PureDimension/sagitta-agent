@@ -72,7 +72,7 @@ export const TYPERT_REMOTE = {
       namespace: "sagittaAutoAdvance",
       method: "getTasks",
       invocation: { kind: "direct" },
-      parameters: [],
+      parameters: [{ name: "agent", wire: "agentId", source: "lookup", lookup: "agent", codec: { mode: "strict", typeSymbol: "@deepseek-ai/dsh-session/types#SessionId", schema: sessionIdSchema } }],
       result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema }
     },
     {

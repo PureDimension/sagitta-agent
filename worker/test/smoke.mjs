@@ -641,12 +641,12 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.ok(!("owner_agent_id" in task), "owner_agent_id must never appear in responses");
   assert.ok(!("claim_token" in task), "claim_token must not appear in create response");
 
-  // A 认领 open 任务 → in_progress + claimed + token 唯一下发一次
+  // A 认领 open 任务 → in_progress + mine（对 A 的读取投影）+ token 唯一下发一次
   result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentA, body: {} });
   assert.equal(result.status, 200);
   assert.equal(result.body.ok, true);
   assert.equal(result.body.data.status, "in_progress");
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
   assert.ok(typeof result.body.data.claim_token === "string" && result.body.data.claim_token.length > 0);
   assert.match(result.body.data.claim_token, /^clm-/);
   assert.ok(!("owner_agent_id" in result.body.data), "owner_agent_id must never appear in claim response");
@@ -659,6 +659,15 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
     assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
   }
 
+  // claim_state 对调用方感知：A=mine，B/无头=claimed；owner_agent_id 永不下发
+  result = await call(env, "GET", "/task/" + task.id, { ...read, ...agentA });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+  assert.ok(!("owner_agent_id" in result.body.data));
+  result = await call(env, "GET", "/task/" + task.id, { ...read, ...agentB });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "claimed");
+
   // claim_token 只在 claim 响应：列表/详情不下发；owner_agent_id 永不下发
   result = await call(env, "GET", "/task/" + task.id, read);
   assert.equal(result.status, 200);
@@ -670,6 +679,10 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.equal(item.claim_state, "claimed");
   assert.ok(!("claim_token" in item), "claim_token must not appear in list response");
   assert.ok(!("owner_agent_id" in item));
+  result = await call(env, "GET", "/task", { ...read, ...agentA });
+  const mineItem = result.body.data.items.find((i) => i.id === task.id);
+  assert.equal(mineItem.claim_state, "mine");
+  assert.ok(!("owner_agent_id" in mineItem));
 
   // PATCH in_progress 防绕过认领：B 直接 PATCH → 409；owner A → 允许
   result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentB, body: { status: "in_progress" } });
@@ -677,7 +690,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
   result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentA, body: { status: "in_progress", title: "owner patch ok" } });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
 
   // 错误 token 释放 → 403 CLAIM_TOKEN_MISMATCH
   result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, body: { claim_token: "clm-not-the-token" } });
@@ -695,6 +708,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.ok(!("claim_token" in result.body.data));
   result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentB, body: {} });
   assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
   const tokenB = result.body.data.claim_token;
   assert.notEqual(tokenB, tokenA);
 
@@ -704,9 +718,11 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   result = await call(env, "GET", "/task/" + task.id, read);
   assert.equal(result.status, 200);
   assert.equal(result.body.data.claim_state, "unclaimed", "expired lease must read as unclaimed");
+  result = await call(env, "GET", "/task/" + task.id, { ...read, ...agentA });
+  assert.equal(result.body.data.claim_state, "unclaimed", "expired owner lease must not read as mine");
   result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentA, body: {} });
   assert.equal(result.status, 200, "expired claim can be taken over by another caller");
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
   const tokenTakeover = result.body.data.claim_token;
   assert.notEqual(tokenTakeover, tokenB, "takeover must issue a fresh token");
 
@@ -714,7 +730,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentA, body: { status: "done" } });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.pending_status, "pending_done");
-  assert.equal(result.body.data.claim_state, "claimed", "pending 申请不释放 owner（认领持续到终态确认）");
+  assert.equal(result.body.data.claim_state, "mine", "pending 申请不释放 owner（认领持续到终态确认）");
   const confirmationId = result.body.data.confirmation_id;
   const pendingVersion = result.body.data.updated_at;
   result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentB, body: {} });
@@ -740,7 +756,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.equal(legacyProgress.claim_state, "unclaimed");
   result = await call(env, "POST", "/task/" + legacyProgress.id + "/claim", { ...write, ...agentB, body: {} });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
 
   // PATCH 到 waiting 自动释放 owner（waiting/blocked 不占用，设计 §7）；
   // waiting 不在认领条件内（仅 open / in_progress 可认领）→ 409，回 open 后可认领
@@ -748,7 +764,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   const waitTask = result.body.data;
   result = await call(env, "POST", "/task/" + waitTask.id + "/claim", { ...write, ...agentA, body: {} });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
   result = await call(env, "PATCH", "/task/" + waitTask.id, { ...write, ...agentA, body: { status: "waiting" } });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "waiting");
@@ -760,6 +776,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.equal(result.status, 200);
   result = await call(env, "POST", "/task/" + waitTask.id + "/claim", { ...write, ...agentB, body: {} });
   assert.equal(result.status, 200, "waiting→open 后可被重新认领");
+  assert.equal(result.body.data.claim_state, "mine");
 
   // 缺省调用方标识：不带 X-Agent-Id → 'unknown'，仍可认领
   result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "no header claim" } });
@@ -779,12 +796,12 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
     assert.equal(result.body.error.code, "INVALID_LEASE_SECONDS");
   }
 
-  // lease_seconds 持久化：claim 传 3600 → 行内 lease_seconds=3600（租约内），读取 claim_state=claimed
+  // lease_seconds 持久化：claim 传 3600 → 行内 lease_seconds=3600（租约内），读取 claim_state=mine
   result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "lease persist" } });
   const persistTask = result.body.data;
   result = await call(env, "POST", "/task/" + persistTask.id + "/claim", { ...write, ...agentA, body: { lease_seconds: 3600 } });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
   let row = database.prepare("SELECT lease_seconds FROM tasks WHERE id = ?").get(persistTask.id);
   assert.equal(row.lease_seconds, 3600, "claim 的 lease_seconds 必须持久化到行");
   // 释放后 lease_seconds 一并清空
@@ -803,6 +820,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   const shortTask = result.body.data;
   result = await call(env, "POST", "/task/" + shortTask.id + "/claim", { ...write, ...agentA, body: { lease_seconds: 5 } });
   assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
   const shortToken = result.body.data.claim_token;
   row = database.prepare("SELECT lease_seconds FROM tasks WHERE id = ?").get(shortTask.id);
   assert.equal(row.lease_seconds, 5);
@@ -817,9 +835,11 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
     .run(new Date(Date.now() - 10 * 1000).toISOString(), shortTask.id);
   result = await call(env, "GET", "/task/" + shortTask.id, read);
   assert.equal(result.body.data.claim_state, "unclaimed", "短租约过期后读取视为未认领");
+  result = await call(env, "GET", "/task/" + shortTask.id, { ...read, ...agentA });
+  assert.equal(result.body.data.claim_state, "unclaimed", "短租约过期后 owner 也不能读为 mine");
   result = await call(env, "POST", "/task/" + shortTask.id + "/claim", { ...write, ...agentB, body: { lease_seconds: 3600 } });
   assert.equal(result.status, 200, "短租约过期后可被他人接管");
-  assert.equal(result.body.data.claim_state, "claimed");
+  assert.equal(result.body.data.claim_state, "mine");
   assert.notEqual(result.body.data.claim_token, shortToken, "接管必须发放新 token");
   row = database.prepare("SELECT lease_seconds, owner_agent_id FROM tasks WHERE id = ?").get(shortTask.id);
   assert.equal(row.lease_seconds, 3600, "接管后按新调用方租约持久化");

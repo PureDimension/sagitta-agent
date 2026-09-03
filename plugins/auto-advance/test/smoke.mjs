@@ -72,6 +72,7 @@ assert.equal(mappedNotifyOnly.sections[0].items[0].open_need_human, false);
 
 let responseMode = "owned";
 const resolvedRequests = [];
+const taskReadAgentIds = [];
 const pendingNeedHumans = [
   {
     id: "nh-notify",
@@ -97,6 +98,9 @@ const pendingNeedHumans = [
 ];
 const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+  if (request.method === "GET" && requestUrl.pathname === "/task") {
+    taskReadAgentIds.push(request.headers["x-agent-id"] ?? null);
+  }
   const resolveMatch = /^\/task\/need-human\/([^/]+)\/resolve$/u.exec(requestUrl.pathname);
   if (request.method === "POST" && resolveMatch !== null) {
     const chunks = [];
@@ -206,6 +210,7 @@ try {
   responseMode = "owned";
   const ownedHarness = makeHarness();
   const pendingSnapshot = await ownedHarness.service.getTasks();
+  assert.equal(taskReadAgentIds.at(-1), "agent-smoke", "UI task read must use the selected session id");
   assert.deepEqual(pendingSnapshot.pendingRequests.map((item) => item.type), ["notify", "need"]);
   assert.equal(pendingSnapshot.pendingRequests[0].needHumanId, "nh-notify");
   const resolvedNotify = await ownedHarness.service.resolveNeedHuman("nh-notify");
@@ -218,12 +223,27 @@ try {
   const refreshedPendingSnapshot = await ownedHarness.service.getTasks();
   assert.deepEqual(refreshedPendingSnapshot.pendingRequests.map((item) => item.type), ["need"]);
   await ownedHarness.service.onTimer(ownedHarness.state, 1);
+  assert.equal(taskReadAgentIds.at(-1), "agent-smoke", "auto-advance qualification read must use state.agent.id");
   assert.equal(ownedHarness.agent.followups.length, 1);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /tsk-mine/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /当前我认领的 in_progress 任务/u);
   assert.doesNotMatch(ownedHarness.agent.followups[0].content[0].text, /task_round_close|round-close/iu);
   assert.equal(ownedHarness.state.pendingAutoMode, "away");
+
+  // Worker v2 的 mine 投影直接驱动所有权判断；claimed 任务不能混入自己的清单。
+  const ownershipHarness = makeHarness({ api: false });
+  const mineTask = task("tsk-owned-by-me", "in_progress", null, { claim_state: "mine" });
+  const otherTask = task("tsk-owned-by-other", "in_progress", null, { claim_state: "claimed" });
+  const ownershipSnapshot = { items: [mineTask, otherTask] };
+  assert.equal(ownershipHarness.service.isOwnedTask(ownershipHarness.state, mineTask), true);
+  assert.equal(ownershipHarness.service.isOwnedTask(ownershipHarness.state, otherTask), false);
+  assert.deepEqual(
+    ownershipHarness.service.ownedInProgressTasks(ownershipHarness.state, ownershipSnapshot).map((item) => item.id),
+    ["tsk-owned-by-me"]
+  );
+  ownershipHarness.service.syncOwnedTasks(ownershipHarness.state, ownershipSnapshot);
+  assert.deepEqual([...ownershipHarness.state.ownedTaskIds], ["tsk-owned-by-me"]);
 
   // 没有 in_progress 但有 open：只提示认领，不注入自主大 prompt，也不熄火。
   responseMode = "open";
