@@ -167,7 +167,7 @@ test("/task CRUD, filters, LIKE search, soft delete, and read/write Bearer split
   assert.equal(database.prepare("SELECT COUNT(*) AS total FROM tasks WHERE id = ?").get(first.id).total, 1);
 });
 
-function taskEnv({ database = new DatabaseSync(":memory:"), legacy = false, failBatch = false, onPrepare } = {}) {
+function taskEnv({ database = new DatabaseSync(":memory:"), legacy = false, legacyNeedHuman = false, failBatch = false, onPrepare } = {}) {
   if (legacy) {
     database.exec(`CREATE TABLE tasks (
       id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL,
@@ -176,6 +176,13 @@ function taskEnv({ database = new DatabaseSync(":memory:"), legacy = false, fail
       body TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
       done_at TEXT DEFAULT '', archived INTEGER NOT NULL DEFAULT 0
     )`);
+    if (legacyNeedHuman) {
+      database.exec(`CREATE TABLE task_need_human (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, content TEXT NOT NULL,
+        suggestion TEXT, status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL,
+        resolved_at TEXT, resolved_by TEXT
+      )`);
+    }
   } else {
     database.exec(schema);
   }
@@ -192,16 +199,23 @@ function taskEnv({ database = new DatabaseSync(":memory:"), legacy = false, fail
 
 test("task migration is re-entrant and fails closed when D1 batch fails", async () => {
   let alterCount = 0;
-  const legacy = taskEnv({ legacy: true, onPrepare(sql) {
+  let needHumanTypeAlterCount = 0;
+  const legacy = taskEnv({ legacy: true, legacyNeedHuman: true, onPrepare(sql) {
     if (/^ALTER TABLE tasks ADD COLUMN/.test(sql)) alterCount += 1;
+    if (/^ALTER TABLE task_need_human ADD COLUMN type /.test(sql)) needHumanTypeAlterCount += 1;
   }});
   const read = { token: legacy.env.D1_READ_TOKEN };
   const legacyId = "tsk-20260830-legacy";
   legacy.database.prepare(
     "INSERT INTO tasks (id, project, title, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(legacyId, "legacy", "legacy task", "open", 0, 0, "company", "old body", "2026-08-30T00:00:00.000Z", "2026-08-30T00:00:00.000Z", "", 0);
+  legacy.database.prepare(
+    "INSERT INTO task_need_human (id, task_id, content, suggestion, status, created_at, resolved_at, resolved_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("nh-20260830-old", legacyId, "legacy need-human", null, "open", "2026-08-30T00:00:00.000Z", null, null);
   let result = await call(legacy.env, "GET", "/task", read);
   assert.equal(result.status, 200);
+  assert.equal(needHumanTypeAlterCount, 1, "existing task_need_human must gain type exactly once");
+  assert.equal(legacy.database.prepare("SELECT type FROM task_need_human WHERE id = ?").get("nh-20260830-old").type, "need");
   // blocked_reason + pending_status（既有）+ kind（v2）+ owner_agent_id/claimed_at/claim_token/lease_seconds（task-ownership-p2 §3）
   assert.equal(alterCount, 7);
   result = await call(legacy.env, "GET", "/task/" + legacyId, read);
@@ -215,6 +229,7 @@ test("task migration is re-entrant and fails closed when D1 batch fails", async 
   result = await call(legacy.env, "GET", "/task", read);
   assert.equal(result.status, 200);
   assert.equal(alterCount, 7, "second migration must not issue duplicate ALTER TABLE");
+  assert.equal(needHumanTypeAlterCount, 1, "second migration must not issue duplicate type ALTER TABLE");
   const taskColumns = legacy.database.prepare("PRAGMA table_info(tasks)").all().map((row) => row.name);
   for (const column of ["blocked_reason", "pending_status", "kind", "owner_agent_id", "claimed_at", "claim_token", "lease_seconds"]) {
     assert.ok(taskColumns.includes(column), "missing tasks column " + column);
@@ -224,7 +239,7 @@ test("task migration is re-entrant and fails closed when D1 batch fails", async 
     assert.ok(eventColumns.includes(column), "missing task_events column " + column);
   }
   const needHumanColumns = legacy.database.prepare("PRAGMA table_info(task_need_human)").all().map((row) => row.name);
-  for (const column of ["id", "task_id", "content", "suggestion", "status", "created_at", "resolved_at", "resolved_by"]) {
+  for (const column of ["id", "task_id", "content", "suggestion", "type", "status", "created_at", "resolved_at", "resolved_by"]) {
     assert.ok(needHumanColumns.includes(column), "missing task_need_human column " + column);
   }
 
@@ -261,23 +276,78 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
   result = await call(env, "GET", "/task?kind=temp&owner=me", { ...read, ...agentB });
   assert.deepEqual(result.body.data.items, []);
 
-  // open need-human 会阻止 done confirm；resolve（含 abandoned）后可继续确认。
+  // type=need 在申请 done 时即被拦截，不生成 pending_done；type=notify 不阻塞 done。
   result = await call(env, "POST", "/task", {
     ...write, body: { project: "v2", title: "done gate", status: "in_progress" },
   });
   const gated = result.body.data;
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { content: "非法类型", type: "question" },
+  });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "INVALID_NEED_HUMAN_TYPE");
   result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
     ...write, body: { content: "请确认是否保留旧接口", suggestion: "建议保留兼容层" },
   });
   assert.equal(result.status, 201);
   const needHuman = result.body.data;
   assert.match(needHuman.id, /^nh-\d{8}-[0-9a-f]+$/);
+  assert.equal(needHuman.type, "need");
   assert.equal(needHuman.status, "open");
   result = await call(env, "GET", "/need-human?status=open", read);
-  assert.ok(result.body.data.items.some((item) => item.id === needHuman.id));
+  assert.equal(result.body.data.items.find((item) => item.id === needHuman.id).type, "need");
+  result = await call(env, "GET", "/task/" + gated.id, read);
+  assert.equal(result.body.data.open_need_human, true);
+  assert.equal(result.body.data.open_need_human_count, 1);
+  assert.equal(result.body.data.open_notify_count, 0);
   result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
+  assert.match(result.body.error.message, /可标 blocked 或先 resolve need-human/);
+  assert.equal(result.body.error.details.task.pending_status, null, "need-human 拦截不得生成 pending_done");
+
+  result = await call(env, "POST", "/task/" + gated.id + "/round-close", {
+    ...write,
+    body: {
+      agent_id: "smoke-agent", round_id: "need-open-done", action: "done",
+      progress: "实现已完成", next: "等待 need-human",
+      expected_updated_at: result.body.error.details.task.updated_at,
+    },
+  });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
+  assert.equal(result.body.error.details.task.pending_status, null, "round-close 拦截不得生成 pending_done");
+
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { type: "notify", content: "已部署可验证" },
+  });
+  assert.equal(result.status, 201);
+  const notifyHuman = result.body.data;
+  assert.equal(notifyHuman.type, "notify");
+  result = await call(env, "GET", "/task/" + gated.id, read);
+  assert.equal(result.body.data.open_need_human, true);
+  assert.equal(result.body.data.open_need_human_count, 1);
+  assert.equal(result.body.data.open_notify_count, 1);
+
+  result = await call(env, "POST", "/task/need-human/" + needHuman.id + "/resolve", {
+    ...write, body: { resolve_kind: "abandoned" },
+  });
   assert.equal(result.status, 200);
+  assert.equal(result.body.data.type, "need");
+  result = await call(env, "GET", "/task/" + gated.id, read);
+  assert.equal(result.body.data.open_need_human, false);
+  assert.equal(result.body.data.open_need_human_count, 0);
+  assert.equal(result.body.data.open_notify_count, 1);
+
+  result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 200, "open notify 不应阻塞 done 申请");
   const donePending = result.body.data;
+  assert.equal(donePending.pending_status, "pending_done");
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { type: "need", content: "确认前新增阻塞项" },
+  });
+  assert.equal(result.status, 201);
+  const lateNeedHuman = result.body.data;
   result = await call(env, "POST", "/task/" + gated.id + "/confirm", {
     ...write,
     body: {
@@ -286,13 +356,13 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
       confirmation_id: donePending.confirmation_id,
     },
   });
-  assert.equal(result.status, 409);
+  assert.equal(result.status, 409, "confirm accept 仍须拦截新增的 open need");
   assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
-  result = await call(env, "POST", "/task/need-human/" + needHuman.id + "/resolve", {
-    ...write, body: { resolve_kind: "abandoned" },
+  assert.equal(result.body.error.details.task.pending_status, "pending_done");
+  result = await call(env, "POST", "/task/need-human/" + lateNeedHuman.id + "/resolve", {
+    ...write, body: { resolved_by: "ripple" },
   });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.status, "resolved");
   result = await call(env, "POST", "/task/" + gated.id + "/confirm", {
     ...write,
     body: {
@@ -305,6 +375,13 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
   assert.equal(result.body.data.status, "done");
   result = await call(env, "GET", "/need-human?status=open", read);
   assert.ok(!result.body.data.items.some((item) => item.id === needHuman.id));
+  assert.ok(!result.body.data.items.some((item) => item.id === lateNeedHuman.id));
+  assert.ok(result.body.data.items.some((item) => item.id === notifyHuman.id && item.type === "notify"));
+  result = await call(env, "POST", "/task/need-human/" + notifyHuman.id + "/resolve", {
+    ...write, body: { resolved_by: "ripple" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.type, "notify");
 
   // blocked 任务清掉最后一条 need-human 后自动回 open；in_progress 解除则保持原状态。
   result = await call(env, "POST", "/task", {

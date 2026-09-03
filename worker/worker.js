@@ -960,6 +960,7 @@ const TASK_EVENT_SCHEMA_COLUMNS = [
 ];
 const TASK_NEED_HUMAN_SCHEMA_COLUMNS = [
   ['id', 'TEXT'], ['task_id', 'TEXT'], ['content', 'TEXT'], ['suggestion', 'TEXT'],
+  ['type', "TEXT NOT NULL DEFAULT 'need'"],
   ['status', 'TEXT'], ['created_at', 'TEXT'], ['resolved_at', 'TEXT'], ['resolved_by', 'TEXT'],
 ];
 const TASK_SYSTEM_AGENT = 'worker';
@@ -969,6 +970,7 @@ const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'b
 const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
 const TASK_ROUND_ACTIONS = ['update', 'done', 'blocked'];
 const TASK_NEED_HUMAN_STATUSES = ['open', 'resolved'];
+const TASK_NEED_HUMAN_TYPES = ['need', 'notify'];
 const TASK_NEED_HUMAN_RESOLVED_BY = ['ripple', 'sagitta'];
 const TASK_NEED_HUMAN_RESOLVE_KINDS = ['solved', 'abandoned'];
 const MAX_TASK_EVENT_TEXT = 1000;
@@ -1028,11 +1030,13 @@ const TASK_NEED_HUMAN_CREATE_DDL = `CREATE TABLE IF NOT EXISTS task_need_human (
   task_id      TEXT NOT NULL,
   content      TEXT NOT NULL,
   suggestion   TEXT,
+  type         TEXT NOT NULL DEFAULT 'need',
   status       TEXT NOT NULL DEFAULT 'open',
   created_at   TEXT NOT NULL,
   resolved_at  TEXT,
   resolved_by  TEXT,
   CHECK (status IN ('open', 'resolved')),
+  CHECK (type IN ('need', 'notify')),
   CHECK (resolved_by IS NULL OR resolved_by IN ('ripple', 'sagitta'))
 )`;
 
@@ -1050,7 +1054,7 @@ async function ensureColumns(db, table, definitions) {
   const columns = await tableColumns(db, table);
   const missing = definitions
     .filter(([name]) => !columns.has(name))
-    // SQLite 不允许 ALTER TABLE ADD COLUMN 加 NOT NULL 无默认值；迁移列统一可空。
+    // SQLite 不允许 ALTER TABLE ADD COLUMN 加 NOT NULL 无默认值；迁移列使用可空定义或默认值。
     .map(([name, type]) => db.prepare('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + type));
   await d1Batch(db, missing);
   const verified = await tableColumns(db, table);
@@ -1101,6 +1105,8 @@ function isTaskBody(body) {
 //   · claim_token：默认不下发（防泄露）；仅在 claim 成功响应经 extra.claim_token 注入一次
 function serializeTask(row, extra = {}) {
   if (!row) return null;
+  const openNeedHumanCount = Number(row.open_need_human_count || 0);
+  const openNotifyCount = Number(row.open_notify_count || 0);
   const result = Object.assign({}, row, {
     kind: row.kind === undefined || row.kind === null ? 'normal' : row.kind,
     priority: Number(row.priority),
@@ -1110,6 +1116,9 @@ function serializeTask(row, extra = {}) {
     pending_status: row.pending_status === undefined ? null : row.pending_status,
     // legacy 兼容：旧 schema 的 done_at 默认是空字符串 ''，新不变量要求 null。
     done_at: isNonEmptyString(row.done_at) ? row.done_at : null,
+    open_need_human: openNeedHumanCount > 0,
+    open_need_human_count: openNeedHumanCount,
+    open_notify_count: openNotifyCount,
   }, extra);
   result.claim_state = taskClaimState(row);
   delete result.owner_agent_id;
@@ -1263,7 +1272,11 @@ async function getTaskRow(db, id) {
       ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_progress,
     (SELECT e.next FROM task_events e
       WHERE e.task_id = t.id AND e.event_type = 'round_close'
-      ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_next
+      ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_next,
+    (SELECT COUNT(*) FROM task_need_human n
+      WHERE n.task_id = t.id AND n.status = 'open' AND n.type = 'need') AS open_need_human_count,
+    (SELECT COUNT(*) FROM task_need_human n
+      WHERE n.task_id = t.id AND n.status = 'open' AND n.type = 'notify') AS open_notify_count
     FROM tasks t WHERE t.id = ?`).bind(id).first();
   return rows;
 }
@@ -1276,7 +1289,11 @@ const TASK_SELECT_LIST = `SELECT t.*,
   (SELECT e.progress FROM task_events e WHERE e.task_id = t.id AND e.event_type = 'round_close'
     ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_progress,
   (SELECT e.next FROM task_events e WHERE e.task_id = t.id AND e.event_type = 'round_close'
-    ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_next
+    ORDER BY e.created_at DESC, e.event_id DESC LIMIT 1) AS last_next,
+  (SELECT COUNT(*) FROM task_need_human n
+    WHERE n.task_id = t.id AND n.status = 'open' AND n.type = 'need') AS open_need_human_count,
+  (SELECT COUNT(*) FROM task_need_human n
+    WHERE n.task_id = t.id AND n.status = 'open' AND n.type = 'notify') AS open_notify_count
   FROM tasks t WHERE `;
 
 async function taskResponse(db, id, extra = {}) {
@@ -1305,9 +1322,18 @@ function needHumanStatus(value) {
   return null;
 }
 
+function needHumanType(value) {
+  if (value === undefined || value === null) return 'need';
+  if (!TASK_NEED_HUMAN_TYPES.includes(value)) {
+    return jsonError(422, 'INVALID_NEED_HUMAN_TYPE', 'type 必须是：' + TASK_NEED_HUMAN_TYPES.join(' / '));
+  }
+  return value;
+}
+
 function serializeNeedHuman(row) {
   if (!row) return null;
   return Object.assign({}, row, {
+    type: row.type === undefined || row.type === null ? 'need' : row.type,
     suggestion: row.suggestion === undefined ? null : row.suggestion,
     resolved_at: row.resolved_at === undefined ? null : row.resolved_at,
     resolved_by: row.resolved_by === undefined ? null : row.resolved_by,
@@ -1320,9 +1346,15 @@ async function getNeedHumanRow(db, id) {
 
 async function hasOpenNeedHuman(db, taskIdValue) {
   const row = await db.prepare(
-    "SELECT id FROM task_need_human WHERE task_id = ? AND status = 'open' LIMIT 1"
+    "SELECT id FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need' LIMIT 1"
   ).bind(taskIdValue).first();
   return !!row;
+}
+
+function taskNeedHumanOpenError(row) {
+  return jsonError(409, 'TASK_NEED_HUMAN_OPEN',
+    '存在 open need-human（type=need），可标 blocked 或先 resolve need-human 后再申请 done',
+    { task: serializeTask(row) });
 }
 
 // GET /need-human —— 跨任务汇聚；默认只返回待涟漪处理的 open 条目。
@@ -1347,6 +1379,8 @@ async function createNeedHumanHandler(db, taskIdValue, body) {
 
   const content = taskEventText(body.content, 'content', true);
   if (content instanceof Response) return content;
+  const type = needHumanType(body.type);
+  if (type instanceof Response) return type;
   let suggestion = null;
   if (body.suggestion !== undefined && body.suggestion !== null) {
     suggestion = taskEventText(body.suggestion, 'suggestion', false);
@@ -1356,9 +1390,9 @@ async function createNeedHumanHandler(db, taskIdValue, body) {
   const id = needHumanId();
   const now = nowIso();
   await db.prepare(
-    'INSERT INTO task_need_human (id, task_id, content, suggestion, status, created_at, resolved_at, resolved_by) ' +
-    "VALUES (?, ?, ?, ?, 'open', ?, NULL, NULL)"
-  ).bind(id, taskIdValue, content, suggestion, now).run();
+    'INSERT INTO task_need_human (id, task_id, content, suggestion, type, status, created_at, resolved_at, resolved_by) ' +
+    "VALUES (?, ?, ?, ?, ?, 'open', ?, NULL, NULL)"
+  ).bind(id, taskIdValue, content, suggestion, type, now).run();
   return jsonOk(serializeNeedHuman(await getNeedHumanRow(db, id)), 201);
 }
 
@@ -1392,7 +1426,7 @@ async function resolveNeedHumanHandler(db, id, body) {
   const reopen = db.prepare(
     "UPDATE tasks SET status = 'open', blocked_reason = NULL, owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL, updated_at = ? " +
     "WHERE id = ? AND archived = 0 AND status = 'blocked' AND NOT EXISTS (" +
-    "SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open')"
+    "SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')"
   ).bind(now, current.task_id, current.task_id);
   await db.batch([resolve, reopen]);
   return jsonOk(serializeNeedHuman(await getNeedHumanRow(db, id)));
@@ -1705,6 +1739,9 @@ async function patchTaskHandler(db, id, body, request, env) {
   if (statusIsTerminal) {
     const stateError = taskStateError(row);
     if (stateError) return stateError;
+    if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
+      return taskNeedHumanOpenError(row);
+    }
     const pendingStatus = nextStatus === 'done' ? 'pending_done' : 'pending_blocked';
     const confirmationId = 'cnf-' + crypto.randomUUID();
     const eventId = crypto.randomUUID();
@@ -1721,10 +1758,14 @@ async function patchTaskHandler(db, id, body, request, env) {
       (sets.length ? sets.join(', ') + ', ' : '') +
       'status = ?, pending_status = ?, blocked_reason = ?, updated_at = ? ' +
       'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL' +
-      (expected === null ? '' : ' AND updated_at = ?')
+      (expected === null ? '' : ' AND updated_at = ?') +
+      (nextStatus === 'done'
+        ? " AND NOT EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')"
+        : '')
     ).bind(
       ...params, 'in_progress', pendingStatus, nextStatus === 'blocked' ? blockedReason : null, now, id,
-      ...(expected === null ? [] : [expected])
+      ...(expected === null ? [] : [expected]),
+      ...(nextStatus === 'done' ? [id] : [])
     );
     const event = db.prepare(
       'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
@@ -1737,6 +1778,9 @@ async function patchTaskHandler(db, id, body, request, env) {
     const savedEvent = await findTerminalEvent(db, id, confirmationId);
     if (!savedEvent) {
       const current = await getTaskRow(db, id);
+      if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
+        return taskNeedHumanOpenError(current);
+      }
       return taskConflict('任务版本已变化，终态申请未提交', current);
     }
     return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false });
@@ -1878,9 +1922,7 @@ async function confirmTaskHandler(db, id, body) {
 
   if (body.decision === 'accept' && body.expected_pending === 'pending_done' &&
       await hasOpenNeedHuman(db, id)) {
-    return jsonError(409, 'TASK_NEED_HUMAN_OPEN', 'need-human 清完前不许 done', {
-      task: serializeTask(row),
-    });
+    return taskNeedHumanOpenError(row);
   }
 
   const now = nowIso();
@@ -1905,7 +1947,7 @@ async function confirmTaskHandler(db, id, body) {
     'WHERE id = ? AND pending_status = ? AND updated_at = ? AND EXISTS (' +
       'SELECT 1 FROM task_events WHERE task_id = ? AND confirmation_id = ? AND pending_status = ?' +
     ') AND NOT (' +
-      "? = 'done' AND EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open')" +
+      "? = 'done' AND EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')" +
     ')'
   ).bind(
     nextStatus, nextReason, ...(nextStatus === 'done' ? [now] : []), now, id, body.expected_pending, expected,
@@ -1933,9 +1975,7 @@ async function confirmTaskHandler(db, id, body) {
   if (!savedEvent) {
     const current = await getTaskRow(db, id);
     if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
-      return jsonError(409, 'TASK_NEED_HUMAN_OPEN', 'need-human 清完前不许 done', {
-        task: serializeTask(current),
-      });
+      return taskNeedHumanOpenError(current);
     }
     return taskConflict('任务版本已变化，确认未提交', current);
   }
@@ -1992,6 +2032,9 @@ async function roundCloseTaskHandler(db, id, body) {
   }
   const stateError = taskStateError(row);
   if (stateError) return stateError;
+  if (body.action === 'done' && await hasOpenNeedHuman(db, id)) {
+    return taskNeedHumanOpenError(row);
+  }
 
   const now = nowIso();
   const eventId = crypto.randomUUID();
@@ -2004,8 +2047,11 @@ async function roundCloseTaskHandler(db, id, body) {
     ).bind(now, id, ...(expected === null ? [] : [expected]))
     : db.prepare(
       'UPDATE tasks SET status = \'in_progress\', pending_status = ?, blocked_reason = ?, updated_at = ? ' +
-      'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL AND updated_at = ?'
-    ).bind(pendingStatus, blockedReason, now, id, expected);
+      'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL AND updated_at = ?' +
+      (body.action === 'done'
+        ? " AND NOT EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')"
+        : '')
+    ).bind(pendingStatus, blockedReason, now, id, expected, ...(body.action === 'done' ? [id] : []));
   const event = db.prepare(
     'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
     'SELECT ?, ?, ?, \'round_close\', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1'
@@ -2023,7 +2069,13 @@ async function roundCloseTaskHandler(db, id, body) {
     throw err;
   }
   const savedEvent = await findRoundEvent(db, id, agentId, roundId);
-  if (!savedEvent) return taskConflict('任务版本已变化，round-close 未提交', await getTaskRow(db, id));
+  if (!savedEvent) {
+    const current = await getTaskRow(db, id);
+    if (body.action === 'done' && await hasOpenNeedHuman(db, id)) {
+      return taskNeedHumanOpenError(current);
+    }
+    return taskConflict('任务版本已变化，round-close 未提交', current);
+  }
   return await taskResponse(db, id, {
     event_id: eventId,
     round_id: roundId,

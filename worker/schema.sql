@@ -132,11 +132,13 @@ CREATE TABLE IF NOT EXISTS task_need_human (
   task_id       TEXT NOT NULL,
   content       TEXT NOT NULL,                   -- 需要涟漪做什么（问题/上下文）
   suggestion    TEXT,                            -- 我的建议（可选）
+  type          TEXT NOT NULL DEFAULT 'need',   -- need=阻塞 done；notify=仅告知，不阻塞 done
   status        TEXT NOT NULL DEFAULT 'open',    -- open | resolved
   created_at    TEXT NOT NULL,
   resolved_at   TEXT,
   resolved_by   TEXT,                            -- ripple | sagitta
   CHECK (status IN ('open','resolved')),
+  CHECK (type IN ('need','notify')),
   CHECK (resolved_by IS NULL OR resolved_by IN ('ripple','sagitta'))
 );
 
