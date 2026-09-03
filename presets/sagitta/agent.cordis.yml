@@ -217,6 +217,11 @@
         backgroundMode: continuable
 
     # codex 子代理：Sagitta 的核心执行资源。重任务交给它跑，Sagitta 负责监督与审查。
+    # provider 注册行必须存在，工具行才能挂载（dsh-tool-subagent 监听 provider-added；
+    # 2026-09-03 涟漪指示：修好 subagent_codex，且必须受任务门禁约束——见 memory task-gate）。
+    - id: subagent-codex
+      name: '@deepseek-ai/dsh-subagent-codex'
+
     - id: tool-subagent-codex
       name: '@deepseek-ai/dsh-tool-subagent'
       config:

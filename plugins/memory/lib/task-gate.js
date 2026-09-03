@@ -16,6 +16,7 @@ const EXECUTION_TOOL_NAMES = new Set([
   "codex_dispatch",
   "subagent",
   "subagent:delegation",
+  "subagent_codex",
   "async_register",
 ]);
 
