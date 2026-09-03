@@ -11,8 +11,14 @@ export interface TaskSnapshot {
   readonly path: string;
   readonly updatedAt: number | null;
   readonly sections: readonly { readonly title: string; readonly items: readonly { readonly text: string; readonly done: boolean }[] }[];
-  readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string }[];
+  readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string; readonly type: "need" | "notify"; readonly needHumanId: string }[];
   readonly error?: string;
+}
+export interface NeedHumanResolution {
+  readonly needHumanId: string;
+  readonly taskId: string;
+  readonly type: "need" | "notify";
+  readonly status: string;
 }
 export declare const TYPERT_REMOTE: unknown;
 export default TYPERT_REMOTE;

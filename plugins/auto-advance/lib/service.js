@@ -33,7 +33,7 @@ const LEGACY_WORKSPACE_CANDIDATES = [
 ];
 
 const REMOTE_INITIALIZERS = [];
-for (const method of ["getState", "setMode", "getTasks"]) {
+for (const method of ["getState", "setMode", "getTasks", "resolveNeedHuman"]) {
   Remote(method)(undefined, {
     kind: "method",
     name: method,
@@ -91,12 +91,13 @@ function hasConfiguredTaskApiValue(config) {
   return config !== undefined && Object.values(config).some((value) => value !== undefined);
 }
 
-function completeTaskApiConfig(config) {
+function completeTaskApiConfig(config, operation = "read") {
   const normalized = normalizeTaskApiConfig(config);
   // API 模式就绪条件：workerApiUrl 非空，且具备任一认证形态
   // （Bearer d1ReadToken，或 Cloudflare Access 双 key——网关放行后免 Bearer）。
   const accessComplete = normalized.accessClientId !== undefined && normalized.accessClientSecret !== undefined;
-  return normalized.workerApiUrl !== undefined && (normalized.d1ReadToken !== undefined || accessComplete)
+  const token = operation === "write" ? normalized.d1WriteToken : normalized.d1ReadToken;
+  return normalized.workerApiUrl !== undefined && (token !== undefined || accessComplete)
     ? normalized
     : undefined;
 }
@@ -256,16 +257,42 @@ function isTempTask(task, args = {}) {
 
 function hasOpenNeedHuman(task) {
   if (!isRecord(task)) return false;
-  if (task.open_need_human === true || task.has_open_need_human === true || Number(task.open_need_human_count) > 0) return true;
-  for (const key of ["need_human", "needHuman"]) {
-    const value = task[key];
-    if (value === true) return true;
-    if (isRecord(value) && (value.status === undefined || value.status === "open")) return true;
-  }
-  for (const key of ["need_humans", "needHumans"]) {
-    if (Array.isArray(task[key]) && task[key].some((item) => item?.status === undefined || item?.status === "open")) return true;
+  const entries = openNeedHumanEntries(task);
+  if (entries !== undefined) return entries.some(isOpenNeedHumanEntry);
+  if (task.open_need_human === true || task.has_open_need_human === true || Number(task.open_need_human_count) > 0) {
+    return needHumanType({ type: task.open_need_human_type ?? task.openNeedHumanType }) === "need";
   }
   return false;
+}
+
+function needHumanType(value) {
+  const raw = value?.type ?? value?.need_human_type ?? value?.needHumanType;
+  return typeof raw === "string" && raw.trim().toLowerCase() === "notify" ? "notify" : "need";
+}
+
+function isOpenNeedHumanEntry(value) {
+  return isRecord(value) && (value.status === undefined || value.status === "open") && needHumanType(value) === "need";
+}
+
+function openNeedHumanEntries(task) {
+  if (!isRecord(task)) return undefined;
+  for (const key of ["need_humans", "needHumans", "open_need_humans", "openNeedHumans", "need_human_items", "needHumanItems"]) {
+    if (Array.isArray(task[key])) return task[key];
+  }
+  for (const key of ["open_need_human", "has_open_need_human"]) {
+    if (isRecord(task[key])) return [task[key]];
+  }
+  for (const key of ["need_human", "needHuman"]) {
+    if (isRecord(task[key])) return [task[key]];
+    if (task[key] === true) return [{ status: "open", type: task.open_need_human_type ?? task.openNeedHumanType }];
+  }
+  return undefined;
+}
+
+function openNeedHumanCount(task) {
+  const entries = openNeedHumanEntries(task);
+  if (entries !== undefined) return entries.filter(isOpenNeedHumanEntry).length;
+  return hasOpenNeedHuman(task) ? Math.max(1, Number(task.open_need_human_count) || 0) : 0;
 }
 
 function taskIsTerminal(task) {
@@ -443,6 +470,34 @@ class AutoAdvanceService extends TypertRemoteService {
         error: `任务 API 暂时不可用（${renderError(error)}）；当前为 file-stale 文件快照${stale.error ? `；${stale.error}` : ""}`
       };
     });
+  }
+
+  async resolveNeedHuman(needHumanId) {
+    const id = nonEmptyString(needHumanId);
+    if (id === undefined) throw new Error("need-human id 必填");
+    const taskApi = this.resolveTaskApiConfig();
+    if (completeTaskApiConfig(taskApi, "write") === undefined) {
+      throw taskApiUnavailable("Worker API 写入认证或地址配置不完整");
+    }
+    const payload = await requestTaskApiJson(
+      taskApi,
+      this.config,
+      needHumanResolveApiUrl(taskApi.workerApiUrl, id),
+      undefined,
+      {
+        method: "POST",
+        operation: "write",
+        body: { resolve_kind: "solved", resolved_by: "ripple" }
+      }
+    );
+    const data = unwrapTaskApiPayload(payload);
+    if (!isRecord(data)) throw taskApiUnavailable("resolve need-human 响应不是对象");
+    return {
+      needHumanId: typeof data.id === "string" ? data.id : id,
+      taskId: typeof data.task_id === "string" ? data.task_id : "",
+      type: needHumanType(data),
+      status: typeof data.status === "string" ? data.status : "resolved"
+    };
   }
 
   /**
@@ -985,6 +1040,11 @@ function needHumanApiUrl(workerApiUrl) {
   return url;
 }
 
+function needHumanResolveApiUrl(workerApiUrl, needHumanId) {
+  const baseUrl = workerApiUrl.replace(/\/+$/u, "");
+  return new URL(`${baseUrl}/task/need-human/${encodeURIComponent(needHumanId)}/resolve`);
+}
+
 function taskApiUpdatedAt(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string" || value.trim().length === 0) return null;
@@ -1006,6 +1066,7 @@ function mapApiTask(item) {
   const titleValue = item?.title ?? item?.text;
   const title = cleanMarkdown(typeof titleValue === "string" ? titleValue : "") || "未命名需求";
   const project = typeof item?.project === "string" && item.project.trim() ? item.project.trim() : "未分类";
+  const openNeedHumans = openNeedHumanCount(item);
   const task = {
     text: title,                       // 项目进度区（normalizeTask 用 text + done）
     title,                             // 待处理需求区用
@@ -1018,8 +1079,9 @@ function mapApiTask(item) {
     doneAt: item?.done_at ?? null,
     confirmationId: item?.confirmation_id ?? null,
     type: item?.type ?? item?.task_type ?? null,
-    open_need_human: item?.open_need_human ?? item?.has_open_need_human ?? false,
-    open_need_human_count: item?.open_need_human_count ?? 0,
+    // A notify is visible in the inbox but does not block task progress.
+    open_need_human: openNeedHumans > 0,
+    open_need_human_count: openNeedHumans,
     project,                           // 分组键
     hasCheckbox: item?.checkbox === 1 || item?.checkbox === "1",
     body: typeof item?.body === "string" ? cleanBody(item.body) : "",
@@ -1119,12 +1181,16 @@ function linkedAbortSignal(signal, timeoutMs) {
   };
 }
 
-async function requestTaskApiJson(apiConfig, config, url, signal) {
-  if (completeTaskApiConfig(apiConfig) === undefined) {
-    throw taskApiUnavailable("Worker API 认证或地址配置不完整");
+async function requestTaskApiJson(apiConfig, config, url, signal, options = {}) {
+  const method = options.method ?? "GET";
+  const operation = options.operation ?? (method === "GET" ? "read" : "write");
+  if (completeTaskApiConfig(apiConfig, operation) === undefined) {
+    throw taskApiUnavailable(`Worker API ${operation === "write" ? "写入" : "读取"}认证或地址配置不完整`);
   }
   assertTaskTransportPolicy(apiConfig.workerApiUrl, config.proxy);
-  const requestHeaders = buildTaskAuthHeaders(apiConfig);
+  const requestHeaders = buildTaskAuthHeaders(apiConfig, operation);
+  const requestBodyText = options.body === undefined ? undefined : JSON.stringify(options.body);
+  if (requestBodyText !== undefined) requestHeaders["Content-Type"] = "application/json";
   const timeoutMs = config.taskApiTimeoutMs;
   const useProxy = typeof config.proxy === "string" && config.proxy.trim().length > 0 && config.proxy.trim().toLowerCase() !== "direct";
   let status = 0;
@@ -1136,9 +1202,10 @@ async function requestTaskApiJson(apiConfig, config, url, signal) {
     }
     try {
       const response = await memoryRequest({
-        method: "GET",
+        method,
         url: url.toString(),
         headers: requestHeaders,
+        body: requestBodyText,
         timeoutMs,
         signal,
         proxy: config.proxy,
@@ -1151,7 +1218,7 @@ async function requestTaskApiJson(apiConfig, config, url, signal) {
   } else {
     const linked = linkedAbortSignal(signal, timeoutMs);
     try {
-      const response = await fetch(url.toString(), { method: "GET", headers: requestHeaders, signal: linked.signal });
+      const response = await fetch(url.toString(), { method, headers: requestHeaders, body: requestBodyText, signal: linked.signal });
       status = Number(response?.status);
       bodyText = typeof response.text === "function" ? await response.text() : "";
     } catch (error) {
@@ -1206,6 +1273,7 @@ function mapNeedHumanItem(item) {
     title: content,
     hasCheckbox: false,
     body,
+    type: needHumanType(item),
     needHumanId: typeof item.id === "string" ? item.id : typeof item.nh_id === "string" ? item.nh_id : "",
     taskId,
     taskTitle,
@@ -1325,6 +1393,8 @@ export {
   readTasks,
   readTasksFromApi,
   readCloudTaskSnapshotStrict,
+  mapApiTaskSnapshot,
+  hasOpenNeedHuman,
   splitCloudTaskSnapshotStrict,
   parseRoundCloseText,
   parseRoundCloseMessage,

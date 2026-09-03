@@ -38,6 +38,15 @@ window.__ModuleLoader__.load({
           invocation: { kind: "direct" },
           parameters: [],
           result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema() }
+        },
+        {
+          id: "@sagitta/auto-advance#sagittaAutoAdvance/resolveNeedHuman",
+          service: "sagittaAutoAdvance",
+          namespace: "sagittaAutoAdvance",
+          method: "resolveNeedHuman",
+          invocation: { kind: "direct" },
+          parameters: [{ name: "needHumanId", wire: "needHumanId", source: "json", codec: { mode: "strict", typeSymbol: "@sagitta/auto-advance#string", schema: stringSchema() } }],
+          result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#NeedHumanResolution", schema: needHumanResolutionSchema() }
         }
       ]
     };
@@ -74,9 +83,16 @@ window.__ModuleLoader__.load({
           if (!Array.isArray(value.pendingRequests)) throw new Error("invalid pending request list");
           for (const request of value.pendingRequests) {
             if (request === null || typeof request.title !== "string" || typeof request.hasCheckbox !== "boolean" || typeof request.body !== "string") throw new Error("invalid pending request");
+            if ((request.type !== "need" && request.type !== "notify") || typeof request.needHumanId !== "string") throw new Error("invalid typed pending request");
           }
         }
         if (value.pendingRequestsError !== undefined && typeof value.pendingRequestsError !== "string") throw new Error("invalid pending request error");
+        return value;
+      });
+    }
+    function needHumanResolutionSchema() {
+      return strictSchema((value) => {
+        if (value === null || typeof value !== "object" || typeof value.needHumanId !== "string" || typeof value.taskId !== "string" || (value.type !== "need" && value.type !== "notify") || typeof value.status !== "string") throw new Error("invalid need-human resolution");
         return value;
       });
     }
@@ -133,10 +149,16 @@ window.__ModuleLoader__.load({
       .saa-pending-heading { margin-top: 3px; }
       .saa-pending-list { display: grid; gap: 7px; margin: 0 0 4px; padding: 0; list-style: none; }
       .saa-pending-item { display: flex; align-items: flex-start; gap: 9px; padding: 10px 11px; border: 1px solid rgba(110,158,255,.24); border-radius: 12px; background: linear-gradient(145deg,rgba(83,135,234,.14),rgba(255,255,255,.045)); }
+      .saa-pending-item[data-type="notify"] { border-color: rgba(230,174,84,.34); background: linear-gradient(145deg,rgba(230,174,84,.14),rgba(255,255,255,.045)); }
       .saa-pending-checkbox { width: 17px; flex: 0 0 auto; color: #8cb5ff; font-size: 17px; line-height: 1.35; }
-      .saa-pending-content { min-width: 0; }
+      .saa-pending-item[data-type="notify"] .saa-pending-checkbox { color: #f2c56f; }
+      .saa-pending-content { min-width: 0; flex: 1 1 auto; }
       .saa-pending-item-title { color: #edf4ff; font-size: 12px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
       .saa-pending-body { margin-top: 3px; color: #aebed4; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+      .saa-pending-resolve { flex: 0 0 auto; border: 1px solid rgba(242,197,111,.42); border-radius: 8px; padding: 5px 8px; color: #ffe0a0; background: rgba(230,174,84,.12); cursor: pointer; font: inherit; font-size: 11px; white-space: nowrap; }
+      .saa-pending-resolve:hover { background: rgba(230,174,84,.22); }
+      .saa-pending-resolve:disabled { opacity: .55; cursor: wait; }
+      .saa-pending-resolve:focus-visible { outline: 2px solid #f2c56f; outline-offset: 2px; }
       .saa-pending-empty { margin-bottom: 4px; }
       .saa-task-count { color: var(--saa-muted); font-size: 11px; font-weight: 500; }
       .saa-task-scroll { min-height: 0; max-height: min(26rem, 52dvh); flex: 0 1 auto; overflow: auto; overscroll-behavior: contain; scrollbar-color: rgba(142,164,194,.35) transparent; scrollbar-width: thin; }
@@ -243,6 +265,10 @@ window.__ModuleLoader__.load({
     function pendingRequestItems(snapshot) {
       if (!Array.isArray(snapshot?.pendingRequests)) return [];
       return snapshot.pendingRequests.filter((request) => request !== null && typeof request === "object" && typeof request.title === "string");
+    }
+
+    function pendingRequestType(request) {
+      return request?.type === "notify" ? "notify" : "need";
     }
 
     function chooseLatest(items) {
@@ -359,6 +385,7 @@ window.__ModuleLoader__.load({
       let lastState;
       let tasks;
       let taskScrollTop = 0;
+      let resolvingNeedHumanId;
 
       const EDGE_GAP = 8;
 
@@ -423,6 +450,65 @@ window.__ModuleLoader__.load({
         if (!panel.hidden) placePanelAtBall();
       }
 
+      async function resolveNotify(button, request) {
+        const needHumanId = safeText(request?.needHumanId).trim();
+        if (busy || pendingRequestType(request) !== "notify" || needHumanId.length === 0) return;
+        busy = true;
+        resolvingNeedHumanId = needHumanId;
+        render();
+        try {
+          const result = await remoteApi.resolveNeedHuman(needHumanId);
+          if (result?.ok === false) throw new Error(result.error?.message ?? "通知确认失败");
+          await refresh(true);
+        } catch (error) {
+          console.warn("sagitta-auto-advance: notify resolve failed", error);
+        } finally {
+          busy = false;
+          resolvingNeedHumanId = undefined;
+          render();
+        }
+      }
+
+      function appendPendingSection(container, requests, type) {
+        const isNotify = type === "notify";
+        const heading = createElement("div", { class: "saa-task-title saa-pending-heading" });
+        heading.append(
+          createElement("span", {}, isNotify ? "📢 待你确认" : "🔔 待你处理"),
+          createElement("span", { class: "saa-task-count" }, `${requests.length} 项`)
+        );
+        container.append(heading);
+        if (requests.length === 0) {
+          container.append(createElement("div", { class: "saa-empty saa-pending-empty" }, isNotify ? "暂无待确认通知" : "暂无待处理需求"));
+          return;
+        }
+        const pendingList = createElement("ul", { class: "saa-pending-list" });
+        for (const request of requests) {
+          const requestTitle = request.title.trim() || (isNotify ? "未命名通知" : "未命名需求");
+          const requestBody = safeText(request.body).trim();
+          const requestType = pendingRequestType(request);
+          const requestItem = createElement("li", { class: "saa-pending-item", "data-type": requestType });
+          requestItem.append(createElement("span", { class: "saa-pending-checkbox", "aria-hidden": "true" }, isNotify ? "📢" : "•"));
+          const requestContent = createElement("div", { class: "saa-pending-content" });
+          requestContent.append(createElement("div", { class: "saa-pending-item-title" }, requestTitle));
+          if (requestBody.length > 0) requestContent.append(createElement("div", { class: "saa-pending-body" }, requestBody));
+          requestItem.append(requestContent);
+          if (isNotify) {
+            const needHumanId = safeText(request.needHumanId).trim();
+            const resolve = createElement("button", {
+              class: "saa-pending-resolve",
+              type: "button",
+              "aria-label": `确认通知：${requestTitle}`
+            }, resolvingNeedHumanId === needHumanId ? "确认中…" : "确认");
+            resolve.disabled = busy || needHumanId.length === 0;
+            resolve.title = needHumanId.length === 0 ? "缺少 need-human id，无法确认" : "确认后自动关闭通知";
+            resolve.addEventListener("click", () => { void resolveNotify(resolve, request); });
+            requestItem.append(resolve);
+          }
+          pendingList.append(requestItem);
+        }
+        container.append(pendingList);
+      }
+
       function render() {
         // PointerEvent.clientX/Y, getBoundingClientRect(), and fixed left/top
         // are all CSS pixels. Keeping one coordinate space avoids dpr/zoom drift.
@@ -472,30 +558,14 @@ window.__ModuleLoader__.load({
         const groups = taskGroups(tasks);
         const rawContent = rawTaskContent(tasks);
         const pending = pendingRequestItems(tasks);
+        const needs = pending.filter((request) => pendingRequestType(request) === "need");
+        const notifications = pending.filter((request) => pendingRequestType(request) === "notify");
         const taskScroll = createElement("div", { class: "saa-task-scroll" });
-        const pendingTitle = createElement("div", { class: "saa-task-title saa-pending-heading" });
-        pendingTitle.append(createElement("span", {}, "🔔 待处理需求"), createElement("span", { class: "saa-task-count" }, `${pending.length} 项`));
-        taskScroll.append(pendingTitle);
         if (tasks?.pendingRequestsError) {
           taskScroll.append(createElement("div", { class: "saa-error saa-pending-empty" }, `⚠ 待处理需求暂不可用：${tasks.pendingRequestsError}`));
         }
-        if (pending.length === 0) {
-          if (!tasks?.pendingRequestsError) taskScroll.append(createElement("div", { class: "saa-empty saa-pending-empty" }, "暂无待处理需求"));
-        } else {
-          const pendingList = createElement("ul", { class: "saa-pending-list" });
-          for (const request of pending) {
-            const requestTitle = request.title.trim() || "未命名需求";
-            const requestBody = safeText(request.body).trim();
-            const requestItem = createElement("li", { class: "saa-pending-item" });
-            requestItem.append(createElement("span", { class: "saa-pending-checkbox", "aria-hidden": "true" }, "•"));
-            const requestContent = createElement("div", { class: "saa-pending-content" });
-            requestContent.append(createElement("div", { class: "saa-pending-item-title" }, requestTitle));
-            if (requestBody.length > 0) requestContent.append(createElement("div", { class: "saa-pending-body" }, requestBody));
-            requestItem.append(requestContent);
-            pendingList.append(requestItem);
-          }
-          taskScroll.append(pendingList);
-        }
+        appendPendingSection(taskScroll, needs, "need");
+        appendPendingSection(taskScroll, notifications, "notify");
         const taskTitle = createElement("div", { class: "saa-task-title" });
         taskTitle.append(createElement("span", {}, "项目进度"), createElement("span", { class: "saa-task-count" }, `${groups.length} 个项目`));
         taskScroll.append(taskTitle);

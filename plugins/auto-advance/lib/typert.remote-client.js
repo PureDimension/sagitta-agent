@@ -20,7 +20,15 @@ const taskSchema = z.object({
 const pendingRequestSchema = z.object({
   title: z.string().readonly(),
   hasCheckbox: z.boolean().readonly(),
-  body: z.string().readonly()
+  body: z.string().readonly(),
+  type: z.union([z.literal("need"), z.literal("notify")]).readonly(),
+  needHumanId: z.string().readonly()
+}).readonly();
+const needHumanResolutionSchema = z.object({
+  needHumanId: z.string().readonly(),
+  taskId: z.string().readonly(),
+  type: z.union([z.literal("need"), z.literal("notify")]).readonly(),
+  status: z.string().readonly()
 }).readonly();
 const tasksSchema = z.object({
   path: z.string().readonly(),
@@ -66,6 +74,15 @@ export const TYPERT_REMOTE = {
       invocation: { kind: "direct" },
       parameters: [],
       result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema }
+    },
+    {
+      id: "@sagitta/auto-advance#sagittaAutoAdvance/resolveNeedHuman",
+      service: "sagittaAutoAdvance",
+      namespace: "sagittaAutoAdvance",
+      method: "resolveNeedHuman",
+      invocation: { kind: "direct" },
+      parameters: [{ name: "needHumanId", wire: "needHumanId", source: "json", codec: { mode: "strict", typeSymbol: "@sagitta/auto-advance#string", schema: z.string() } }],
+      result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#NeedHumanResolution", schema: needHumanResolutionSchema }
     }
   ]
 };

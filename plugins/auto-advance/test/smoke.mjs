@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,8 @@ import {
   AUTONOMOUS_CHALLENGE,
   buildTaskAuthHeaders,
   isLoopbackUrl,
+  hasOpenNeedHuman,
+  mapApiTaskSnapshot,
   splitCloudTaskSnapshotStrict,
 } from "../lib/service.js";
 
@@ -57,9 +59,62 @@ assert.equal(buildTaskAuthHeaders({ accessClientId: "id", accessClientSecret: "s
 assert.equal(isLoopbackUrl("http://127.0.0.1:8787"), true);
 assert.equal(isLoopbackUrl("https://worker.example.test"), false);
 assert.doesNotMatch(AUTONOMOUS_PROMPT, /round[_-]?close/iu);
+assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "notify", status: "open" }] }), false);
+assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "need", status: "open" }] }), true);
+assert.equal(hasOpenNeedHuman({ open_need_human: true, open_need_human_type: "notify" }), false);
+const mappedNotifyOnly = mapApiTaskSnapshot([
+  task("tsk-notify-only", "in_progress", null, {
+    open_need_human: true,
+    need_humans: [{ type: "notify", status: "open" }],
+  }),
+], "smoke-TASKS.md");
+assert.equal(mappedNotifyOnly.sections[0].items[0].open_need_human, false);
 
 let responseMode = "owned";
-const server = createServer((request, response) => {
+const resolvedRequests = [];
+const pendingNeedHumans = [
+  {
+    id: "nh-notify",
+    type: "notify",
+    content: "部署已完成，可开始验证",
+    task_id: "tsk-mine",
+    task_title: "部署 Sagitta",
+    task_project: "smoke",
+    suggestion: "请在浏览器打开验收页",
+    status: "open",
+    created_at: iso(22),
+  },
+  {
+    id: "nh-need",
+    type: "need",
+    content: "请确认发布窗口",
+    task_id: "tsk-mine",
+    task_title: "部署 Sagitta",
+    task_project: "smoke",
+    status: "open",
+    created_at: iso(21),
+  },
+];
+const server = createServer(async (request, response) => {
+  const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+  const resolveMatch = /^\/task\/need-human\/([^/]+)\/resolve$/u.exec(requestUrl.pathname);
+  if (request.method === "POST" && resolveMatch !== null) {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    resolvedRequests.push({ id: decodeURIComponent(resolveMatch[1]), body, authorization: request.headers.authorization });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, data: {
+      id: decodeURIComponent(resolveMatch[1]), task_id: "tsk-mine", type: "notify", status: "resolved",
+    } }));
+    return;
+  }
+  if (request.method === "GET" && requestUrl.pathname === "/need-human") {
+    const items = pendingNeedHumans.filter((item) => !resolvedRequests.some((resolved) => resolved.id === item.id));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, data: { items, total: items.length, status: "open", source: "cloud" } }));
+    return;
+  }
   const modes = {
     owned: [task("tsk-mine", "in_progress", null, { claim_state: "mine" }, 20)],
     open: [task("tsk-open", "open", null, { claim_state: "unclaimed" }, 20)],
@@ -110,7 +165,7 @@ function makeHarness({ api = true } = {}) {
     taskPageSize: 200,
     proxy: "direct",
     statePath: join(tmpdir(), "sagitta-auto-advance-smoke-state.json"),
-    apiConfig: api ? { workerApiUrl: workerUrl, d1ReadToken: "smoke-token" } : {},
+    apiConfig: api ? { workerApiUrl: workerUrl, d1ReadToken: "smoke-token", d1WriteToken: "smoke-write-token" } : {},
     manager: undefined,
     managerApiConfig: {},
     idleTimeoutMs: 1000,
@@ -150,6 +205,18 @@ try {
   // 有已认领 in_progress 才注入自主推进；提示只带轻量任务清单，取消 round-close 强制。
   responseMode = "owned";
   const ownedHarness = makeHarness();
+  const pendingSnapshot = await ownedHarness.service.getTasks();
+  assert.deepEqual(pendingSnapshot.pendingRequests.map((item) => item.type), ["notify", "need"]);
+  assert.equal(pendingSnapshot.pendingRequests[0].needHumanId, "nh-notify");
+  const resolvedNotify = await ownedHarness.service.resolveNeedHuman("nh-notify");
+  assert.deepEqual(resolvedNotify, { needHumanId: "nh-notify", taskId: "tsk-mine", type: "notify", status: "resolved" });
+  assert.deepEqual(resolvedRequests[0], {
+    id: "nh-notify",
+    body: { resolve_kind: "solved", resolved_by: "ripple" },
+    authorization: "Bearer smoke-write-token",
+  });
+  const refreshedPendingSnapshot = await ownedHarness.service.getTasks();
+  assert.deepEqual(refreshedPendingSnapshot.pendingRequests.map((item) => item.type), ["need"]);
   await ownedHarness.service.onTimer(ownedHarness.state, 1);
   assert.equal(ownedHarness.agent.followups.length, 1);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
@@ -215,8 +282,12 @@ try {
   const stale = await staleHarness.service.getTasks();
   assert.equal(stale.source, "file-stale");
   assert.match(stale.error, /task-api-unavailable/u);
+  const clientSource = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.match(clientSource, /📢 待你确认/u);
+  assert.match(clientSource, /remoteApi\.resolveNeedHuman/u);
+  assert.match(clientSource, /await refresh\(true\)/u);
   rmSync(directory, { recursive: true, force: true });
-  console.log("auto-advance smoke: PASS (task-driven owned/open/terminal branches, need-human quiet wait, cloud defer, stale UI fallback)");
+  console.log("auto-advance smoke: PASS (need/notify mapping, notify resolve POST + refresh, task-driven branches, cloud defer, stale UI fallback)");
 } finally {
   server.close();
 }
