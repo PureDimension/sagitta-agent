@@ -54,6 +54,9 @@ export function pickTask(task) {
   const result = {
     id: String(task.id ?? task.task_id ?? ""),
     project: String(task.project ?? ""),
+    // P2 task-system-v2：normal 是兼容旧 Worker/旧数据的默认值；Worker
+    // 新版本会显式返回 normal|temp。
+    kind: task.kind === "temp" ? "temp" : "normal",
     title: String(task.title ?? ""),
     status: String(task.status ?? ""),
     priority: Number(task.priority ?? 0),

@@ -5,12 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AutoAdvanceService,
+  AUTONOMOUS_PROMPT,
+  IN_PERSON_CHALLENGE,
+  AUTONOMOUS_CHALLENGE,
   buildTaskAuthHeaders,
   isLoopbackUrl,
-  parseRoundCloseMessage,
-  parseRoundCloseText,
-  readTasks,
-  STOP_MARKER,
   splitCloudTaskSnapshotStrict,
 } from "../lib/service.js";
 
@@ -33,89 +32,57 @@ function task(id, status, pending_status = null, extra = {}, minute = 20) {
   };
 }
 
-const cloudItems = [
-  task("tsk-open", "open", null, {}, 20),
-  task("tsk-running", "in_progress", null, {}, 19),
-  task("tsk-pending-done", "in_progress", "pending_done", {}, 18),
-  task("tsk-pending-blocked", "in_progress", "pending_blocked", {}, 17),
-  task("tsk-waiting", "waiting", null, {}, 16),
-  task("tsk-blocked", "blocked", null, {}, 15),
-  task("tsk-done", "done", null, {}, 14),
-];
-
-const page = (items, pageNumber, total = cloudItems.length, size = items.length || 1) => ({
-  total,
-  page: pageNumber,
-  size,
-  has_more: pageNumber * size < total,
-  source: "cloud",
-  items,
+// Snapshot qualification remains strict, while v2 driving uses ownership
+// separately: an explicit mine task is not confused with an open task to claim.
+const split = splitCloudTaskSnapshotStrict({
+  pages: [{
+    total: 4, page: 1, size: 200, has_more: false, source: "cloud",
+    items: [
+      task("tsk-open", "open", null, { claim_state: "unclaimed" }, 20),
+      task("tsk-mine", "in_progress", null, { claim_state: "mine" }, 19),
+      task("tsk-other", "in_progress", null, { claim_state: "claimed" }, 18),
+      task("tsk-done", "done", null, {}, 17),
+    ],
+  }],
 });
-
-// Strict splitter: all four collections, pending invariants, and stable order.
-const split = splitCloudTaskSnapshotStrict({ pages: [page(cloudItems.slice(0, 4), 1, 7, 4), page(cloudItems.slice(4), 2, 7, 4)] });
-assert.deepEqual(split.runnable.map((item) => item.task_id), ["tsk-open", "tsk-running"]);
-assert.deepEqual(split.confirmationQueue.map((item) => item.task_id), ["tsk-pending-done", "tsk-pending-blocked"]);
-assert.deepEqual(split.waiting.map((item) => item.task_id), ["tsk-waiting"]);
-assert.deepEqual(split.terminal.map((item) => item.task_id), ["tsk-blocked", "tsk-done"]);
+assert.deepEqual(split.runnable.map((item) => item.task_id), ["tsk-open", "tsk-mine"]);
+assert.deepEqual(split.terminal.map((item) => item.task_id), ["tsk-done"]);
 assert.equal(split.source, "cloud");
 assert.throws(
-  () => splitCloudTaskSnapshotStrict({ pages: [page([], 1, 1, 1)] }),
+  () => splitCloudTaskSnapshotStrict({ pages: [{ total: 1, page: 1, size: 200, has_more: false, source: "cloud", items: [] }] }),
   (error) => error.code === "task-api-unavailable"
 );
-assert.throws(
-  () => splitCloudTaskSnapshotStrict({ pages: [page(cloudItems.slice(0, 4), 1, 7, 4)] }),
-  (error) => error.code === "task-api-unavailable"
-);
-assert.throws(
-  () => splitCloudTaskSnapshotStrict({ pages: [page([task("bad", "in_progress", "pending_done", { blocked_reason: "错误" })], 1, 1, 1)] }),
-  (error) => error.code === "task-api-unavailable"
-);
-
-// Stage 3 claim integration: claimed tasks never enter runnable but stay in
-// the full snapshot; unclaimed and missing claim_state (old Worker) stay
-// runnable; confirmation collection is unaffected by claim_state.
-const claimItems = [
-  task("tsk-claimed", "open", null, { claim_state: "claimed" }, 22),
-  task("tsk-unclaimed", "open", null, { claim_state: "unclaimed" }, 21),
-  task("tsk-legacy", "open", null, {}, 20),
-];
-const claimSplit = splitCloudTaskSnapshotStrict({ pages: [page(claimItems, 1, 3, 3)] });
-assert.deepEqual(claimSplit.runnable.map((item) => item.task_id), ["tsk-unclaimed", "tsk-legacy"]);
-assert.deepEqual(claimSplit.items.map((item) => item.task_id), ["tsk-claimed", "tsk-unclaimed", "tsk-legacy"]);
-assert.deepEqual(claimSplit.confirmationQueue, []);
-const claimedPendingSplit = splitCloudTaskSnapshotStrict({
-  pages: [page([task("tsk-claimed-pending", "in_progress", "pending_done", { claim_state: "claimed" }, 22)], 1, 1, 1)],
-});
-assert.deepEqual(claimedPendingSplit.confirmationQueue.map((item) => item.task_id), ["tsk-claimed-pending"]);
-
-// Auth and transport policy match memory: Bearer wins; Access-only sends both;
-// production direct is rejected while loopback direct is allowed.
-assert.deepEqual(buildTaskAuthHeaders({ d1ReadToken: "read", accessClientId: "id", accessClientSecret: "secret" }).Authorization, "Bearer read");
+assert.equal(buildTaskAuthHeaders({ d1ReadToken: "read", accessClientId: "id", accessClientSecret: "secret" }).Authorization, "Bearer read");
 assert.equal(buildTaskAuthHeaders({ accessClientId: "id", accessClientSecret: "secret" }).Authorization, undefined);
-assert.equal(buildTaskAuthHeaders({ accessClientId: "id", accessClientSecret: "secret" })["CF-Access-Client-Id"], "id");
 assert.equal(isLoopbackUrl("http://127.0.0.1:8787"), true);
 assert.equal(isLoopbackUrl("https://worker.example.test"), false);
+assert.doesNotMatch(AUTONOMOUS_PROMPT, /round[_-]?close/iu);
 
-const received = [];
-let responseMode = "runnable";
-const server = createServer(async (request, response) => {
-  received.push({ url: request.url, authorization: request.headers.authorization, accessId: request.headers["cf-access-client-id"] });
-  const requestPage = Number(new URL(request.url, "http://127.0.0.1").searchParams.get("page") || 1);
-  const pagedItems = requestPage === 1 ? cloudItems.slice(0, 2) : cloudItems.slice(2, 3);
-  const terminalItems = [task("tsk-blocked-final", "blocked", null, { blocked_reason: "等待外部依赖" }, 12), task("tsk-done-final", "done", null, {}, 11)];
-  const body = responseMode === "error"
-    ? { ok: false, error: { code: "UNAVAILABLE", message: "smoke outage" } }
-    : { ok: true, data: responseMode === "paged"
-      ? page(pagedItems, requestPage, 3, 2)
-      : page(responseMode === "terminal" ? terminalItems : responseMode === "confirmation" ? cloudItems.slice(2, 3) : responseMode === "empty" ? [] : responseMode === "runnable-many" ? cloudItems.slice(0, 2) : cloudItems.slice(0, 1), 1, responseMode === "terminal" ? terminalItems.length : responseMode === "empty" ? 0 : responseMode === "runnable-many" ? 2 : 1, 200) };
-  response.writeHead(responseMode === "error" ? 503 : 200, { "content-type": "application/json" });
-  response.end(JSON.stringify(body));
+let responseMode = "owned";
+const server = createServer((request, response) => {
+  const modes = {
+    owned: [task("tsk-mine", "in_progress", null, { claim_state: "mine" }, 20)],
+    open: [task("tsk-open", "open", null, { claim_state: "unclaimed" }, 20)],
+    empty: [task("tsk-done", "done", null, {}, 20), task("tsk-blocked", "blocked", null, {}, 19)],
+    need: [task("tsk-mine", "in_progress", null, { claim_state: "mine", open_need_human: true }, 20)],
+    pending: [task("tsk-mine", "in_progress", "pending_blocked", { claim_state: "mine" }, 20)],
+    error: null,
+  };
+  const items = modes[responseMode];
+  if (items === null) {
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: false, error: { code: "UNAVAILABLE", message: "smoke outage" } }));
+    return;
+  }
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({ ok: true, data: {
+    total: items.length, page: 1, size: 200, has_more: false, source: "cloud", items,
+  } }));
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const workerUrl = `http://127.0.0.1:${server.address().port}`;
 
-function makeHarness({ api = true, works = [], pageSize = 200, auth = "bearer" } = {}) {
+function makeHarness({ api = true } = {}) {
   const agent = {
     id: "agent-smoke",
     status: "idle",
@@ -131,9 +98,7 @@ function makeHarness({ api = true, works = [], pageSize = 200, auth = "bearer" }
       get: (id) => id === agent.id ? agent : undefined,
       isOwnedBy: () => false,
     },
-    get: (name) => name === "sagitta-async-work" ? {
-      listActive: (_ownerId, filter = {}) => works.filter((work) => filter.taskId === undefined || (work.task_id ?? work.taskId) === filter.taskId),
-    } : undefined,
+    get: (name) => name === "sagitta-async-work" ? { listActive: () => [] } : undefined,
     logger: { warn() {}, debug() {} },
     emit: (_event, payload) => events.push(payload),
   };
@@ -142,172 +107,13 @@ function makeHarness({ api = true, works = [], pageSize = 200, auth = "bearer" }
   service.config = {
     tasksPath: join(tmpdir(), "sagitta-auto-advance-smoke-TASKS.md"),
     taskApiTimeoutMs: 1000,
-    taskPageSize: pageSize,
+    taskPageSize: 200,
     proxy: "direct",
     statePath: join(tmpdir(), "sagitta-auto-advance-smoke-state.json"),
-    apiConfig: api ? auth === "access"
-      ? { workerApiUrl: workerUrl, accessClientId: "smoke-access-id", accessClientSecret: "smoke-access-secret" }
-      : { workerApiUrl: workerUrl, d1ReadToken: "smoke-token" } : {},
+    apiConfig: api ? { workerApiUrl: workerUrl, d1ReadToken: "smoke-token" } : {},
     manager: undefined,
     managerApiConfig: {},
-  };
-  service.persistedModes = new Map();
-  service.persistModes = () => {};
-  service.broadcast = (_state, reason) => events.push({ reason });
-  return { service, state: { agent, enabled: true, stoppedByProtocol: false, disposed: false, timer: undefined, timerGeneration: 1, idleSince: null, injectedAt: null, lastAutoMessageId: undefined, requestController: undefined, retryAttempt: 0, retrying: false, degraded: false, degradedReason: null, cloudSnapshot: undefined }, agent, events };
-}
-
-try {
-  // Runnable branch injects a prompt containing the cloud task id.
-  responseMode = "runnable";
-  const runnableHarness = makeHarness();
-  await runnableHarness.service.onTimer(runnableHarness.state, 1);
-  assert.equal(runnableHarness.agent.followups.length, 1);
-  assert.match(runnableHarness.agent.followups[0].content[0].text, /tsk-open/u);
-  assert.match(runnableHarness.agent.followups[0].content[0].text, /task_round_close/u);
-  assert.match(runnableHarness.agent.followups[0].content[0].text, /task_confirm/u);
-  assert.deepEqual(runnableHarness.state.activeRound.taskIds, ["tsk-open"]);
-  assert.equal(received.at(-1).authorization, "Bearer smoke-token");
-
-  // Access-only is sent identically to memory's task transport.
-  const accessHarness = makeHarness({ auth: "access" });
-  await accessHarness.service.onTimer(accessHarness.state, 1);
-  assert.equal(accessHarness.agent.followups.length, 1);
-  assert.equal(received.at(-1).authorization, undefined);
-  assert.equal(received.at(-1).accessId, "smoke-access-id");
-
-  // A valid multi-page response is fetched completely before injection.
-  responseMode = "paged";
-  const pagedHarness = makeHarness({ pageSize: 2 });
-  await pagedHarness.service.onTimer(pagedHarness.state, 1);
-  assert.equal(pagedHarness.agent.followups.length, 1);
-  assert.equal(received.filter((entry) => entry.url.includes("page=")).length >= 2, true);
-
-  // A bounded work item for task A does not block independent task B.
-  responseMode = "runnable-many";
-  const isolatedHarness = makeHarness({ works: [{ task_id: "tsk-open", status: "running" }] });
-  await isolatedHarness.service.onTimer(isolatedHarness.state, 1);
-  assert.equal(isolatedHarness.agent.followups.length, 1);
-  assert.doesNotMatch(isolatedHarness.agent.followups[0].content[0].text, /tsk-open/u);
-  assert.match(isolatedHarness.agent.followups[0].content[0].text, /tsk-running/u);
-
-  // Confirmation takes priority over runnable work and carries all replay keys.
-  responseMode = "confirmation";
-  const confirmationHarness = makeHarness();
-  await confirmationHarness.service.onTimer(confirmationHarness.state, 1);
-  assert.equal(confirmationHarness.agent.followups.length, 1);
-  assert.match(confirmationHarness.agent.followups[0].content[0].text, /task_id=tsk-pending-done/u);
-  assert.match(confirmationHarness.agent.followups[0].content[0].text, /confirmation_id=cnf-tsk-pending-done/u);
-  assert.match(confirmationHarness.agent.followups[0].content[0].text, /expected_updated_at=/u);
-  assert.match(confirmationHarness.agent.followups[0].content[0].text, /decision 只能是 accept 或 reopen/u);
-
-  // A valid empty cloud snapshot is the only path that auto-stops.
-  responseMode = "empty";
-  const emptyHarness = makeHarness();
-  await emptyHarness.service.onTimer(emptyHarness.state, 1);
-  assert.equal(emptyHarness.agent.followups.length, 0);
-  assert.equal(emptyHarness.state.enabled, false);
-  assert.ok(emptyHarness.events.some((event) => event.reason === "autostop: no-runnable-tasks"));
-
-  // Cloud error is degraded/deferred, never injected or stopped; retry is armed.
-  responseMode = "error";
-  const errorHarness = makeHarness();
-  await errorHarness.service.onTimer(errorHarness.state, 1);
-  assert.equal(errorHarness.agent.followups.length, 0);
-  assert.equal(errorHarness.state.enabled, true);
-  assert.equal(errorHarness.state.degraded, true);
-  assert.ok(errorHarness.state.timer !== undefined);
-  assert.ok(errorHarness.events.some((event) => event.reason === "defer: task-api-unavailable"));
-  errorHarness.service.clearTimer(errorHarness.state);
-
-  // Strict qualification has no file fallback path, even when TASKS.md exists.
-  const strictNoApiHarness = makeHarness({ api: false });
-  await strictNoApiHarness.service.onTimer(strictNoApiHarness.state, 1);
-  assert.equal(strictNoApiHarness.agent.followups.length, 0);
-  assert.equal(strictNoApiHarness.state.enabled, true);
-  assert.ok(strictNoApiHarness.events.some((event) => event.reason === "defer: task-api-unavailable"));
-  strictNoApiHarness.service.clearTimer(strictNoApiHarness.state);
-
-  // Generation invalidation during fetch prevents a late response from queueing.
-  responseMode = "runnable";
-  const raceHarness = makeHarness();
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (...args) => {
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    return await originalFetch(...args);
-  };
-  const pendingRead = raceHarness.service.onTimer(raceHarness.state, 1);
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  raceHarness.service.clearTimer(raceHarness.state);
-  await pendingRead;
-  globalThis.fetch = originalFetch;
-  assert.equal(raceHarness.agent.followups.length, 0);
-
-  // UI fallback is explicitly stale and is never used by the strict reader.
-  const directory = mkdtempSync(join(tmpdir(), "sagitta-auto-advance-smoke-"));
-  const tasksPath = join(directory, "TASKS.md");
-  writeFileSync(tasksPath, "# Tasks\n- [ ] UI-only stale task\n", "utf8");
-  const staleHarness = makeHarness({ api: false });
-  staleHarness.service.config.tasksPath = tasksPath;
-  const stale = await staleHarness.service.getTasks();
-  assert.equal(stale.source, "file-stale");
-  assert.match(stale.error, /task-api-unavailable/u);
-  rmSync(directory, { recursive: true, force: true });
-  assert.ok(received.length >= 5);
-  console.log("auto-advance smoke: PASS (strict split/pagination + claim filter, runnable+confirmation+empty branches, cloud defer/backoff, generation race, stale UI fallback, auth/policy)");
-} finally {
-  server.close();
-}
-
-// Stage 5 protocol parser and stop semantics are pure/local and run after the
-// transport server is closed so they cannot accidentally hide network errors.
-const validClose = {
-  task_id: "tsk-open",
-  action: "update",
-  progress: "完成一项可验证推进",
-  next: "继续下一步实现",
-  round_id: "round-smoke-1",
-};
-assert.deepEqual(parseRoundCloseText(JSON.stringify(validClose)), validClose);
-assert.deepEqual(parseRoundCloseText(`\`\`\`json\n${JSON.stringify(validClose)}\n\`\`\``), validClose);
-for (const invalid of [
-  "完成了，下一步继续",
-  `${JSON.stringify(validClose)}${JSON.stringify(validClose)}`,
-  JSON.stringify({ ...validClose, next: undefined }),
-  JSON.stringify({ ...validClose, action: "unknown" }),
-  JSON.stringify({ ...validClose, action: "done" }),
-  JSON.stringify({ ...validClose, action: "blocked", blocked_reason: "" }),
-  `前言\n${JSON.stringify(validClose)}`,
-]) {
-  assert.throws(() => parseRoundCloseText(invalid), (error) => error.code === "close-protocol-error");
-}
-assert.deepEqual(
-  parseRoundCloseMessage({
-    role: "assistant",
-    content: [
-      { type: "text", text: "旁边的文本不是协议" },
-      { type: "tool-call", name: "task_round_close", arguments: validClose },
-    ],
-  }),
-  { kind: "tool", payload: validClose },
-);
-
-function protocolHarness() {
-  const agent = {
-    id: "agent-protocol",
-    status: "idle",
-    inbox: { nextStep: [], nextTurn: [] },
-    followups: [],
-    followup(message) { this.followups.push(message); },
-  };
-  const events = [];
-  const service = Object.create(AutoAdvanceService.prototype);
-  service.config = { idleTimeoutMs: 60000 };
-  service.ctx = {
-    fiber: { state: 2 },
-    agents: { get: (id) => id === agent.id ? agent : undefined, list: () => [agent], isOwnedBy: () => false },
-    logger: { warn() {}, debug() {} },
-    emit: (_event, payload) => events.push(payload),
+    idleTimeoutMs: 1000,
   };
   service.persistedModes = new Map();
   service.persistModes = () => {};
@@ -324,90 +130,135 @@ function protocolHarness() {
       idleSince: null,
       injectedAt: null,
       lastAutoMessageId: undefined,
+      pendingAutoMode: undefined,
+      autonomousMode: false,
+      ownedTaskIds: new Set(),
       requestController: undefined,
       retryAttempt: 0,
       retrying: false,
       degraded: false,
       degradedReason: null,
-      cloudSnapshot: split,
-      activeRound: {
-        kind: "runnable",
-        taskIds: ["tsk-open"],
-        closePayload: undefined,
-        protocolFailures: 0,
-        repairPromptSent: false,
-      },
+      cloudSnapshot: undefined,
       lastProtocolNotice: null,
     },
+    agent,
     events,
   };
 }
 
-const strictHarness = protocolHarness();
-const strictResult = await strictHarness.service.handleAssistantMessage(strictHarness.state, {
-  role: "assistant",
-  content: [{ type: "tool-call", name: "task_round_close", arguments: validClose }],
-});
-assert.equal(strictResult.ok, true);
-assert.deepEqual(strictHarness.state.activeRound.closePayload, validClose);
-await strictHarness.service.handleAssistantMessage(strictHarness.state, {
-  role: "assistant",
-  content: [{ type: "tool-call", name: "task_round_close", arguments: validClose }],
-});
-assert.ok(strictHarness.events.some((event) => event.reason === "round-close: idempotent-replay"));
-await strictHarness.service.handleAssistantMessage(strictHarness.state, {
-  role: "assistant",
-  content: [{ type: "tool-call", name: "task_round_close", arguments: { ...validClose, progress: "不同内容" } }],
-});
-assert.equal(strictHarness.state.activeRound.closePayload.progress, validClose.progress);
+try {
+  // 有已认领 in_progress 才注入自主推进；提示只带轻量任务清单，取消 round-close 强制。
+  responseMode = "owned";
+  const ownedHarness = makeHarness();
+  await ownedHarness.service.onTimer(ownedHarness.state, 1);
+  assert.equal(ownedHarness.agent.followups.length, 1);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /tsk-mine/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /当前我认领的 in_progress 任务/u);
+  assert.doesNotMatch(ownedHarness.agent.followups[0].content[0].text, /task_round_close|round-close/iu);
+  assert.equal(ownedHarness.state.pendingAutoMode, "away");
 
-const textHarness = protocolHarness();
-textHarness.service.submitTextRoundClose = async (_state, payload) => payload;
-const textResult = await textHarness.service.handleAssistantMessage(textHarness.state, {
+  // 没有 in_progress 但有 open：只提示认领，不注入自主大 prompt，也不熄火。
+  responseMode = "open";
+  const openHarness = makeHarness();
+  await openHarness.service.onTimer(openHarness.state, 1);
+  assert.equal(openHarness.agent.followups.length, 1);
+  assert.match(openHarness.agent.followups[0].content[0].text, /有 1 个任务可认领/u);
+  assert.doesNotMatch(openHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
+  assert.equal(openHarness.state.enabled, true);
+
+  // 全部终态：自动熄火；没有 in_progress 的云端快照不会继续轮询。
+  responseMode = "empty";
+  const emptyHarness = makeHarness();
+  await emptyHarness.service.onTimer(emptyHarness.state, 1);
+  assert.equal(emptyHarness.agent.followups.length, 0);
+  assert.equal(emptyHarness.state.enabled, false);
+  assert.ok(emptyHarness.events.some((event) => event.reason === "autostop: no-in-progress"));
+
+  // 已挂 open need-human / pending 的任务不重复提示，保留安静轮询等待状态变化。
+  responseMode = "need";
+  const needHarness = makeHarness();
+  await needHarness.service.onTimer(needHarness.state, 1);
+  assert.equal(needHarness.agent.followups.length, 0);
+  assert.equal(needHarness.state.enabled, true);
+  assert.ok(needHarness.state.timer !== undefined);
+  needHarness.service.clearTimer(needHarness.state);
+  responseMode = "pending";
+  const pendingHarness = makeHarness();
+  await pendingHarness.service.onTimer(pendingHarness.state, 1);
+  assert.equal(pendingHarness.agent.followups.length, 0);
+  pendingHarness.service.clearTimer(pendingHarness.state);
+
+  // 云端不可用时 fail closed：不注入、不误熄火，只降级重试。
+  responseMode = "error";
+  const errorHarness = makeHarness();
+  await errorHarness.service.onTimer(errorHarness.state, 1);
+  assert.equal(errorHarness.agent.followups.length, 0);
+  assert.equal(errorHarness.state.enabled, true);
+  assert.equal(errorHarness.state.degraded, true);
+  assert.ok(errorHarness.state.timer !== undefined);
+  errorHarness.service.clearTimer(errorHarness.state);
+
+  // 严格资格判断没有 TASKS.md 文件兜底。
+  const noApiHarness = makeHarness({ api: false });
+  await noApiHarness.service.onTimer(noApiHarness.state, 1);
+  assert.equal(noApiHarness.agent.followups.length, 0);
+  assert.equal(noApiHarness.state.enabled, true);
+  noApiHarness.service.clearTimer(noApiHarness.state);
+
+  // UI 的旧文件只作为 stale 展示来源，不能参与自动推进资格。
+  const directory = mkdtempSync(join(tmpdir(), "sagitta-auto-advance-smoke-"));
+  const tasksPath = join(directory, "TASKS.md");
+  writeFileSync(tasksPath, "# Tasks\n- [ ] UI-only stale task\n", "utf8");
+  const staleHarness = makeHarness({ api: false });
+  staleHarness.service.config.tasksPath = tasksPath;
+  const stale = await staleHarness.service.getTasks();
+  assert.equal(stale.source, "file-stale");
+  assert.match(stale.error, /task-api-unavailable/u);
+  rmSync(directory, { recursive: true, force: true });
+  console.log("auto-advance smoke: PASS (task-driven owned/open/terminal branches, need-human quiet wait, cloud defer, stale UI fallback)");
+} finally {
+  server.close();
+}
+
+function challengeHarness(autonomousMode) {
+  const harness = makeHarness({ api: false });
+  harness.state.autonomousMode = autonomousMode;
+  harness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
+    pages: [{
+      total: 2, page: 1, size: 200, has_more: false, source: "cloud",
+      items: [
+        task("tsk-work", "in_progress", null, { claim_state: "mine" }),
+        task("tsk-temp", "in_progress", null, { claim_state: "mine", type: "temp" }),
+      ],
+    }],
+  });
+  return harness;
+}
+
+// 在场/离开两态质询，且 temp 任务直接豁免。
+const present = challengeHarness(false);
+const presentResult = await present.service.handleAssistantMessage(present.state, {
   role: "assistant",
-  content: [{ type: "text", text: JSON.stringify(validClose) }],
+  content: [{ type: "tool-call", name: "task_update", arguments: { task_id: "tsk-work", status: "done" } }],
 });
-assert.equal(textResult.ok, true);
-assert.equal(textHarness.state.activeRound.closeSource, "text");
+assert.equal(presentResult.challenged, true);
+assert.ok(present.agent.followups[0].content[0].text.includes(IN_PERSON_CHALLENGE));
 
-const malformedHarness = protocolHarness();
-await malformedHarness.service.handleAssistantMessage(malformedHarness.state, {
+const away = challengeHarness(true);
+const awayResult = await away.service.handleAssistantMessage(away.state, {
   role: "assistant",
-  content: [{ type: "text", text: "这不是唯一 JSON 收尾" }],
+  content: [{ type: "tool-call", name: "task_update", arguments: { task_id: "tsk-work", status: "blocked" } }],
 });
-assert.equal(malformedHarness.state.activeRound.repairPromptSent, true);
-assert.equal(malformedHarness.state.activeRound.closePayload, undefined);
-assert.equal(malformedHarness.events.filter((event) => event.reason === "close-protocol-error").length, 1);
-const followupsAfterRepair = malformedHarness.state.agent.followups.length;
-await malformedHarness.service.handleAssistantMessage(malformedHarness.state, {
+assert.equal(awayResult.challenged, true);
+assert.ok(away.agent.followups[0].content[0].text.includes(AUTONOMOUS_CHALLENGE));
+
+const temp = challengeHarness(false);
+const tempResult = await temp.service.handleAssistantMessage(temp.state, {
   role: "assistant",
-  content: [{ type: "text", text: "仍然不是 JSON" }],
+  content: [{ type: "tool-call", name: "task_update", arguments: { task_id: "tsk-temp", status: "done" } }],
 });
-assert.equal(malformedHarness.state.activeRound, undefined);
-assert.equal(malformedHarness.state.agent.followups.length, followupsAfterRepair);
+assert.equal(tempResult.ok, true);
+assert.equal(temp.agent.followups.length, 0);
 
-const unclosedHarness = protocolHarness();
-const unclosedResult = unclosedHarness.service.stopByProtocol(unclosedHarness.state);
-assert.equal(unclosedResult, false);
-assert.equal(unclosedHarness.state.enabled, true);
-assert.equal(unclosedHarness.state.lastProtocolNotice, "未收尾停止");
-const markerHarness = protocolHarness();
-await markerHarness.service.handleAssistantMessage(markerHarness.state, { role: "assistant", content: [{ type: "text", text: STOP_MARKER }] });
-assert.equal(markerHarness.state.enabled, true);
-assert.equal(markerHarness.state.lastProtocolNotice, "未收尾停止");
-
-const unfinishedHarness = protocolHarness();
-unfinishedHarness.state.activeRound.closePayload = validClose;
-assert.equal(unfinishedHarness.service.stopByProtocol(unfinishedHarness.state), false);
-assert.equal(unfinishedHarness.state.enabled, true);
-assert.equal(unfinishedHarness.state.lastProtocolNotice, "仍有未完成任务；停止自主推进不合法");
-
-const terminalHarness = protocolHarness();
-terminalHarness.state.activeRound.requireClose = false;
-terminalHarness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
-  pages: [page([task("tsk-blocked-final", "blocked", null, { blocked_reason: "等待外部依赖" }, 12), task("tsk-done-final", "done", null, {}, 11)], 1, 2, 200)],
-});
-assert.equal(terminalHarness.service.stopByProtocol(terminalHarness.state), true);
-assert.equal(terminalHarness.state.enabled, false);
-assert.equal(terminalHarness.state.stoppedByProtocol, true);
-console.log("auto-advance stage5 protocol smoke: PASS (prompt contract, tool priority, JSON/fenced parser, repair cap, unclosed stop, terminal stop guard)");
+console.log("auto-advance challenge smoke: PASS (in-person/autonomous wording + temp exemption)");

@@ -25,6 +25,8 @@ import {
   CONSOLIDATE_ACTIONS,
 } from "./config.js";
 import { pickTask, taskContractError, validateRoundText, validateTaskUpdate, validateClaimLease } from "./task-contract.js";
+import { createTaskGate, installTaskGate } from "./task-gate.js";
+import { recallProjectMemory } from "./task-project-memory.js";
 
 const CONTENT_EXCERPT_MAX = 1200;
 
@@ -164,11 +166,51 @@ function presentCall(name, args, detail) {
   };
 }
 
+function pickNeedHuman(raw) {
+  const src = raw?.need_human ?? raw?.needHuman ?? raw?.item ?? raw ?? {};
+  const resolved = src.status === "resolved" || src.resolved === true || src.resolved_at;
+  return {
+    nh_id: String(src.nh_id ?? src.need_human_id ?? src.id ?? ""),
+    task_id: String(src.task_id ?? src.taskId ?? ""),
+    content: String(src.content ?? ""),
+    suggestion: src.suggestion === undefined || src.suggestion === null ? null : String(src.suggestion),
+    status: resolved ? "resolved" : "open",
+    resolve_kind: src.resolve_kind === undefined || src.resolve_kind === null ? null : String(src.resolve_kind),
+    created_at: String(src.created_at ?? src.created ?? ""),
+    resolved_at: src.resolved_at === undefined || src.resolved_at === null ? null : String(src.resolved_at),
+    updated_at: src.updated_at === undefined || src.updated_at === null ? null : String(src.updated_at),
+  };
+}
+
+function taskListData(data, expectedKind) {
+  const projected = (data?.items || []).map(pickTask);
+  const kindItems = expectedKind
+    ? projected.filter((task) => task.kind === expectedKind)
+    : projected;
+  const serverTotal = Number.isInteger(data?.total) && kindItems.length === projected.length
+    ? data.total
+    : kindItems.length;
+  return {
+    total: serverTotal,
+    items: kindItems,
+  };
+}
+
 // ---- 工具定义 ---------------------------------------------------------------
 
 export function registerMemoryTools(ctx, client) {
   const timeoutMs = client.config.timeoutMs;
   const toolOpts = { ctx, client, timeoutMs };
+  const taskGate = createTaskGate({
+    getAgent: (id) => {
+      try {
+        return ctx?.agents?.get?.(id);
+      } catch {
+        return undefined;
+      }
+    },
+  });
+  const gateInstallation = installTaskGate(ctx, taskGate);
 
   ctx.tools.register(defineTool({
     name: "memory_remember",
@@ -761,6 +803,7 @@ export function registerMemoryTools(ctx, client) {
   const TASK_FIELDS = {
     id: { type: "string", required: true },
     task_id: { type: "string" },
+    kind: { type: "string", required: true, enum: ["normal", "temp"] },
     project: { type: "string", required: true },
     title: { type: "string", required: true },
     status: { type: "string", required: true },
@@ -783,12 +826,27 @@ export function registerMemoryTools(ctx, client) {
   };
   const TASK_STATUSES = ["open", "in_progress", "blocked", "waiting", "done"];
   const TASK_CREATE_STATUSES = ["open", "in_progress", "waiting"];
+  const TASK_KINDS = ["normal", "temp"];
   const TASK_STREAMS = [...STREAMS, "company"];
+  const NEED_HUMAN_STATUSES = ["open", "resolved"];
+  const NEED_HUMAN_RESOLVE_KINDS = ["solved", "abandoned"];
+  const NEED_HUMAN_FIELDS = {
+    nh_id: { type: "string", required: true },
+    task_id: { type: "string", required: true },
+    content: { type: "string", required: true },
+    suggestion: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+    status: { type: "string", required: true, enum: NEED_HUMAN_STATUSES },
+    resolve_kind: { oneOf: [{ type: "string", enum: NEED_HUMAN_RESOLVE_KINDS }, { type: "null" }], required: true },
+    created_at: { type: "string", required: true },
+    resolved_at: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+    updated_at: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+  };
 
   ctx.tools.register(defineTool({
     name: "task_list",
     description:
       "任务列表（云端 D1 tasks 表，docs/task-api-p1.md）：按 project/stream/status/checkbox 过滤；" +
+      "支持 kind=normal|temp；默认只列 normal，并额外带回当前 agent 自己认领的 temp；显式 kind=temp 才列 temp 任务；" +
       "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/updated_at/done_at；" +
       "done/blocked 只有 pending_done/pending_blocked 申请并经 task_confirm accept 后才是终态，pending 时带 confirmation_id；" +
       "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。\n" +
@@ -799,6 +857,7 @@ export function registerMemoryTools(ctx, client) {
       project: { type: "string", description: "项目过滤（如 research/lmy-diffusion-accel、sagitta-agent）。" },
       stream: { type: "string", enum: TASK_STREAMS, description: "流过滤：personal-projects | company-projects | sagitta | ripple | company。" },
       status: { type: "string", enum: TASK_STATUSES, description: "状态过滤。" },
+      kind: { type: "string", enum: TASK_KINDS, description: "任务类型；不传=normal + 当前 agent 已认领的 temp。" },
       checkbox: { type: "integer", description: "1=只列涟漪待处理项；0=只列非 checkbox 项。" },
       page: { type: "integer" },
       size: { type: "integer", description: "每页数量（默认 50）。" },
@@ -829,29 +888,210 @@ export function registerMemoryTools(ctx, client) {
     timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const data = await client.listTasks(
-        {
-          project: args.project,
-          stream: args.stream,
-          status: args.status,
-          checkbox: args.checkbox,
-          page: args.page,
-          size: args.size,
-        },
-        exec.signal
-      );
-      return { total: data.total, items: (data.items || []).map(pickTask) };
+      const filters = {
+        project: args.project,
+        stream: args.stream,
+        status: args.status,
+        checkbox: args.checkbox,
+        agentId: String(exec?.agent?.id ?? "unknown"),
+        page: args.page,
+        size: args.size,
+      };
+      if (args.kind) {
+        return taskListData(await client.listTasks({ ...filters, kind: args.kind }, exec.signal), args.kind);
+      }
+      // Worker 的 include_temp=1 内部按当前 owner 只补回自己仍在租约内的
+      // temp；owner_agent_id 不出响应，也不需要插件自行拼接/暴露 owner。
+      return taskListData(await client.listTasks({ ...filters, includeTemp: 1 }, exec.signal));
     },
-    presentCall: (args) => presentCall("task_list", args, `project=${args.project || ""} status=${args.status || ""} checkbox=${args.checkbox ?? ""}`),
+    presentCall: (args) => presentCall("task_list", args, `project=${args.project || ""} kind=${args.kind || "default"} status=${args.status || ""} checkbox=${args.checkbox ?? ""}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_need_human",
+    description:
+      "给任务记一条 need-human（POST /task/{id}/need-human）：记录需要涟漪参与或决定的内容，" +
+      "不会阻塞你推进其他任务；涟漪处理后用 task_need_human_resolve 解除。",
+    parameters: {
+      task_id: { type: "string", required: true, description: "挂载该 need-human 的任务 id。" },
+      content: { type: "string", required: true, description: "需要涟漪参与/决定的具体内容。" },
+      suggestion: { type: "string", description: "给涟漪的可选建议或候选方案。" },
+    },
+    output: {
+      schema: { type: "object", additionalProperties: false, properties: { ...NEED_HUMAN_FIELDS, message: { type: "string", required: true } } },
+      render: (_args, value) => [{
+        type: "text",
+        text: `## need-human 已记录\n\n- nh_id：${value.nh_id}\n- task_id：${value.task_id}\n- 内容：${value.content}${value.suggestion ? `\n- 建议：${value.suggestion}` : ""}\n\n${value.message}`,
+      }],
+      presentationMeta: (_args, value) => ({ nh_id: value.nh_id, task_id: value.task_id, status: value.status }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const content = typeof args.content === "string" ? args.content.trim() : "";
+      if (!content) throw taskContractError("NEED_HUMAN_CONTENT_REQUIRED", "need-human content 必填");
+      const suggestion = typeof args.suggestion === "string" ? args.suggestion.trim() : "";
+      const created = await client.createNeedHuman(args.task_id, content, suggestion || undefined, exec.signal);
+      const item = pickNeedHuman(created);
+      return {
+        ...item,
+        message: `已为任务 ${item.task_id || args.task_id} 记录 need-human ${item.nh_id}（status=${item.status}）；涟漪处理后请调用 task_need_human_resolve。`,
+      };
+    },
+    presentCall: (args) => presentCall("task_need_human", args, `task=${args.task_id}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_need_human_resolve",
+    description:
+      "解除一条 need-human（POST /task/need-human/{nh_id}/resolve）。resolve_kind=solved 表示已解决，" +
+      "resolve_kind=abandoned 表示算了不做；缺省按 Worker 默认处理。",
+    parameters: {
+      nh_id: { type: "string", required: true, description: "need-human id。" },
+      resolve_kind: { type: "string", enum: NEED_HUMAN_RESOLVE_KINDS, description: "solved（解决）或 abandoned（放弃）。" },
+    },
+    output: {
+      schema: { type: "object", additionalProperties: false, properties: { ...NEED_HUMAN_FIELDS, message: { type: "string", required: true } } },
+      render: (_args, value) => [{
+        type: "text",
+        text: `## need-human 已解除\n\n- nh_id：${value.nh_id}\n- task_id：${value.task_id}\n- 结果：${value.resolve_kind || "（Worker 默认）"}\n- status：${value.status}\n\n${value.message}`,
+      }],
+      presentationMeta: (_args, value) => ({ nh_id: value.nh_id, task_id: value.task_id, status: value.status, resolve_kind: value.resolve_kind }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const resolved = await client.resolveNeedHuman(args.nh_id, args.resolve_kind, exec.signal);
+      const item = pickNeedHuman(resolved);
+      // Current Worker responses do not echo resolve_kind; preserve the
+      // caller's explicit choice in the tool projection when that happens.
+      if (args.resolve_kind && item.resolve_kind === null) item.resolve_kind = args.resolve_kind;
+      return {
+        ...item,
+        message: `已解除 need-human ${item.nh_id || args.nh_id}（${item.resolve_kind || args.resolve_kind || "Worker 默认"}）；若它是任务最后一条 open need-human，Worker 可据状态机继续处理该任务。`,
+      };
+    },
+    presentCall: (args) => presentCall("task_need_human_resolve", args, `nh=${args.nh_id} kind=${args.resolve_kind || "default"}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "need_human_list",
+    description:
+      "跨任务汇聚 need-human（GET /need-human）。默认只列 status=open 的待涟漪处理项；" +
+      "显式传 status=resolved 可查历史已解除条目。",
+    parameters: {
+      status: { type: "string", enum: NEED_HUMAN_STATUSES, description: "默认 open；可传 resolved 查看已解除条目。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          status: { type: "string", required: true, enum: NEED_HUMAN_STATUSES },
+          total: { type: "integer", required: true },
+          items: { type: "array", required: true, items: { type: "object", additionalProperties: false, properties: NEED_HUMAN_FIELDS } },
+          message: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text: value.items.length === 0
+          ? `## need-human 列表（${value.status}）\n\n（无条目）\n\n${value.message}`
+          : `## need-human 列表（${value.status}，${value.total} 条）\n\n` +
+            value.items.map((item) => `- **${item.nh_id}** · task=${item.task_id} · ${item.content}${item.suggestion ? `（建议：${item.suggestion}）` : ""}`).join("\n") +
+            `\n\n${value.message}`,
+      }],
+      presentationMeta: (_args, value) => ({ status: value.status, total: value.total }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const status = args.status || "open";
+      const data = await client.listNeedHuman(status, exec.signal);
+      const rawItems = data?.items || data?.need_humans || data?.needHuman || [];
+      const items = rawItems.map(pickNeedHuman);
+      return {
+        status,
+        total: Number.isInteger(data?.total) ? data.total : items.length,
+        items,
+        message: status === "open"
+          ? "这些条目就是当前待涟漪处理事项；处理后请记得调用 task_need_human_resolve 清账。"
+          : `已列出 status=${status} 的 need-human 历史条目。`,
+      };
+    },
+    presentCall: (args) => presentCall("need_human_list", args, `status=${args.status || "open"}`),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "task_assert_bound",
+    description:
+      "执行型工具的任务绑定自查。传 task_id 时检查该任务是否是当前 agent 已认领且仍为 in_progress 的 normal/temp；" +
+      "不传时检查当前 agent 是否至少有一个这样的认领。无绑定会拒绝并提示先 task_claim。",
+    parameters: {
+      task_id: { type: "string", description: "可选的明确任务 id；不传则检查当前 agent 的全部本地认领。" },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          bound: {
+            type: "array",
+            required: true,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                task_id: { type: "string", required: true },
+                kind: { type: "string", required: true, enum: ["normal", "temp"] },
+                status: { type: "string", required: true, const: "in_progress" },
+              },
+            },
+          },
+          message: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text: `## 任务门禁自查通过\n\n${value.message}\n` +
+          value.bound.map((item) => `- ${item.task_id}（${item.kind} · ${item.status}）`).join("\n"),
+      }],
+      presentationMeta: (_args, value) => ({ boundCount: value.bound.length, taskIds: value.bound.map((item) => item.task_id) }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const bound = taskGate.assertBound(args.task_id, exec.agent).map((item) => ({
+        task_id: item.taskId,
+        kind: item.kind,
+        status: item.status,
+      }));
+      if (bound.length === 0) {
+        throw taskContractError(
+          "TASK_NOT_BOUND",
+          args.task_id
+            ? `task_id=${args.task_id} 尚未被当前 agent 认领；请先调用 task_claim`
+            : "当前 agent 没有已认领的 in_progress normal/temp 任务；请先调用 task_claim"
+        );
+      }
+      return {
+        bound,
+        message: args.task_id
+          ? `task_id=${args.task_id} 已绑定，可执行重活。`
+          : "当前 agent 至少有一个已认领任务，可执行重活。",
+      };
+    },
+    presentCall: (args) => presentCall("task_assert_bound", args, `task=${args.task_id || "current"}`),
   }));
 
   ctx.tools.register(defineTool({
     name: "task_create",
     description:
-      "创建任务（云端 D1 tasks 表）：project（项目）+ title 必填；status 默认 open；priority 默认 0；" +
+      "创建任务（云端 D1 tasks 表）：kind=normal|temp（默认 normal）；normal 任务需 project，temp 可不传 project；title 必填；status 默认 open；priority 默认 0；" +
       "checkbox=1 表示涟漪待处理项（会出现在悬浮窗\"待处理需求\"区）；stream 默认 company。管理字段由服务端生成。",
     parameters: {
-      project: { type: "string", required: true, description: "所属项目（与 TASKS.md §1 分类对齐，如 research/lmy-diffusion-accel）。" },
+      kind: { type: "string", enum: TASK_KINDS, description: "normal（默认，正式任务）或 temp（临时小事；可无 project）。" },
+      project: { type: "string", description: "所属项目；normal 必填，temp 可省略。" },
       title: { type: "string", required: true, description: "条目一行描述。" },
       status: { type: "string", enum: TASK_CREATE_STATUSES, description: "默认 open；done/blocked 必须通过 task_update 或 task_round_close 申请后再 task_confirm。" },
       priority: { type: "integer", description: "0 普通 / 1 高 / 2 紧急（默认 0）。" },
@@ -871,8 +1111,12 @@ export function registerMemoryTools(ctx, client) {
     timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
+      const kind = args.kind || "normal";
+      const project = typeof args.project === "string" ? args.project.trim() : "";
+      if (kind === "normal" && !project) throw new Error("task_create：normal 任务必须提供 project；temp 任务可省略 project。");
       const body = {
-        project: args.project.trim(),
+        kind,
+        ...(project ? { project } : {}),
         title: args.title.trim(),
         ...(args.status ? { status: args.status } : {}),
         ...(args.priority !== undefined ? { priority: args.priority } : {}),
@@ -883,7 +1127,7 @@ export function registerMemoryTools(ctx, client) {
       const created = await client.createTask(body, exec.signal);
       return { ...pickTask(created), message: `已创建任务 ${created.id}` };
     },
-    presentCall: (args) => presentCall("task_create", args, `project=${args.project} title=${JSON.stringify(args.title).slice(0, 40)}`),
+    presentCall: (args) => presentCall("task_create", args, `kind=${args.kind || "normal"} project=${args.project || ""} title=${JSON.stringify(args.title).slice(0, 40)}`),
   }));
 
   ctx.tools.register(defineTool({
@@ -938,8 +1182,13 @@ export function registerMemoryTools(ctx, client) {
         ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
       };
       if (Object.keys(body).length === 0) throw new Error("task_update 至少需要更新一个字段。");
-      const updated = await client.patchTask(args.task_id, body, exec.signal);
+      const updated = await client.patchTask(args.task_id, body, exec.signal, String(exec?.agent?.id ?? "unknown"));
       const task = pickTask(updated);
+      // Worker 将非终态任务切到 waiting/open 时会同时释放租约；同步本地
+      // 非敏感绑定，避免后续执行型工具误把旧认领当作仍然有效。
+      if (task.status === "waiting" || task.status === "open") {
+        taskGate.forgetClaim(task.id || args.task_id, exec.agent);
+      }
       const message = task.pending_status
         ? `已提交 ${task.pending_status} 申请（任务仍为 ${task.status}，未进入终态）；请用 task_confirm accept 确认，confirmation_id=${task.confirmation_id || "缺失"}，updated_at=${task.updated_at || "缺失"}`
         : `已更新任务 ${task.id}`;
@@ -978,7 +1227,8 @@ export function registerMemoryTools(ctx, client) {
         text:
           `## 任务已认领\n\n**${value.title}**（${value.id} · ${value.project} · status=${value.status}）\n` +
           `- claim_state=${value.claim_state ?? "claimed"}（租约内，他人不可认领）\n` +
-          `- ⚠ 已向你下发 claim_token（不在列表/日志/记忆回显）；本会话内保管，task_release 释放时需要它`,
+          `- ⚠ 已向你下发 claim_token（不在列表/日志/记忆回显）；本会话内保管，task_release 释放时需要它\n\n` +
+          value.message,
       }],
       presentationMeta: (_args, value) => ({ id: value.id, status: value.status, claim_state: value.claim_state ?? "claimed" }),
     },
@@ -987,7 +1237,11 @@ export function registerMemoryTools(ctx, client) {
     async execute(args, exec) {
       // 本地先拦明显非法的租约（省一次往返；服务端仍把关，错误码一致）
       const leaseSeconds = validateClaimLease(args.lease_seconds);
-      const claimed = await client.claimTask(args.task_id, { leaseSeconds }, exec.signal);
+      const claimed = await client.claimTask(
+        args.task_id,
+        { leaseSeconds, agentId: String(exec?.agent?.id ?? "unknown") },
+        exec.signal
+      );
       const task = pickTask(claimed);
       const token = typeof claimed.claim_token === "string" && claimed.claim_token.length > 0 ? claimed.claim_token : null;
       if (!token) {
@@ -996,10 +1250,23 @@ export function registerMemoryTools(ctx, client) {
           `请重试 task_claim，或直接用 task_update 推进并依赖服务端租约判定。`
         );
       }
+      taskGate.recordClaim(task, exec.agent);
+      let memoryNote = "";
+      if (task.project) {
+        try {
+          memoryNote = (await recallProjectMemory(client, task, exec.signal)).note;
+        } catch (error) {
+          // 认领已由 Worker 成功提交；项目记忆是附加上下文，召回失败不
+          // 回滚认领，但必须把缺口显式告诉模型，避免伪装成已注入。
+          memoryNote = `项目记忆暂未召回（${error?.message ?? String(error)}）；如需更多项目背景，可调用 memory_recall domain=projects/${task.project} 查询`;
+        }
+      }
       return {
         ...task,
         claim_token: token,
-        message: `已认领任务 ${task.id}（claim_state=${task.claim_state ?? "claimed"}）；claim_token 仅本次返回，请在本会话内存中保管（task_release 释放需要它）。`,
+        message:
+          `已认领任务 ${task.id}（claim_state=${task.claim_state ?? "claimed"}）；claim_token 仅本次返回，请在本会话内存中保管（task_release 释放需要它）。` +
+          (memoryNote ? `\n\n${memoryNote}` : ""),
       };
     },
     presentCall: (args) => presentCall("claim", args, `id=${args.task_id} lease=${args.lease_seconds ?? "default"}`),
@@ -1036,6 +1303,7 @@ export function registerMemoryTools(ctx, client) {
     async execute(args, exec) {
       const released = await client.releaseTask(args.task_id, args.claim_token, exec.signal);
       const task = pickTask(released);
+      taskGate.forgetClaim(task.id || args.task_id, exec.agent);
       return {
         ...task,
         message: `已释放任务 ${task.id} 的认领（claim_state=${task.claim_state ?? "unclaimed"}${task.status === "open" ? "，任务已回到未认领" : `，status=${task.status}`}）。`,
@@ -1096,6 +1364,7 @@ export function registerMemoryTools(ctx, client) {
         confirmation_id: args.confirmation_id,
       }, exec.signal);
       const task = pickTask(result);
+      if (task.status === "done" || task.status === "blocked") taskGate.forgetAll(task.id || args.task_id);
       return {
         task_id: String(result.task_id ?? task.id ?? args.task_id),
         status: task.status,
@@ -1245,6 +1514,8 @@ export function registerMemoryTools(ctx, client) {
     },
     presentCall: (args) => presentCall("task_search", args, `query=${JSON.stringify(args.query)}`),
   }));
+
+  return { taskGate, gateMode: gateInstallation.mode };
 }
 
 // ---- 系统提示词引导（工具使用纪律 + §4 v1.3 分数驱动信任轨道） ----------------
@@ -1258,8 +1529,10 @@ export const MEMORY_PROMPT_GUIDANCE = `记忆工具（sagitta-memory）——设
 
 信任轨道（v1.3 分数驱动，防过拟合）：score 0~3 钳制；score≥1→digested、≥2→corroborated（ack 提交自动联动，无需手动升级）；validated 由验证事件承载（不是认可次数堆出来的）；score=3 固化档（"已固化，若不与当前场景冲突建议遵循"）；score=2 无提示；score 0~1 "尚未经过多次强化，不一定可信"。delegatee=ripple 仅涟漪实际输入背书时记录，AI 无权代填。密钥/明文永不写入任何记忆条目（L1 硬规则）。
 
-任务工具（task API v2）：task_update 的参数仅限 status/priority/body/title/checkbox/blocked_reason（可带 expected_updated_at），不得传 done_at/pending_status/confirm。done/blocked 只提交 pending_done/pending_blocked 申请并返回 confirmation_id，必须 task_confirm accept 才进入终态；blocked 必须有 blocked_reason。每轮用 task_round_close 写 progress/next，二者 trim 后各 1–1000 字符且不得有控制字符或换行；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。
+任务工具（task API v2）：task_create 的 kind=normal|temp；normal 必须 project，temp 可无根。task_list 不传 kind 时只列 normal 并补当前 agent 已认领 temp；显式 kind=temp 才查 temp。task_need_human/task_need_human_resolve/need_human_list 负责需要涟漪参与事项的记账、解除和跨任务汇聚。task_update 的参数仅限 status/priority/body/title/checkbox/blocked_reason（可带 expected_updated_at），不得传 done_at/pending_status/confirm。done/blocked 只提交 pending_done/pending_blocked 申请并返回 confirmation_id，必须 task_confirm accept 才进入终态；blocked 必须有 blocked_reason。每轮用 task_round_close 写 progress/next，二者 trim 后各 1–1000 字符且不得有控制字符或换行；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。
 
-认领制（task-ownership-p2 §6）：任务带 claim_state——unclaimed=未认领（可 task_claim）；claimed=他人认领中（租约内），未认领才可认领。task_claim 成功是模型获得 claim_token 的唯一途径（唯一一次下发，不进列表/日志）；你持有某任务的 token 即视为自己认领的（mine），可继续推进或 task_release 释放；token 丢失=失去对该任务的继续操作权（可等租约过期重新认领）。task_release 需 task_id+claim_token，token 不匹配 403；他人认领中的任务 PATCH in_progress 会 409 拒绝——先 task_claim。claim_token 属敏感凭证，绝不写入任何日志/记忆/持久化。`;
+认领制与工具门禁（task-ownership-p2 / task-system-v2 §3.1）：任务带 claim_state——unclaimed=未认领（可 task_claim）；claimed=他人认领中（租约内），未认领才可认领。task_claim 成功是模型获得 claim_token 的唯一途径（唯一一次下发，不进列表/日志）；你持有某任务的 token 即视为自己认领的（mine），可继续推进或 task_release 释放；token 丢失=失去对该任务的继续操作权（可等租约过期重新认领）。task_release 需 task_id+claim_token，token 不匹配 403；他人认领中的任务 PATCH in_progress 会 409 拒绝——先 task_claim。claim_token 属敏感凭证，绝不写入任何日志/记忆/持久化。DSH 已注册全局单调 guard：write/edit/pwsh/codex_dispatch/subagent/async_register 等执行型工具必须已有当前 agent 的 in_progress normal/temp 认领；读/搜索/讨论类工具自由。执行重活前可调用 task_assert_bound 自查；无绑定会拒绝。
 
-export { pickTask };
+task_claim 成功且任务有 project 时，会自动召回 domain=projects/{project} 的最新项目记忆并注入返回；无根 temp/无 project 不召回。`;
+
+export { pickNeedHuman, pickTask };

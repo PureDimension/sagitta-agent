@@ -88,7 +88,12 @@ function apply(ctx, config) {
     text: MEMORY_PROMPT_GUIDANCE,
   });
 
-  registerMemoryTools(ctx, client);
+  const taskTools = registerMemoryTools(ctx, client);
+  try {
+    ctx.logger?.info(`sagitta-memory 任务门禁=${taskTools?.gateMode === "global-guard" ? "global-guard" : "prompt+assert（DSH 无 tools.guard）"}`);
+  } catch {
+    /* logger 不可用时静默 */
+  }
 }
 
 export { Config, apply, inject, name };

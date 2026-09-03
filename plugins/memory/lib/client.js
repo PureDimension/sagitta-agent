@@ -261,7 +261,7 @@ export class SagittaMemoryClient {
     return runtime;
   }
 
-  async request(path, { method = "GET", operation = method === "GET" ? "read" : "write", query, body, signal } = {}) {
+  async request(path, { method = "GET", operation = method === "GET" ? "read" : "write", query, body, signal, agentId } = {}) {
     const runtime = this.getRuntimeConfig(operation);
     if (!runtime.baseUrl || (!runtime.auth.accessPresent && !runtime.auth.bearerPresent)) {
       throw missingConfigurationError(operation, runtime);
@@ -276,10 +276,13 @@ export class SagittaMemoryClient {
     }
     let response;
     try {
+      const headers = buildAuthHeaders(runtime.auth);
+      const callerAgentId = textValue(agentId);
+      if (callerAgentId) headers["X-Agent-Id"] = callerAgentId;
       response = await request({
         method,
         url,
-        headers: buildAuthHeaders(runtime.auth),
+        headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         timeoutMs: runtime.timeoutMs,
         signal,
@@ -370,15 +373,23 @@ export class SagittaMemoryClient {
   // ---- task API（docs/task-api-p1.md；/task 路由 08-30 部署上线）----
 
   async listTasks(filters = {}, signal) {
-    const { project, stream, status, checkbox, page, size } = filters;
+    const { project, stream, status, checkbox, kind, owner, includeTemp, include_temp: includeTempSnake, agentId, page, size } = filters;
     const query = {};
     if (project) query.project = project;
     if (stream) query.stream = stream;
     if (status) query.status = status;
     if (checkbox !== undefined && checkbox !== null && checkbox !== "") query.checkbox = String(checkbox);
+    if (kind) query.kind = kind;
+    // owner is a server-side view selector (normally "me"); the owner id is
+    // intentionally never sent by the plugin or exposed to the model.
+    if (owner) query.owner = owner;
+    const includeTempValue = includeTemp ?? includeTempSnake;
+    if (includeTempValue !== undefined && includeTempValue !== null) {
+      query.include_temp = includeTempValue === true ? "1" : includeTempValue === false ? "0" : String(includeTempValue);
+    }
     if (page !== undefined) query.page = page;
     if (size !== undefined) query.size = size;
-    return await this.request("/task", { method: "GET", operation: "read", query, signal });
+    return await this.request("/task", { method: "GET", operation: "read", query, signal, agentId });
   }
 
   async getTask(id, signal) {
@@ -389,8 +400,8 @@ export class SagittaMemoryClient {
     return await this.request("/task", { method: "POST", operation: "write", body: payload, signal });
   }
 
-  async patchTask(id, payload, signal) {
-    return await this.request(`/task/${encodeURIComponent(id)}`, { method: "PATCH", operation: "write", body: payload, signal });
+  async patchTask(id, payload, signal, agentId) {
+    return await this.request(`/task/${encodeURIComponent(id)}`, { method: "PATCH", operation: "write", body: payload, signal, agentId });
   }
 
   /**
@@ -401,10 +412,10 @@ export class SagittaMemoryClient {
    * @param {string} id 任务 id
    * @param {{leaseSeconds?: number}} [opts] lease_seconds（1~604800 秒，缺省=全局默认 24h）
    */
-  async claimTask(id, { leaseSeconds } = {}, signal) {
+  async claimTask(id, { leaseSeconds, agentId } = {}, signal) {
     const body = {};
     if (leaseSeconds !== undefined && leaseSeconds !== null) body.lease_seconds = leaseSeconds;
-    return await this.request(`/task/${encodeURIComponent(id)}/claim`, { method: "POST", operation: "write", body, signal });
+    return await this.request(`/task/${encodeURIComponent(id)}/claim`, { method: "POST", operation: "write", body, signal, agentId });
   }
 
   /**
@@ -420,6 +431,43 @@ export class SagittaMemoryClient {
       method: "POST",
       operation: "write",
       body: { claim_token: claimToken },
+      signal,
+    });
+  }
+
+  /** 记录任务需要涟漪参与/决定（task-system-v2 §2.3）。 */
+  async createNeedHuman(taskId, content, suggestion, signal) {
+    const body = {
+      content,
+      ...(suggestion !== undefined && suggestion !== null ? { suggestion } : {}),
+    };
+    return await this.request(`/task/${encodeURIComponent(taskId)}/need-human`, {
+      method: "POST",
+      operation: "write",
+      body,
+      signal,
+    });
+  }
+
+  /** 解决/放弃一条 need-human。 */
+  async resolveNeedHuman(needHumanId, resolveKind, signal) {
+    const body = resolveKind === undefined || resolveKind === null
+      ? {}
+      : { resolve_kind: resolveKind };
+    return await this.request(`/task/need-human/${encodeURIComponent(needHumanId)}/resolve`, {
+      method: "POST",
+      operation: "write",
+      body,
+      signal,
+    });
+  }
+
+  /** 跨任务汇聚 need-human（默认由调用方传 status=open）。 */
+  async listNeedHuman(status, signal) {
+    return await this.request("/need-human", {
+      method: "GET",
+      operation: "read",
+      ...(status ? { query: { status } } : {}),
       signal,
     });
   }

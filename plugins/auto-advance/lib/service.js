@@ -4,32 +4,17 @@ import { homedir } from "node:os";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { splitCloudTaskSnapshotStrict, validateCloudTaskPage, MAX_PAGE_SIZE } from "./snapshot.js";
+// Kept as a compatibility export for older consumers. v2 no longer invokes
+// these parsers or injects a round-close requirement.
 import { parseRoundCloseMessage, parseRoundCloseText, validateRoundClosePayload } from "./round-close.js";
 
 /**
- * Model-facing v2 protocol. Keep the explicit state-machine wording here:
- * this prompt is part of the autonomous continuation contract.
+ * Model-facing v2 prompt. Task state is written by the memory task tools;
+ * auto-advance only decides whether there is owned work worth continuing.
  */
-const AUTONOMOUS_PROMPT = `当前用户处于离开模式。你只能依据本消息末尾注入的完整云端 runnable 清单自主推进。
-
-任务选择与新增：
-- 本轮只能选择清单中的 task_id；清单外任务不属于本轮可推进范围。
-- 有新想法时先调用 task_create；创建后必须等待下一次完整云端快照，不能在本轮直接推进新任务。
-- 开始一个任务时先用 task_update(status=in_progress) 明确置为进行中；不要从自然语言猜测任务状态。
-- 认领说明：清单任务均为未认领（claim_state=unclaimed），可直接用 task_claim 认领后推进；他人认领中的任务不会出现在清单。
-
-每轮收尾（出向协议）：
-- 只要本轮选择了任务，必须调用一次 task_round_close；progress 和 next 必填，round_id 必须是本轮唯一值。
-- action=update 只记录本轮进展，action=done/blocked 只是申请 pending_done/pending_blocked，不是终态；done/blocked 必须带 expected_updated_at，blocked 还必须填写 blocked_reason。
-- 终态只能由 task_confirm(decision=accept|reopen) 确认。task_update 或 task_round_close 的 done/blocked 申请成功后，必须等待确认质询并按其中的 task_id、pending_status、expected_updated_at、confirmation_id 调用 task_confirm；不得用普通 PATCH 或自然语言确认代替。
-- 不要把“完成了”“阻塞了”或其它自然语言当作结构化收尾；规范通道是工具调用。若工具不可用，兼容 JSON 也必须是一个完整且唯一的 round-close 对象，不得夹带解释。
-
-停止条件：
-- 只有云端快照确认所有任务均为 done 或 blocked，且不存在任何 pending 申请时，才允许输出【停止自主推进】。
-- 若本轮选择过任务，必须先完成本轮 task_round_close；没有 close 时不得用停止标记掩盖未收尾。
-- 仍有 open/in_progress/waiting/pending 任务时继续推进、等待下一次确认质询或报告阻塞，不得输出停止标记。
-
-异步工作：若某任务有活跃的有界工作，只等待该任务；其它 task_id 的 runnable 任务仍可推进。不要重复派发或打断正在运行的工作，所有 codex 派发走 codex_dispatch。`;
+const AUTONOMOUS_PROMPT = "涟漪已离开。请继续尽可能多完成下面已由你认领的 in_progress 任务；先做能自主推进的工作，并在完成或阻塞前自测、自查、核对验收点。终态请使用任务工具更新。";
+const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？是否已对交付内容做了审计（自测/自查）？若标 blocked，请确认已没有自主可推进部分；若标 done，请确认交付完整且没有 open need-human。";
+const AUTONOMOUS_CHALLENGE = "涟漪已离开。确认没有能自主推进的部分了？若需涟漪，记 need-human 后标 blocked；若完成，确认验收点都过了再 done。标记 blocked 前应先把能拆的拆、能自测的自测。";
 
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
@@ -112,14 +97,6 @@ function completeTaskApiConfig(config) {
   // （Bearer d1ReadToken，或 Cloudflare Access 双 key——网关放行后免 Bearer）。
   const accessComplete = normalized.accessClientId !== undefined && normalized.accessClientSecret !== undefined;
   return normalized.workerApiUrl !== undefined && (normalized.d1ReadToken !== undefined || accessComplete)
-    ? normalized
-    : undefined;
-}
-
-function completeTaskApiWriteConfig(config) {
-  const normalized = normalizeTaskApiConfig(config);
-  const accessComplete = normalized.accessClientId !== undefined && normalized.accessClientSecret !== undefined;
-  return normalized.workerApiUrl !== undefined && (normalized.d1WriteToken !== undefined || accessComplete)
     ? normalized
     : undefined;
 }
@@ -211,14 +188,6 @@ function isExactStopMessage(message) {
   return message?.role === "assistant" && extractText(message.content).includes(STOP_MARKER);
 }
 
-function isStopOnlyMessage(message) {
-  return isExactStopMessage(message) && extractText(message.content).trim() === STOP_MARKER;
-}
-
-function looksLikeRoundCloseText(message) {
-  return /^\s*(?:\{|```)/u.test(extractText(message?.content));
-}
-
 function isTerminalCloudSnapshot(snapshot) {
   return snapshot?.source === "cloud" && Array.isArray(snapshot.items) &&
     snapshot.items.every((task) =>
@@ -228,6 +197,79 @@ function isTerminalCloudSnapshot(snapshot) {
 
 function isAutoAdvanceMessage(message, state) {
   return message?.id !== undefined && message.id === state.lastAutoMessageId;
+}
+
+function toolCallBlocks(message) {
+  const blocks = [];
+  if (Array.isArray(message?.content)) {
+    blocks.push(...message.content.filter((block) => {
+      const type = typeof block?.type === "string" ? block.type.toLowerCase() : "";
+      return type === "tool-call" || type === "tool_call" || type === "tool_use" || type === "tool-use" ||
+        type === "function-call" || type === "function_call" || type === "function" ||
+        (type === "tool" && (block?.arguments !== undefined || block?.input !== undefined || block?.args !== undefined));
+    }));
+    blocks.push(...message.content.filter((block) => {
+      const type = typeof block?.type === "string" ? block.type.toLowerCase() : "";
+      return (type === "tool-result" || type === "tool_result" || type === "tool-output" || type === "tool_output") && toolName(block) !== undefined;
+    }));
+  }
+  for (const key of ["tool_calls", "toolCalls", "function_calls", "functionCalls"]) {
+    if (Array.isArray(message?.[key])) blocks.push(...message[key]);
+  }
+  return blocks;
+}
+
+function toolName(block) {
+  return block?.name ?? block?.tool_name ?? block?.toolName ?? block?.function?.name ?? block?.tool?.name;
+}
+
+function toolArguments(block) {
+  const value = block?.arguments ?? block?.input ?? block?.args ?? block?.parameters ?? block?.function?.arguments ?? block?.tool?.arguments;
+  if (typeof value !== "string") return isRecord(value) ? value : {};
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function toolSucceeded(block) {
+  const result = block?.result ?? block?.output ?? block?.response ?? block?.return_value;
+  return isRecord(result) && (typeof result.claim_token === "string" || result.claim_state === "mine" || result.claimed === true);
+}
+
+function taskIdFromArgs(args) {
+  const value = args?.task_id ?? args?.taskId ?? args?.id;
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function taskType(value) {
+  const type = value?.type ?? value?.task_type ?? value?.taskType ?? value?.kind;
+  return typeof type === "string" ? type.trim().toLowerCase() : "";
+}
+
+function isTempTask(task, args = {}) {
+  const type = taskType(task) || taskType(args);
+  return type === "temp" || type === "temporary";
+}
+
+function hasOpenNeedHuman(task) {
+  if (!isRecord(task)) return false;
+  if (task.open_need_human === true || task.has_open_need_human === true || Number(task.open_need_human_count) > 0) return true;
+  for (const key of ["need_human", "needHuman"]) {
+    const value = task[key];
+    if (value === true) return true;
+    if (isRecord(value) && (value.status === undefined || value.status === "open")) return true;
+  }
+  for (const key of ["need_humans", "needHumans"]) {
+    if (Array.isArray(task[key]) && task[key].some((item) => item?.status === undefined || item?.status === "open")) return true;
+  }
+  return false;
+}
+
+function taskIsTerminal(task) {
+  return (task?.status === "done" || task?.status === "blocked") && task?.pending_status === null;
 }
 
 /**
@@ -275,7 +317,9 @@ class AutoAdvanceService extends TypertRemoteService {
       state.retryAttempt = 0;
       state.degraded = false;
       state.degradedReason = null;
-      state.activeRound = undefined;
+      state.ownedTaskIds = new Set();
+      state.autonomousMode = false;
+      state.pendingAutoMode = undefined;
       state.lastProtocolNotice = null;
       this.resetTimer(state, "session-start");
     });
@@ -290,9 +334,13 @@ class AutoAdvanceService extends TypertRemoteService {
       if (isAutoAdvanceMessage(message, state)) {
         this.clearTimer(state);
         state.idleSince = null;
+        state.autonomousMode = state.pendingAutoMode === "away";
+        state.pendingAutoMode = undefined;
         this.broadcast(state);
         return;
       }
+      state.autonomousMode = false;
+      state.pendingAutoMode = undefined;
       this.resetTimer(state, "inbox-message");
       this.touchOwners(agent, "child-inbox-message");
     });
@@ -312,8 +360,12 @@ class AutoAdvanceService extends TypertRemoteService {
       if (event.type === "user/message") {
         if (event.data?.id === state.lastAutoMessageId) {
           state.lastAutoMessageId = undefined;
+          state.autonomousMode = state.pendingAutoMode === "away";
+          state.pendingAutoMode = undefined;
           this.broadcast(state);
         } else {
+          state.autonomousMode = false;
+          state.pendingAutoMode = undefined;
           this.resetTimer(state, "user-message");
         }
         return;
@@ -362,6 +414,9 @@ class AutoAdvanceService extends TypertRemoteService {
     const state = this.stateFor(agent);
     state.enabled = enabled === true;
     state.stoppedByProtocol = false;
+    state.autonomousMode = false;
+    state.pendingAutoMode = undefined;
+    state.ownedTaskIds = new Set();
     this.persistedModes.set(agent.id, state.enabled);
     this.persistModes();
     if (state.enabled) this.maybeArm(state);
@@ -428,7 +483,9 @@ class AutoAdvanceService extends TypertRemoteService {
       degraded: false,
       degradedReason: null,
       cloudSnapshot: undefined,
-      activeRound: undefined,
+      ownedTaskIds: new Set(),
+      autonomousMode: false,
+      pendingAutoMode: undefined,
       lastProtocolNotice: null
     };
     this.states.set(agent, state);
@@ -482,20 +539,72 @@ class AutoAdvanceService extends TypertRemoteService {
     return hasPendingInbox(agent) || this.hasRunningWork(agent, taskId);
   }
 
-  availableRunnableTasks(state, snapshot = state.cloudSnapshot) {
+  ownedTaskSet(state) {
+    if (state.ownedTaskIds instanceof Set) return state.ownedTaskIds;
+    state.ownedTaskIds = new Set(Array.isArray(state.ownedTaskIds) ? state.ownedTaskIds : []);
+    return state.ownedTaskIds;
+  }
+
+  isOwnedTask(state, task) {
+    const id = task?.task_id ?? task?.id;
+    if (id === undefined) return false;
+    if (this.ownedTaskSet(state).has(id)) return true;
+    if (task?.claim_state === "mine" || task?.mine === true) return true;
+    // Before task-ownership-p2, an in_progress row had no claim_state. Keep
+    // that compatibility behavior; an explicit "claimed" always means that
+    // another lease owns it unless this process recorded the task locally.
+    return task?.status === "in_progress" && task?.claim_state === undefined;
+  }
+
+  syncOwnedTasks(state, snapshot) {
+    const owned = this.ownedTaskSet(state);
+    for (const task of snapshot?.items ?? []) {
+      const id = task?.task_id ?? task?.id;
+      if (id === undefined) continue;
+      if (taskIsTerminal(task)) owned.delete(id);
+      if (task?.claim_state === "mine" || task?.mine === true) owned.add(id);
+    }
+    for (const id of [...owned]) {
+      const task = (snapshot?.items ?? []).find((item) => (item?.task_id ?? item?.id) === id);
+      if (task === undefined || taskIsTerminal(task) || task.status !== "in_progress") owned.delete(id);
+    }
+  }
+
+  ownedInProgressTasks(state, snapshot = state.cloudSnapshot) {
+    return (snapshot?.items ?? []).filter((task) =>
+      task?.status === "in_progress" && this.isOwnedTask(state, task)
+    );
+  }
+
+  actionableOwnedTasks(state, snapshot = state.cloudSnapshot) {
+    return this.ownedInProgressTasks(state, snapshot).filter((task) =>
+      task?.pending_status === null && !hasOpenNeedHuman(task) && !this.hasRunningWork(state.agent, task.task_id ?? task.id)
+    );
+  }
+
+  openClaimableTasks(state, snapshot = state.cloudSnapshot) {
     if (!snapshot?.runnable) return [];
-    return snapshot.runnable.filter((task) => !this.hasRunningWork(state.agent, task.task_id ?? task.id));
+    return snapshot.runnable.filter((task) =>
+      task?.status === "open" && !this.isOwnedTask(state, task) && !hasOpenNeedHuman(task)
+    );
+  }
+
+  availableRunnableTasks(state, snapshot = state.cloudSnapshot) {
+    return this.openClaimableTasks(state, snapshot);
+  }
+
+  canAutonomouslyDrive(state, snapshot = state.cloudSnapshot) {
+    return this.actionableOwnedTasks(state, snapshot).length > 0;
   }
 
   readyToDrive(state) {
     if (!this.isLive(state) || !state.enabled || state.stoppedByProtocol || state.agent.status !== "idle") return false;
     if (hasPendingInbox(state.agent)) return false;
-    // Before the first cloud read, arm a probe. Once a valid snapshot exists,
-    // keep only task-id-isolated runnable work eligible; confirmations do not
-    // need an async-work binding.
+    // Before the first cloud read, arm one probe. The probe itself is not an
+    // autonomous continuation: after the snapshot, only owned work keeps the
+    // poll alive. Open tasks receive one lightweight claim hint in onTimer.
     if (state.cloudSnapshot !== undefined) {
-      if (state.cloudSnapshot.confirmationQueue.length > 0) return true;
-      return this.availableRunnableTasks(state).length > 0;
+      return this.ownedInProgressTasks(state).length > 0;
     }
     return true;
   }
@@ -549,8 +658,13 @@ class AutoAdvanceService extends TypertRemoteService {
       !state.stoppedByProtocol && state.agent.status === "idle" && !hasPendingInbox(state.agent);
   }
 
-  queuePrompt(state, generation, text, summary, reason, round = undefined) {
+  queuePrompt(state, generation, text, summary, reason, { autonomous = true } = {}) {
     if (!this.isCurrentRun(state, generation)) return false;
+    return this.queueNotice(state, text, summary, reason, { autonomous });
+  }
+
+  queueNotice(state, text, summary, reason, { autonomous = false } = {}) {
+    if (state?.disposed === true || state?.enabled !== true || !this.isLive(state)) return false;
     const message = createUserMessage({
       content: [{ type: "text", text }],
       source: {
@@ -561,219 +675,78 @@ class AutoAdvanceService extends TypertRemoteService {
       }
     });
     state.lastAutoMessageId = message.id;
+    state.autonomousMode = autonomous;
+    state.pendingAutoMode = autonomous ? "away" : "present";
     state.injectedAt = Date.now();
     state.idleSince = null;
-    if (round?.kind === "runnable") {
-      state.activeRound = {
-        kind: "runnable",
-        generation,
-        taskIds: [...new Set(round.taskIds ?? [])],
-        closePayload: undefined,
-        closeSource: undefined,
-        protocolFailures: 0,
-        repairPromptSent: false,
-        lastProtocolError: null,
-      };
-    } else if (round?.kind === "confirmation") {
-      // A confirmation challenge is its own protocol turn. It does not ask
-      // for a second round-close; the preceding runnable round was already
-      // closed before the pending request was created.
-      state.activeRound = {
-        kind: "confirmation",
-        generation,
-        taskIds: [],
-        closePayload: undefined,
-        closeSource: undefined,
-        protocolFailures: 0,
-        repairPromptSent: false,
-        lastProtocolError: null,
-        requireClose: false,
-      };
-    }
     agentFollowup(state.agent, message);
     this.broadcast(state, reason);
     return true;
   }
 
-  /**
-   * Handle the assistant side of the autonomous round protocol. Tool calls
-   * are only observed here: the memory tool/Worker remains the authoritative
-   * writer. Text JSON is a compatibility path and is submitted only after
-   * the exact same schema and runnable-list checks pass.
-   */
+  observeTaskTools(state, message) {
+    const transitions = [];
+    let ownershipChanged = false;
+    for (const call of toolCallBlocks(message)) {
+      const name = String(toolName(call) ?? "");
+      const args = toolArguments(call);
+      const id = taskIdFromArgs(args) ?? taskIdFromArgs(call);
+      if (id === undefined) continue;
+      if (name === "task_claim" || name.endsWith(".task_claim")) {
+        // A claim token/result is the local ownership signal. A bare request
+        // is not enough: it may be a rejected claim against another lease.
+        if (toolSucceeded(call)) {
+          this.ownedTaskSet(state).add(id);
+          ownershipChanged = true;
+        }
+      } else if (name === "task_release" || name.endsWith(".task_release")) {
+        this.ownedTaskSet(state).delete(id);
+        ownershipChanged = true;
+      }
+      if (name === "task_update" || name.endsWith(".task_update")) {
+        if (args.status === "in_progress") {
+          this.ownedTaskSet(state).add(id);
+          ownershipChanged = true;
+        }
+        if (args.status === "done" || args.status === "blocked") transitions.push({ id, args });
+      }
+      // Keep old tool clients observable during the transition, but do not
+      // require or parse round-close text anymore.
+      if (name === "task_round_close" || name.endsWith(".task_round_close")) {
+        if (args.action === "done" || args.action === "blocked") transitions.push({ id, args });
+      }
+    }
+    return { transitions, ownershipChanged };
+  }
+
+  findTask(state, id) {
+    return (state.cloudSnapshot?.items ?? []).find((task) => (task?.task_id ?? task?.id) === id);
+  }
+
   async handleAssistantMessage(state, message) {
     if (state?.disposed === true || state?.enabled !== true) return { ignored: true };
-    const hasStopMarker = isExactStopMessage(message);
-    if (!state?.activeRound) {
-      if (hasStopMarker) return await this.handleStopMarker(state);
-      return { ignored: true };
-    }
-    const round = state.activeRound;
-    if (round.requireClose === false || round.kind === "confirmation") {
-      if (hasStopMarker) return await this.handleStopMarker(state);
-      return { ignored: true };
-    }
-    if (round.closePayload !== undefined && (isStopOnlyMessage(message) || (hasStopMarker && !looksLikeRoundCloseText(message)))) {
-      return await this.handleStopMarker(state);
-    }
+    const observed = this.observeTaskTools(state, message);
+    if (observed.ownershipChanged) this.maybeArm(state);
 
-    let extracted;
-    try {
-      extracted = parseRoundCloseMessage(message);
-    } catch (error) {
-      // A normal summary after an already accepted strict tool close is not a
-      // second protocol message. Potential JSON/fenced JSON is still checked
-      // so a second malformed close cannot silently pass.
-      if (round.closePayload !== undefined && !hasStopMarker && !looksLikeRoundCloseText(message)) {
-        return { ignored: true };
-      }
-      await this.handleCloseProtocolError(state, error);
-      if (hasStopMarker) this.recordUnclosedStop(state);
-      return { ok: false, error };
+    const terminalRequests = observed.transitions.filter(({ id, args }) => !isTempTask(this.findTask(state, id), args));
+    if (terminalRequests.length > 0) {
+      const challenge = state.autonomousMode === true ? AUTONOMOUS_CHALLENGE : IN_PERSON_CHALLENGE;
+      const taskLines = terminalRequests.map(({ id, args }) => `task_id=${id} → ${args.status ?? args.action}`);
+      this.queueNotice(
+        state,
+        `${challenge}\n涉及任务：${taskLines.join("，")}`,
+        state.autonomousMode === true ? "autonomous task challenge" : "in-person task challenge",
+        "injected: task-termination-challenge",
+        { autonomous: state.autonomousMode === true }
+      );
+      return { ok: false, challenged: true, taskIds: terminalRequests.map(({ id }) => id) };
     }
 
-    // A different strict tool call in a message means the model is using the
-    // normal tool channel; never interpret nearby prose as JSON fallback.
-    if (extracted?.kind === "tool-other") {
-      if (hasStopMarker) return await this.handleStopMarker(state);
-      return { ignored: true };
-    }
-
-    if (extracted?.payload !== undefined) {
-      const payload = extracted.payload;
-      if (!round.taskIds.includes(payload.task_id)) {
-        const error = new Error(`close-protocol-error: task_id 不在本轮 runnable 清单中：${payload.task_id}`);
-        error.code = "close-protocol-error";
-        await this.handleCloseProtocolError(state, error);
-        return { ok: false, error };
-      }
-
-      if (round.closePayload !== undefined) {
-        const same = JSON.stringify(round.closePayload) === JSON.stringify(payload);
-        if (!same) {
-          const error = new Error("close-protocol-error: 本轮只能接受一个 task_round_close");
-          error.code = "close-protocol-error";
-          await this.handleCloseProtocolError(state, error);
-          return { ok: false, error };
-        }
-        this.broadcast(state, "round-close: idempotent-replay");
-      } else {
-        if (extracted.kind === "text") {
-          try {
-            await this.submitTextRoundClose(state, payload);
-          } catch (error) {
-            if (error?.code === "task-api-unavailable") {
-              state.degraded = true;
-              state.degradedReason = renderError(error);
-              state.lastProtocolNotice = "round-close 文本兜底尚未写回";
-              this.broadcast(state, "defer: task-api-unavailable");
-              return { ok: false, deferred: true, error };
-            }
-            await this.handleCloseProtocolError(state, error);
-            return { ok: false, error };
-          }
-        }
-        round.closePayload = payload;
-        round.closeSource = extracted.kind;
-        round.protocolFailures = 0;
-        state.lastProtocolNotice = null;
-        this.broadcast(state, `round-close: ${extracted.kind}`);
-      }
-    }
-
-    if (hasStopMarker) return await this.handleStopMarker(state);
-    return extracted?.payload === undefined ? { ignored: true } : { ok: true, payload: extracted.payload };
-  }
-
-  async submitTextRoundClose(state, payload) {
-    const taskApi = this.resolveTaskApiConfig();
-    if (completeTaskApiWriteConfig(taskApi) === undefined) {
-      throw taskApiUnavailable("文本 round-close 兜底需要 Worker 写凭据或成对 Access 凭据");
-    }
-    const body = {
-      ...validateRoundClosePayload(payload),
-      agent_id: String(state.agent?.id ?? "unknown"),
-    };
-    return await requestTaskApiMutation(taskApi, this.config, `/task/${encodeURIComponent(payload.task_id)}/round-close`, body, undefined, this.logger());
-  }
-
-  async handleCloseProtocolError(state, error) {
-    const round = state.activeRound;
-    if (!round) return;
-    round.protocolFailures = Number(round.protocolFailures ?? 0) + 1;
-    round.lastProtocolError = renderError(error);
-    state.lastProtocolNotice = renderError(error);
-    safeLog(() => this.logger(), "warn", `sagitta-auto-advance: ${renderError(error)}`);
-    this.broadcast(state, "close-protocol-error");
-
-    if (round.repairPromptSent !== true) {
-      round.repairPromptSent = true;
-      this.queueProtocolMessage(state, [
-        "round-close 协议错误：本轮尚未形成可接受的结构化收尾。",
-        "请只调用一次 task_round_close，参数必须包含当前 runnable 清单中的 task_id、唯一 round_id、action、progress、next；action=done/blocked 还必须有 expected_updated_at，action=blocked 还必须有 blocked_reason。",
-        "不要用自然语言或多个 JSON 猜测状态；若使用兼容文本，只能输出一个完整且唯一的 JSON 对象或 fenced JSON。终态申请仍须等待 task_confirm。",
-      ].join("\n"), "injected: close-protocol-repair");
-      return;
-    }
-
-    // Repeated malformed closes must not spin forever. End only this round;
-    // autonomous mode stays enabled so the next clean timer cycle can retry.
-    state.activeRound = undefined;
-    state.idleSince = null;
-    this.broadcast(state, "close-protocol-error: round-halted");
-    this.maybeArm(state);
-  }
-
-  queueProtocolMessage(state, text, reason) {
-    if (state?.disposed === true || state?.enabled !== true) return false;
-    const message = createUserMessage({
-      content: [{ type: "text", text }],
-      source: { kind: "plugin", plugin: PLUGIN_ID, form: "notice", summary: "autonomous round protocol" },
-    });
-    state.lastAutoMessageId = message.id;
-    state.injectedAt = Date.now();
-    state.idleSince = null;
-    agentFollowup(state.agent, message);
-    this.broadcast(state, reason);
-    return true;
-  }
-
-  recordUnclosedStop(state) {
-    state.lastProtocolNotice = "未收尾停止";
-    safeLog(() => this.logger(), "warn", "sagitta-auto-advance: 未收尾停止；保留任务 in_progress，不写入 done/blocked");
+    if (isExactStopMessage(message)) return this.stopByProtocol(state);
+    return observed.transitions.length > 0 || observed.ownershipChanged ? { ok: true } : { ignored: true };
   }
 
   async handleStopMarker(state) {
-    const round = state.activeRound;
-    if (round !== undefined && round.requireClose !== false && round.closePayload === undefined) {
-      this.recordUnclosedStop(state);
-      const error = new Error("close-protocol-error: 仅输出停止标记但本轮没有 task_round_close");
-      error.code = "close-protocol-error";
-      await this.handleCloseProtocolError(state, error);
-      return false;
-    }
-
-    // The snapshot used for injection can be stale after task_update and
-    // task_confirm. Refresh before accepting a stop marker; a failure is
-    // fail-closed and never becomes an empty/terminal conclusion.
-    try {
-      const taskApi = this.resolveTaskApiConfig();
-      if (completeTaskApiConfig(taskApi) === undefined) throw taskApiUnavailable("停止协议需要重新读取完整云端任务快照");
-      const controller = new AbortController();
-      if (state.requestController === undefined) state.requestController = controller;
-      try {
-        const latest = await readCloudTaskSnapshotStrict(taskApi, this.config, controller.signal, this.logger());
-        if (state.disposed === true || state.enabled !== true) return false;
-        state.cloudSnapshot = latest;
-      } finally {
-        if (state.requestController === controller) state.requestController = undefined;
-      }
-    } catch (error) {
-      state.degraded = true;
-      state.degradedReason = renderError(error);
-      this.broadcast(state, "defer: task-api-unavailable");
-      return false;
-    }
     return this.stopByProtocol(state);
   }
 
@@ -793,24 +766,31 @@ class AutoAdvanceService extends TypertRemoteService {
     this.broadcast(state, "defer: task-api-unavailable");
   }
 
-  scheduleBoundedWorkRecheck(state, generation) {
+  scheduleTaskRecheck(state, generation, reason = "defer: task-driven-wait") {
     if (!this.isCurrentRun(state, generation) || state.timer !== undefined) return;
     state.retrying = true;
     state.idleSince = null;
     state.timer = setTimeout(() => { void this.onTimer(state, generation); }, Math.min(30000, this.config.idleTimeoutMs));
     state.timer.unref?.();
-    this.broadcast(state, "defer: bounded-work");
+    this.broadcast(state, reason);
   }
 
-  autoStopNoRunnableTasks(state) {
+  autoStopNoInProgressTasks(state) {
     state.enabled = false;
     state.stoppedByProtocol = true;
-    state.activeRound = undefined;
+    state.autonomousMode = false;
+    state.pendingAutoMode = undefined;
+    this.ownedTaskSet(state).clear();
     this.persistedModes.set(state.agent.id, false);
     this.persistModes();
     this.clearTimer(state);
     state.idleSince = null;
-    this.broadcast(state, "autostop: no-runnable-tasks");
+    this.broadcast(state, "autostop: no-in-progress");
+  }
+
+  // Compatibility alias for callers from the pre-v2 service.
+  autoStopNoRunnableTasks(state) {
+    this.autoStopNoInProgressTasks(state);
   }
 
   async onTimer(state, generation) {
@@ -842,55 +822,40 @@ class AutoAdvanceService extends TypertRemoteService {
       // reset invalidates this generation while the network request awaited.
       if (!this.isCurrentRun(state, generation)) return;
       state.cloudSnapshot = snapshot;
+      this.syncOwnedTasks(state, snapshot);
       state.retryAttempt = 0;
       state.degraded = false;
       state.degradedReason = null;
 
-      if (snapshot.confirmationQueue.length > 0) {
-        const lines = snapshot.confirmationQueue.map((task) =>
-          `- task_id=${task.task_id} pending_status=${task.pending_status} confirmation_id=${task.confirmation_id} expected_updated_at=${task.updated_at}`
-        );
-        const prompt = [
-          "当前云端任务快照包含待确认的终态申请。确认队列优先于普通推进；本轮只处理下面的确认，不要推进其它任务。",
-          "对每一项必须调用 task_confirm，decision 只能是 accept 或 reopen；不要从自然语言猜测确认结果，也不要把 pending 当成已完成或已阻塞。",
-          "accept：pending_done → done，pending_blocked → blocked；reopen：pending_* → in_progress。",
-          "确认清单（必须原样使用 task_id、pending_status、confirmation_id、expected_updated_at）：",
-          ...lines,
-          "调用格式必须同时包含 task_id、decision、expected_pending、expected_updated_at、confirmation_id；确认成功后下一次完整快照才会恢复普通推进。",
-        ].join("\n");
-        this.queuePrompt(state, generation, prompt, "cloud task confirmation queue", "injected: confirmation-queue", { kind: "confirmation" });
-        return;
-      }
-
-      const runnable = this.availableRunnableTasks(state, snapshot);
-      if (runnable.length > 0) {
-        const lines = runnable.map((task) => {
-          const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
+      const owned = this.ownedInProgressTasks(state, snapshot);
+      const actionable = this.actionableOwnedTasks(state, snapshot);
+      if (actionable.length > 0) {
+        const lines = actionable.map((task) => {
           const title = typeof task.title === "string" ? task.title.trim() : "";
-          return `- task_id=${task.task_id} status=${task.status} pending_status=null updated_at=${task.updated_at}${project} title=${JSON.stringify(title)}`;
+          const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
+          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}`;
         });
-        const prompt = [
-          AUTONOMOUS_PROMPT,
-          "",
-          "本轮严格使用下面这份完整云端 runnable 清单：",
-          ...lines,
-          "清单外任务本轮不得推进；若要新增工作，先 task_create，并等待下一次完整云端快照。终态只能先申请 pending，再用 task_confirm 完成确认。",
-        ].join("\n");
-        this.queuePrompt(state, generation, prompt, "cloud runnable task snapshot", "injected: runnable-tasks", {
-          kind: "runnable",
-          taskIds: runnable.map((task) => task.task_id),
-        });
+        const prompt = [AUTONOMOUS_PROMPT, "", "当前我认领的 in_progress 任务：", ...lines].join("\n");
+        this.queuePrompt(state, generation, prompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
         return;
       }
 
-      if (snapshot.runnable.length > 0) {
-        // Runnable tasks exist but every one is isolated behind its own
-        // bounded work. They are not an objective empty snapshot.
-        this.scheduleBoundedWorkRecheck(state, generation);
+      if (owned.length > 0) {
+        // A task with an open need-human or pending confirmation is already
+        // waiting for the user/model interaction that created it. Do not
+        // inject the same question again; keep a quiet poll for resolution.
+        this.scheduleTaskRecheck(state, generation, "defer: need-human");
         return;
       }
 
-      this.autoStopNoRunnableTasks(state);
+      const openTasks = this.openClaimableTasks(state, snapshot);
+      if (openTasks.length > 0) {
+        const prompt = `有 ${openTasks.length} 个任务可认领；需要开工时请调用 task_claim。当前没有我已认领的 in_progress 任务，本提示不要求立即自主推进。`;
+        this.queuePrompt(state, generation, prompt, "open task claim hint", "injected: open-task-hint", { autonomous: false });
+        return;
+      }
+
+      this.autoStopNoInProgressTasks(state);
     } catch (error) {
       if (!this.isCurrentRun(state, generation)) return;
       if (error?.code === "task-api-unavailable") {
@@ -907,24 +872,17 @@ class AutoAdvanceService extends TypertRemoteService {
   }
 
   stopByProtocol(state) {
-    const round = state.activeRound;
-    if (round !== undefined && round.requireClose !== false && round.closePayload === undefined) {
-      this.recordUnclosedStop(state);
-      this.broadcast(state, "stop-protocol-rejected");
-      return false;
-    }
     if (!isTerminalCloudSnapshot(state.cloudSnapshot)) {
       state.lastProtocolNotice = "仍有未完成任务；停止自主推进不合法";
       safeLog(() => this.logger(), "warn", "sagitta-auto-advance: stop marker rejected；仍有未完成任务");
       this.broadcast(state, "stop-protocol-rejected");
-      if (state.enabled === true) {
-        this.queueProtocolMessage(state, "停止自主推进无效：云端仍有 open/in_progress/waiting/pending 任务。请继续推进，或按协议调用 task_round_close 并等待 task_confirm。", "injected: stop-protocol-repair");
-      }
       return false;
     }
     state.enabled = false;
     state.stoppedByProtocol = true;
-    state.activeRound = undefined;
+    state.autonomousMode = false;
+    state.pendingAutoMode = undefined;
+    this.ownedTaskSet(state).clear();
     this.persistedModes.set(state.agent.id, false);
     this.persistModes();
     this.clearTimer(state);
@@ -952,7 +910,7 @@ class AutoAdvanceService extends TypertRemoteService {
       mode: state.enabled ? "auto" : "chat",
       idleSince: state.idleSince,
       injectedAt: state.injectedAt,
-      ready: this.readyToDrive(state),
+      ready: this.canAutonomouslyDrive(state),
       hasPendingWork: this.hasPendingWork(state.agent),
       stoppedByProtocol: state.stoppedByProtocol,
       agentStatus: typeof state.agent.status === "string" ? state.agent.status : "unknown",
@@ -1050,6 +1008,9 @@ function mapApiTask(item) {
     blockedReason: item?.blocked_reason ?? null,
     doneAt: item?.done_at ?? null,
     confirmationId: item?.confirmation_id ?? null,
+    type: item?.type ?? item?.task_type ?? null,
+    open_need_human: item?.open_need_human ?? item?.has_open_need_human ?? false,
+    open_need_human_count: item?.open_need_human_count ?? 0,
     project,                           // 分组键
     hasCheckbox: item?.checkbox === 1 || item?.checkbox === "1",
     body: typeof item?.body === "string" ? cleanBody(item.body) : "",
@@ -1065,10 +1026,13 @@ function mapApiTaskSnapshot(items, tasksPath, source = "cloud") {
   const byProject = new Map();
   for (const item of items) {
     const task = mapApiTask(item);
+    // temp tasks are execution-only and must not appear in the floating UI.
+    if (isTempTask(task, item)) continue;
     const itemUpdatedAt = task.updatedAt;
     if (itemUpdatedAt !== null && (updatedAt === null || itemUpdatedAt > updatedAt)) updatedAt = itemUpdatedAt;
-    // 待处理需求：checkbox=1 且未完成
-    if (task.hasCheckbox && task.status !== "done") pendingRequests.push(task);
+    // v2 uses open need-human entries. Keep checkbox as a temporary display
+    // fallback until the P2 memory/Worker projection is deployed.
+    if ((hasOpenNeedHuman(item) || task.hasCheckbox) && task.status !== "done") pendingRequests.push(task);
     if (!byProject.has(task.project)) byProject.set(task.project, []);
     byProject.get(task.project).push(task);
   }
@@ -1141,73 +1105,6 @@ function linkedAbortSignal(signal, timeoutMs) {
       signal?.removeEventListener("abort", abort);
     }
   };
-}
-
-async function requestTaskApiMutation(apiConfig, config, path, body, signal, logger) {
-  if (completeTaskApiWriteConfig(apiConfig) === undefined) {
-    throw taskApiUnavailable("Worker API 写入认证或地址配置不完整");
-  }
-  assertTaskTransportPolicy(apiConfig.workerApiUrl, config.proxy);
-  const url = `${apiConfig.workerApiUrl.replace(/\/+$/u, "")}${path}`;
-  const requestHeaders = {
-    ...buildTaskAuthHeaders(apiConfig, "write"),
-    "Content-Type": "application/json",
-  };
-  const timeoutMs = config.taskApiTimeoutMs;
-  const useProxy = typeof config.proxy === "string" && config.proxy.trim().length > 0 && config.proxy.trim().toLowerCase() !== "direct";
-  let status = 0;
-  let bodyText = "";
-  if (useProxy) {
-    const memoryRequest = await memoryHttpRequest();
-    if (typeof memoryRequest !== "function") {
-      throw taskApiUnavailable("proxy 已配置但 @sagitta/memory 的 http.js 不可用（memory 插件缺失/版本过旧）");
-    }
-    try {
-      const response = await memoryRequest({
-        method: "POST",
-        url,
-        headers: requestHeaders,
-        body: JSON.stringify(body),
-        timeoutMs,
-        signal,
-        proxy: config.proxy,
-      });
-      status = Number(response?.status);
-      bodyText = response?.body ? Buffer.from(response.body).toString("utf8") : "";
-    } catch (error) {
-      throw taskApiUnavailable(`请求失败：${renderError(error)}`, error);
-    }
-  } else {
-    const linked = linkedAbortSignal(signal, timeoutMs);
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify(body),
-        signal: linked.signal,
-      });
-      status = Number(response?.status);
-      bodyText = typeof response.text === "function" ? await response.text() : "";
-    } catch (error) {
-      throw taskApiUnavailable(`请求失败：${renderError(error)}`, error);
-    } finally {
-      linked.dispose();
-    }
-  }
-  if (status < 200 || status >= 300) throw taskApiUnavailable(`HTTP ${Number.isInteger(status) ? status : "未知"}`);
-  let payload;
-  try {
-    payload = JSON.parse(bodyText);
-  } catch (error) {
-    throw taskApiUnavailable("响应不是合法 JSON", error);
-  }
-  if (isRecord(payload) && payload.ok === false) {
-    throw taskApiUnavailable(`Worker 拒绝 round-close：${payload.error?.message ?? payload.error?.code ?? "未知错误"}`);
-  }
-  const result = isRecord(payload) && payload.ok === true && isRecord(payload.data) ? payload.data : payload;
-  if (!isRecord(result)) throw taskApiUnavailable("round-close 响应不是对象");
-  logger?.debug?.(`sagitta-auto-advance: text round-close submitted task=${body.task_id} round=${body.round_id}`);
-  return result;
 }
 
 async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
@@ -1394,6 +1291,8 @@ function statMtime(path) {
 export {
   AutoAdvanceService,
   AUTONOMOUS_PROMPT,
+  IN_PERSON_CHALLENGE,
+  AUTONOMOUS_CHALLENGE,
   STOP_MARKER,
   hasPendingInbox,
   isExactStopMessage,

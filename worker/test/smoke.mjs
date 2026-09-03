@@ -102,6 +102,7 @@ test("/task CRUD, filters, LIKE search, soft delete, and read/write Bearer split
   const first = result.body.data;
   assert.match(first.id, /^tsk-\d{8}-[0-9a-f]{6}$/);
   assert.equal(first.project, "alpha");
+  assert.equal(first.kind, "normal");
   assert.equal(first.status, "open");
   assert.equal(first.priority, 1);
   assert.equal(first.checkbox, 1);
@@ -201,10 +202,11 @@ test("task migration is re-entrant and fails closed when D1 batch fails", async 
   ).run(legacyId, "legacy", "legacy task", "open", 0, 0, "company", "old body", "2026-08-30T00:00:00.000Z", "2026-08-30T00:00:00.000Z", "", 0);
   let result = await call(legacy.env, "GET", "/task", read);
   assert.equal(result.status, 200);
-  // blocked_reason + pending_status（既有）+ owner_agent_id/claimed_at/claim_token/lease_seconds（task-ownership-p2 §3）
-  assert.equal(alterCount, 6);
+  // blocked_reason + pending_status（既有）+ kind（v2）+ owner_agent_id/claimed_at/claim_token/lease_seconds（task-ownership-p2 §3）
+  assert.equal(alterCount, 7);
   result = await call(legacy.env, "GET", "/task/" + legacyId, read);
   assert.equal(result.body.data.body, "old body");
+  assert.equal(result.body.data.kind, "normal");
   assert.equal(result.body.data.pending_status, null);
   assert.equal(result.body.data.claim_state, "unclaimed", "legacy task without owner must read as unclaimed");
   result = await call(legacy.env, "PATCH", "/task/" + legacyId, { token: legacy.env.D1_WRITE_TOKEN, body: { body: "updated old body" } });
@@ -212,14 +214,18 @@ test("task migration is re-entrant and fails closed when D1 batch fails", async 
   assert.equal(result.body.data.body, "updated old body");
   result = await call(legacy.env, "GET", "/task", read);
   assert.equal(result.status, 200);
-  assert.equal(alterCount, 6, "second migration must not issue duplicate ALTER TABLE");
+  assert.equal(alterCount, 7, "second migration must not issue duplicate ALTER TABLE");
   const taskColumns = legacy.database.prepare("PRAGMA table_info(tasks)").all().map((row) => row.name);
-  for (const column of ["blocked_reason", "pending_status", "owner_agent_id", "claimed_at", "claim_token", "lease_seconds"]) {
+  for (const column of ["blocked_reason", "pending_status", "kind", "owner_agent_id", "claimed_at", "claim_token", "lease_seconds"]) {
     assert.ok(taskColumns.includes(column), "missing tasks column " + column);
   }
   const eventColumns = legacy.database.prepare("PRAGMA table_info(task_events)").all().map((row) => row.name);
   for (const column of ["event_id", "task_id", "agent_id", "event_type", "round_id", "action", "progress", "next", "blocked_reason", "pending_status", "confirmation_id", "expected_updated_at", "payload_json", "created_at"]) {
     assert.ok(eventColumns.includes(column), "missing task_events column " + column);
+  }
+  const needHumanColumns = legacy.database.prepare("PRAGMA table_info(task_need_human)").all().map((row) => row.name);
+  for (const column of ["id", "task_id", "content", "suggestion", "status", "created_at", "resolved_at", "resolved_by"]) {
+    assert.ok(needHumanColumns.includes(column), "missing task_need_human column " + column);
   }
 
   const broken = taskEnv({ failBatch: true });
@@ -227,6 +233,124 @@ test("task migration is re-entrant and fails closed when D1 batch fails", async 
   assert.equal(result.status, 503);
   assert.equal(result.body.error.code, "TASK_SCHEMA_UNAVAILABLE");
   assert.ok(result.body.request_id);
+});
+
+test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  // temp 可无根创建；默认任务列表隐藏，显式 kind=temp 可见。
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { kind: "temp", title: "temporary unrooted task" },
+  });
+  assert.equal(result.status, 201);
+  const temp = result.body.data;
+  assert.equal(temp.kind, "temp");
+  assert.equal(temp.project, "");
+  result = await call(env, "GET", "/task", read);
+  assert.ok(!result.body.data.items.some((item) => item.id === temp.id));
+  result = await call(env, "GET", "/task?kind=temp", read);
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [temp.id]);
+  result = await call(env, "POST", "/task/" + temp.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task?include_temp=1", { ...read, ...agentA });
+  assert.ok(result.body.data.items.some((item) => item.id === temp.id), "own claimed temp must be available to auto-advance");
+  result = await call(env, "GET", "/task?kind=temp&owner=me", { ...read, ...agentA });
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [temp.id]);
+  result = await call(env, "GET", "/task?kind=temp&owner=me", { ...read, ...agentB });
+  assert.deepEqual(result.body.data.items, []);
+
+  // open need-human 会阻止 done confirm；resolve（含 abandoned）后可继续确认。
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v2", title: "done gate", status: "in_progress" },
+  });
+  const gated = result.body.data;
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { content: "请确认是否保留旧接口", suggestion: "建议保留兼容层" },
+  });
+  assert.equal(result.status, 201);
+  const needHuman = result.body.data;
+  assert.match(needHuman.id, /^nh-\d{8}-[0-9a-f]+$/);
+  assert.equal(needHuman.status, "open");
+  result = await call(env, "GET", "/need-human?status=open", read);
+  assert.ok(result.body.data.items.some((item) => item.id === needHuman.id));
+  result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 200);
+  const donePending = result.body.data;
+  result = await call(env, "POST", "/task/" + gated.id + "/confirm", {
+    ...write,
+    body: {
+      decision: "accept", expected_pending: "pending_done",
+      expected_updated_at: donePending.updated_at,
+      confirmation_id: donePending.confirmation_id,
+    },
+  });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
+  result = await call(env, "POST", "/task/need-human/" + needHuman.id + "/resolve", {
+    ...write, body: { resolve_kind: "abandoned" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "resolved");
+  result = await call(env, "POST", "/task/" + gated.id + "/confirm", {
+    ...write,
+    body: {
+      decision: "accept", expected_pending: "pending_done",
+      expected_updated_at: donePending.updated_at,
+      confirmation_id: donePending.confirmation_id,
+    },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+  result = await call(env, "GET", "/need-human?status=open", read);
+  assert.ok(!result.body.data.items.some((item) => item.id === needHuman.id));
+
+  // blocked 任务清掉最后一条 need-human 后自动回 open；in_progress 解除则保持原状态。
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v2", title: "blocked reopen", status: "in_progress" },
+  });
+  const blocked = result.body.data;
+  result = await call(env, "PATCH", "/task/" + blocked.id, {
+    ...write, body: { status: "blocked", blocked_reason: "等待涟漪决定" },
+  });
+  const blockedPending = result.body.data;
+  result = await call(env, "POST", "/task/" + blocked.id + "/confirm", {
+    ...write,
+    body: {
+      decision: "accept", expected_pending: "pending_blocked",
+      expected_updated_at: blockedPending.updated_at,
+      confirmation_id: blockedPending.confirmation_id,
+    },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "blocked");
+  const nhBodies = ["补充业务背景", "确认是否继续"];
+  const nhIds = [];
+  for (const content of nhBodies) {
+    result = await call(env, "POST", "/task/" + blocked.id + "/need-human", { ...write, body: { content } });
+    assert.equal(result.status, 201);
+    nhIds.push(result.body.data.id);
+  }
+  result = await call(env, "POST", "/task/need-human/" + nhIds[0] + "/resolve", { ...write, body: {} });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + blocked.id, read);
+  assert.equal(result.body.data.status, "blocked");
+  result = await call(env, "POST", "/task/need-human/" + nhIds[1] + "/resolve", { ...write, body: { resolved_by: "sagitta" } });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + blocked.id, read);
+  assert.equal(result.body.data.status, "open");
+  assert.equal(result.body.data.blocked_reason, null);
+
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v2", title: "in progress need-human", status: "in_progress" },
+  });
+  const progressing = result.body.data;
+  result = await call(env, "POST", "/task/" + progressing.id + "/need-human", { ...write, body: { content: "请补充一个参数" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, body: {} });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + progressing.id, read);
+  assert.equal(result.body.data.status, "in_progress");
 });
 
 test("pending invariants, terminal create rejection, PATCH whitelist, and confirm idempotency", async () => {

@@ -76,8 +76,9 @@ CREATE TABLE IF NOT EXISTS entries (
 -- tasks：任务事实表（docs/task-api-p1.md §1；DELETE 仅将 archived 置 1）
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,                -- 生成：tsk-YYYYMMDD-<hex6>
-  project       TEXT NOT NULL,                   -- 所属项目（对应 TASKS §1A/1B 分类）
+  project       TEXT DEFAULT '',                 -- 所属项目；temp 可为空（前端归入未分类）
   title         TEXT NOT NULL,                   -- 条目一行描述
+  kind          TEXT DEFAULT 'normal',           -- normal | temp
   status        TEXT NOT NULL DEFAULT 'open',    -- open | in_progress | blocked | waiting | done
   priority      INTEGER NOT NULL DEFAULT 0,      -- 0 普通 / 1 高 / 2 紧急
   checkbox      INTEGER NOT NULL DEFAULT 0,      -- 1=该条是涟漪待处理 checkbox
@@ -124,6 +125,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_round_close
   ON task_events(task_id, agent_id, round_id) WHERE event_type = 'round_close';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_confirmation
   ON task_events(confirmation_id) WHERE confirmation_id IS NOT NULL;
+
+-- task_need_human：需要涟漪参与/决定的事项（设计稿 §1/§2/§7）
+CREATE TABLE IF NOT EXISTS task_need_human (
+  id            TEXT PRIMARY KEY,                -- nh-YYYYMMDD-<hex>
+  task_id       TEXT NOT NULL,
+  content       TEXT NOT NULL,                   -- 需要涟漪做什么（问题/上下文）
+  suggestion    TEXT,                            -- 我的建议（可选）
+  status        TEXT NOT NULL DEFAULT 'open',    -- open | resolved
+  created_at    TEXT NOT NULL,
+  resolved_at   TEXT,
+  resolved_by   TEXT,                            -- ripple | sagitta
+  CHECK (status IN ('open','resolved')),
+  CHECK (resolved_by IS NULL OR resolved_by IN ('ripple','sagitta'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_need_human_task_status ON task_need_human(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_need_human_status_created ON task_need_human(status, created_at);
 
 -- delegations：派单任务记录（L2 事实层，指挥者记忆的地基，design-review.md 维度五 P0）
 CREATE TABLE IF NOT EXISTS delegations (

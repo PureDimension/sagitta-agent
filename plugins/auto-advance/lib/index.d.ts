@@ -2,9 +2,11 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { AutoAdvanceService } from "./service.js";
 
 export declare const name: "sagitta-auto-advance";
-export declare const inject: readonly ["agents", "goals", "sessions"];
+export declare const inject: readonly ["agents", "goals", "sessions", "sagitta-manager", "sagitta-async-work"];
 export declare const Config: unknown;
 export declare const AUTONOMOUS_PROMPT: string;
+export declare const IN_PERSON_CHALLENGE: string;
+export declare const AUTONOMOUS_CHALLENGE: string;
 export declare const STOP_MARKER: string;
 export declare function parseRoundCloseText(text: string): {
   readonly task_id: string;

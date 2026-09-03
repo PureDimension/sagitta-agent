@@ -58,7 +58,7 @@
 
 'use strict';
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
 // ---- 枚举常量（服务端强制；管理字段由服务端填写，AI 无权编造） -------------
 
@@ -110,6 +110,7 @@ const SCORE_MAX = 3; // 设计 §4 v1.3 钳制上界；score<0 触发软归档�
 
 // task API（docs/task-api-p1.md §1）：任务状态独立于 memory 条目状态。
 const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'waiting', 'done'];
+const TASK_KINDS = ['normal', 'temp'];
 // 任务沿用记忆四流；兼容草案 DDL 的默认值 company。
 const TASK_STREAMS = [...STREAMS, 'company'];
 const TASK_DEFAULT_STREAM = 'company';
@@ -947,6 +948,7 @@ const TASK_SCHEMA_COLUMNS = [
   ['priority', 'INTEGER'], ['checkbox', 'INTEGER'], ['stream', 'TEXT'], ['body', 'TEXT'],
   ['created_at', 'TEXT'], ['updated_at', 'TEXT'], ['done_at', 'TEXT'], ['archived', 'INTEGER'],
   ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'],
+  ['kind', "TEXT DEFAULT 'normal'"],
   // task-ownership-p2 §3：认领制四列（可空；惰性回收，无需定时清理）
   ['owner_agent_id', 'TEXT'], ['claimed_at', 'TEXT'], ['claim_token', 'TEXT'], ['lease_seconds', 'INTEGER'],
 ];
@@ -956,12 +958,19 @@ const TASK_EVENT_SCHEMA_COLUMNS = [
   ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'], ['confirmation_id', 'TEXT'],
   ['expected_updated_at', 'TEXT'], ['payload_json', 'TEXT'], ['created_at', 'TEXT'],
 ];
+const TASK_NEED_HUMAN_SCHEMA_COLUMNS = [
+  ['id', 'TEXT'], ['task_id', 'TEXT'], ['content', 'TEXT'], ['suggestion', 'TEXT'],
+  ['status', 'TEXT'], ['created_at', 'TEXT'], ['resolved_at', 'TEXT'], ['resolved_by', 'TEXT'],
+];
 const TASK_SYSTEM_AGENT = 'worker';
 const TASK_PENDING_STATUSES = ['pending_done', 'pending_blocked'];
 const TASK_TERMINAL_STATUSES = ['done', 'blocked'];
 const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason'];
 const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
 const TASK_ROUND_ACTIONS = ['update', 'done', 'blocked'];
+const TASK_NEED_HUMAN_STATUSES = ['open', 'resolved'];
+const TASK_NEED_HUMAN_RESOLVED_BY = ['ripple', 'sagitta'];
+const TASK_NEED_HUMAN_RESOLVE_KINDS = ['solved', 'abandoned'];
 const MAX_TASK_EVENT_TEXT = 1000;
 // task-ownership-p2 §3/§4：认领租约与调用方标识。
 //   · 租约默认 24h（进程退出后自然过期回收，新对话可接管）；claim body 的
@@ -976,8 +985,9 @@ const tasksSchemaReady = new WeakMap();
 
 const TASKS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
-  project       TEXT NOT NULL,
+  project       TEXT DEFAULT '',
   title         TEXT NOT NULL,
+  kind          TEXT DEFAULT 'normal',
   status        TEXT NOT NULL DEFAULT 'open',
   priority      INTEGER NOT NULL DEFAULT 0,
   checkbox      INTEGER NOT NULL DEFAULT 0,
@@ -1011,6 +1021,19 @@ const TASK_EVENTS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS task_events (
   expected_updated_at TEXT DEFAULT NULL,
   payload_json      TEXT NOT NULL,
   created_at        TEXT NOT NULL
+)`;
+
+const TASK_NEED_HUMAN_CREATE_DDL = `CREATE TABLE IF NOT EXISTS task_need_human (
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  suggestion   TEXT,
+  status       TEXT NOT NULL DEFAULT 'open',
+  created_at   TEXT NOT NULL,
+  resolved_at  TEXT,
+  resolved_by  TEXT,
+  CHECK (status IN ('open', 'resolved')),
+  CHECK (resolved_by IS NULL OR resolved_by IN ('ripple', 'sagitta'))
 )`;
 
 async function d1Batch(db, statements) {
@@ -1047,12 +1070,16 @@ async function ensureTasksSchema(db) {
       db.prepare('CREATE INDEX IF NOT EXISTS idx_tasks_stream ON tasks(stream)'),
       db.prepare('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)'),
       db.prepare(TASK_EVENTS_CREATE_DDL),
+      db.prepare(TASK_NEED_HUMAN_CREATE_DDL),
     ]);
     await ensureColumns(db, 'task_events', TASK_EVENT_SCHEMA_COLUMNS);
+    await ensureColumns(db, 'task_need_human', TASK_NEED_HUMAN_SCHEMA_COLUMNS);
     await d1Batch(db, [
       db.prepare('CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id)'),
       db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_round_close ON task_events(task_id, agent_id, round_id) WHERE event_type = 'round_close'"),
       db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS uq_task_events_confirmation ON task_events(confirmation_id) WHERE confirmation_id IS NOT NULL'),
+      db.prepare('CREATE INDEX IF NOT EXISTS idx_task_need_human_task_status ON task_need_human(task_id, status)'),
+      db.prepare('CREATE INDEX IF NOT EXISTS idx_task_need_human_status_created ON task_need_human(status, created_at)'),
     ]);
     return true;
   })().catch((err) => {
@@ -1075,6 +1102,7 @@ function isTaskBody(body) {
 function serializeTask(row, extra = {}) {
   if (!row) return null;
   const result = Object.assign({}, row, {
+    kind: row.kind === undefined || row.kind === null ? 'normal' : row.kind,
     priority: Number(row.priority),
     checkbox: Number(row.checkbox),
     archived: Number(row.archived),
@@ -1130,6 +1158,13 @@ function taskString(value, field, required = false) {
 function taskStatus(value) {
   if (!TASK_STATUSES.includes(value)) {
     return jsonError(400, 'INVALID_TASK_STATUS', 'status 必须是：' + TASK_STATUSES.join(' / '));
+  }
+  return null;
+}
+
+function taskKind(value) {
+  if (!TASK_KINDS.includes(value)) {
+    return jsonError(400, 'INVALID_TASK_KIND', 'kind 必须是：' + TASK_KINDS.join(' / '));
   }
   return null;
 }
@@ -1257,6 +1292,112 @@ function taskPendingConflict(message, row) {
   return jsonError(409, 'TASK_PENDING_CONFLICT', message, row ? { task: serializeTask(row) } : {});
 }
 
+function needHumanId() {
+  const day = nowIso().slice(0, 10).replace(/-/g, '');
+  const suffix = crypto.randomUUID().replace(/-/g, '').slice(0, 6);
+  return 'nh-' + day + '-' + suffix;
+}
+
+function needHumanStatus(value) {
+  if (!TASK_NEED_HUMAN_STATUSES.includes(value)) {
+    return jsonError(400, 'INVALID_NEED_HUMAN_STATUS', 'status 必须是：' + TASK_NEED_HUMAN_STATUSES.join(' / '));
+  }
+  return null;
+}
+
+function serializeNeedHuman(row) {
+  if (!row) return null;
+  return Object.assign({}, row, {
+    suggestion: row.suggestion === undefined ? null : row.suggestion,
+    resolved_at: row.resolved_at === undefined ? null : row.resolved_at,
+    resolved_by: row.resolved_by === undefined ? null : row.resolved_by,
+  });
+}
+
+async function getNeedHumanRow(db, id) {
+  return await db.prepare('SELECT * FROM task_need_human WHERE id = ?').bind(id).first();
+}
+
+async function hasOpenNeedHuman(db, taskIdValue) {
+  const row = await db.prepare(
+    "SELECT id FROM task_need_human WHERE task_id = ? AND status = 'open' LIMIT 1"
+  ).bind(taskIdValue).first();
+  return !!row;
+}
+
+// GET /need-human —— 跨任务汇聚；默认只返回待涟漪处理的 open 条目。
+async function listNeedHumanHandler(db, url) {
+  const status = url.searchParams.get('status') || 'open';
+  const statusError = needHumanStatus(status);
+  if (statusError) return statusError;
+  const rows = await db.prepare(
+    'SELECT n.*, t.title AS task_title, t.project AS task_project, t.status AS task_status, t.kind AS task_kind ' +
+    'FROM task_need_human n LEFT JOIN tasks t ON t.id = n.task_id ' +
+    'WHERE n.status = ? ORDER BY n.created_at DESC, n.id DESC'
+  ).bind(status).all();
+  const items = (rows.results || []).map(serializeNeedHuman);
+  return jsonOk({ items, total: items.length, status, source: 'cloud' });
+}
+
+// POST /task/{id}/need-human —— 记录一条需要涟漪参与/决定的事项。
+async function createNeedHumanHandler(db, taskIdValue, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const task = await getTaskRow(db, taskIdValue);
+  if (!task) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + taskIdValue);
+
+  const content = taskEventText(body.content, 'content', true);
+  if (content instanceof Response) return content;
+  let suggestion = null;
+  if (body.suggestion !== undefined && body.suggestion !== null) {
+    suggestion = taskEventText(body.suggestion, 'suggestion', false);
+    if (suggestion instanceof Response) return suggestion;
+  }
+
+  const id = needHumanId();
+  const now = nowIso();
+  await db.prepare(
+    'INSERT INTO task_need_human (id, task_id, content, suggestion, status, created_at, resolved_at, resolved_by) ' +
+    "VALUES (?, ?, ?, ?, 'open', ?, NULL, NULL)"
+  ).bind(id, taskIdValue, content, suggestion, now).run();
+  return jsonOk(serializeNeedHuman(await getNeedHumanRow(db, id)), 201);
+}
+
+// POST /task/need-human/{nhid}/resolve —— 解决或放弃一条 need-human。
+async function resolveNeedHumanHandler(db, id, body) {
+  if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
+  const forbidden = Object.keys(body).filter((field) => !['resolved_by', 'resolve_kind'].includes(field));
+  if (forbidden.length > 0) {
+    return jsonError(422, 'NEED_HUMAN_FIELD_FORBIDDEN', 'resolve 字段不在白名单中：' + forbidden.join(', '), { fields: forbidden });
+  }
+  const resolvedBy = body.resolved_by === undefined || body.resolved_by === null
+    ? 'ripple' : body.resolved_by;
+  if (!TASK_NEED_HUMAN_RESOLVED_BY.includes(resolvedBy)) {
+    return jsonError(422, 'INVALID_RESOLVED_BY', 'resolved_by 必须是 ripple 或 sagitta');
+  }
+  if (body.resolve_kind !== undefined && body.resolve_kind !== null &&
+      !TASK_NEED_HUMAN_RESOLVE_KINDS.includes(body.resolve_kind)) {
+    return jsonError(422, 'INVALID_RESOLVE_KIND', 'resolve_kind 必须是 solved 或 abandoned');
+  }
+
+  const current = await getNeedHumanRow(db, id);
+  if (!current) return jsonError(404, 'NEED_HUMAN_NOT_FOUND', 'need-human 不存在：' + id);
+  if (current.status === 'resolved') return jsonOk(serializeNeedHuman(current));
+
+  const now = nowIso();
+  const resolve = db.prepare(
+    "UPDATE task_need_human SET status = 'resolved', resolved_at = ?, resolved_by = ? WHERE id = ? AND status = 'open'"
+  ).bind(now, resolvedBy, id);
+  // 涟漪清掉最后一条 need-human 后，blocked 任务回到 open，等待重新认领；
+  // in_progress 任务保持原状态。abandoned 只结清该条，done 仍由 agent 后续申请。
+  const reopen = db.prepare(
+    "UPDATE tasks SET status = 'open', blocked_reason = NULL, owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL, updated_at = ? " +
+    "WHERE id = ? AND archived = 0 AND status = 'blocked' AND NOT EXISTS (" +
+    "SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open')"
+  ).bind(now, current.task_id, current.task_id);
+  await db.batch([resolve, reopen]);
+  return jsonOk(serializeNeedHuman(await getNeedHumanRow(db, id)));
+}
+
 async function findRoundEvent(db, taskIdValue, agentId, roundId) {
   return await db.prepare(
     "SELECT * FROM task_events WHERE task_id = ? AND agent_id = ? AND round_id = ? AND event_type = 'round_close'"
@@ -1288,20 +1429,49 @@ function eventPayloadMatches(event, expectedPayload) {
   return !!event && event.payload_json === JSON.stringify(expectedPayload);
 }
 
-// GET /task —— 列表，默认排除 archived；checkbox 过滤供 auto-advance API 使用。
-async function listTasksHandler(db, url) {
+// GET /task —— 列表，默认排除 archived 和 temp；kind=temp 可显式查看 temp。
+// include_temp=1 为自主推进/门禁读取自己当前认领的 temp 提供投影。
+async function listTasksHandler(db, url, request, env) {
   const project = url.searchParams.get('project');
   const stream = url.searchParams.get('stream');
   const status = url.searchParams.get('status');
   const checkbox = url.searchParams.get('checkbox');
+  const kind = url.searchParams.get('kind');
+  const includeTemp = url.searchParams.get('include_temp');
+  const owner = url.searchParams.get('owner');
   if (stream && taskStream(stream)) return taskStream(stream);
   if (status && taskStatus(status)) return taskStatus(status);
+  if (kind && taskKind(kind)) return taskKind(kind);
+  if (owner !== null && owner !== 'me') {
+    return jsonError(400, 'INVALID_TASK_OWNER', 'owner 目前只支持 me');
+  }
 
   const where = ['archived = 0'];
   const params = [];
   if (project) { where.push('project = ?'); params.push(project); }
   if (stream) { where.push('stream = ?'); params.push(stream); }
   if (status) { where.push('status = ?'); params.push(status); }
+  if (kind) {
+    where.push('kind = ?');
+    params.push(kind);
+  } else if (includeTemp === null) {
+    where.push("kind = 'normal'");
+  } else {
+    const includeFlag = taskQueryFlag(includeTemp, 'include_temp');
+    if (includeFlag instanceof Response) return includeFlag;
+    if (includeFlag === 0) {
+      where.push("kind = 'normal'");
+    } else {
+      // temp 仅在显式 include_temp 且仍由当前调用方持有有效租约时加入；
+      // kind=temp 过滤则是管理/调试用的显式全量查询。
+      where.push("(kind = 'normal' OR (kind = 'temp' AND owner_agent_id = ? AND claimed_at IS NOT NULL AND claimed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(lease_seconds, ?) || ' seconds')))" );
+      params.push(callerAgentId(request, env), TASK_DEFAULT_LEASE_SECONDS);
+    }
+  }
+  if (owner === 'me') {
+    where.push("owner_agent_id = ? AND claimed_at IS NOT NULL AND claimed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(lease_seconds, ?) || ' seconds')");
+    params.push(callerAgentId(request, env), TASK_DEFAULT_LEASE_SECONDS);
+  }
   if (checkbox !== null) {
     const flagError = taskQueryFlag(checkbox, 'checkbox');
     if (flagError instanceof Response) return flagError;
@@ -1331,6 +1501,9 @@ async function listTasksHandler(db, url) {
     stream: stream || undefined,
     status: status || undefined,
     checkbox: checkbox === null ? undefined : Number(checkbox === 'true' || checkbox === '1'),
+    kind: kind || undefined,
+    owner: owner || undefined,
+    include_temp: includeTemp === null ? undefined : Number(includeTemp === 'true' || includeTemp === '1'),
   });
 }
 
@@ -1351,8 +1524,18 @@ async function createTaskHandler(db, body) {
       'create 不得传入 pending_status、done_at 或其他服务端管理字段');
   }
 
-  const project = taskString(body.project, 'project', true);
-  if (project.error) return project.error;
+  const kind = body.kind === undefined ? 'normal' : body.kind;
+  const kindError = taskKind(kind);
+  if (kindError) return kindError;
+
+  let project;
+  if (kind === 'temp' && (body.project === undefined || body.project === null || body.project === '')) {
+    // temp 可无根；以空字符串落库，兼容存量 project NOT NULL 表。
+    project = { value: '' };
+  } else {
+    project = taskString(body.project, 'project', true);
+    if (project.error) return project.error;
+  }
   const title = taskString(body.title, 'title', true);
   if (title.error) return title.error;
 
@@ -1384,10 +1567,10 @@ async function createTaskHandler(db, body) {
   const id = taskId();
   const now = nowIso();
   await db.prepare(
-    'INSERT INTO tasks (id, project, title, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO tasks (id, project, title, kind, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(
-    id, project.value, title.value, status, priority, checkbox, stream, taskBody, now, now, '', 0
+    id, project.value, title.value, kind, status, priority, checkbox, stream, taskBody, now, now, '', 0
   ).run();
 
   const row = await getTaskRow(db, id);
@@ -1693,6 +1876,13 @@ async function confirmTaskHandler(db, id, body) {
   const stateError = taskStateError(row);
   if (stateError) return stateError;
 
+  if (body.decision === 'accept' && body.expected_pending === 'pending_done' &&
+      await hasOpenNeedHuman(db, id)) {
+    return jsonError(409, 'TASK_NEED_HUMAN_OPEN', 'need-human 清完前不许 done', {
+      task: serializeTask(row),
+    });
+  }
+
   const now = nowIso();
   const nextStatus = body.decision === 'accept'
     ? (body.expected_pending === 'pending_done' ? 'done' : 'blocked')
@@ -1714,10 +1904,12 @@ async function confirmTaskHandler(db, id, body) {
     'UPDATE tasks SET status = ?, pending_status = NULL, blocked_reason = ?' + doneAtSql + clearOwnerSql + ', updated_at = ? ' +
     'WHERE id = ? AND pending_status = ? AND updated_at = ? AND EXISTS (' +
       'SELECT 1 FROM task_events WHERE task_id = ? AND confirmation_id = ? AND pending_status = ?' +
+    ') AND NOT (' +
+      "? = 'done' AND EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open')" +
     ')'
   ).bind(
     nextStatus, nextReason, ...(nextStatus === 'done' ? [now] : []), now, id, body.expected_pending, expected,
-    id, confirmationId, body.expected_pending
+    id, confirmationId, body.expected_pending, nextStatus, id
   );
   // confirmed/reopened 事件的 confirmation_id 列留空：申请事件持有唯一 confirmation_id，
   // 确认事件通过 payload.request.confirmation_id 关联，避免违反非空唯一约束。
@@ -1738,7 +1930,15 @@ async function confirmTaskHandler(db, id, body) {
     throw err;
   }
   const savedEvent = await db.prepare('SELECT event_id FROM task_events WHERE event_id = ?').bind(eventId).first();
-  if (!savedEvent) return taskConflict('任务版本已变化，确认未提交', await getTaskRow(db, id));
+  if (!savedEvent) {
+    const current = await getTaskRow(db, id);
+    if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
+      return jsonError(409, 'TASK_NEED_HUMAN_OPEN', 'need-human 清完前不许 done', {
+        task: serializeTask(current),
+      });
+    }
+    return taskConflict('任务版本已变化，确认未提交', current);
+  }
   return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false });
 }
 
@@ -1845,14 +2045,21 @@ async function deleteTaskHandler(db, id) {
 }
 
 // POST /task/search —— 关键词 LIKE；默认排除 archived。
-async function searchTasksHandler(db, body) {
+async function searchTasksHandler(db, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
   if (!isNonEmptyString(body.query)) return jsonError(400, 'QUERY_REQUIRED', 'query 必填（关键词 LIKE 检索）');
 
   const stream = body.stream;
   const status = body.status;
+  const kind = body.kind;
+  const includeTemp = body.include_temp;
   if (stream && taskStream(stream)) return taskStream(stream);
   if (status && taskStatus(status)) return taskStatus(status);
+  if (kind && taskKind(kind)) return taskKind(kind);
+  if (includeTemp !== undefined && includeTemp !== null &&
+      includeTemp !== true && includeTemp !== false && includeTemp !== 1 && includeTemp !== 0) {
+    return jsonError(400, 'INVALID_INCLUDE_TEMP', 'include_temp 过滤值必须是布尔值或 0/1');
+  }
 
   const pattern = '%' + escapeLike(body.query) + '%';
   const where = [
@@ -1862,11 +2069,20 @@ async function searchTasksHandler(db, body) {
   const params = [pattern, pattern, pattern, pattern];
   if (stream) { where.push('stream = ?'); params.push(stream); }
   if (status) { where.push('status = ?'); params.push(status); }
+  if (kind) {
+    where.push('kind = ?');
+    params.push(kind);
+  } else if (includeTemp === true || includeTemp === 1) {
+    where.push("(kind = 'normal' OR (kind = 'temp' AND owner_agent_id = ? AND claimed_at IS NOT NULL AND claimed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(lease_seconds, ?) || ' seconds')))" );
+    params.push(callerAgentId(request, env), TASK_DEFAULT_LEASE_SECONDS);
+  } else {
+    where.push("kind = 'normal'");
+  }
   const rows = await db.prepare(
     TASK_SELECT_LIST + where.join(' AND ') + ' ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC'
   ).bind(...params).all();
   const items = (rows.results || []).map(serializeTask);
-  return jsonOk({ query: body.query, items, total: items.length, stream, status });
+  return jsonOk({ query: body.query, items, total: items.length, stream, status, kind, include_temp: includeTemp });
 }
 
 // ---- 路由入口 ---------------------------------------------------------------
@@ -1888,8 +2104,9 @@ async function handleRequest(request, env) {
   if (method === 'GET' && path === '/mem/health') {
     return healthHandler(env);
   }
-  const taskOperation = segments[0] === 'task'
-    ? ((method === 'GET' || (method === 'POST' && segments[1] === 'search')) ? 'read' : 'write')
+  const isTaskRoute = segments[0] === 'task' || segments[0] === 'need-human';
+  const taskOperation = isTaskRoute
+    ? ((method === 'GET' || (segments[0] === 'task' && method === 'POST' && segments[1] === 'search')) ? 'read' : 'write')
     : undefined;
   const authErr = checkAuth(request, env, taskOperation);
   if (authErr) return authErr;
@@ -1909,9 +2126,9 @@ async function handleRequest(request, env) {
     }
     try {
       if (segments.length === 2 && segments[1] === 'search') {
-        if (method === 'POST') return await searchTasksHandler(db, await readJson(request));
+        if (method === 'POST') return await searchTasksHandler(db, await readJson(request), request, env);
       } else if (segments.length === 1) {
-        if (method === 'GET') return await listTasksHandler(db, url);
+        if (method === 'GET') return await listTasksHandler(db, url, request, env);
         if (method === 'POST') return await createTaskHandler(db, await readJson(request));
       } else if (segments.length === 2) {
         const id = decodeURIComponent(segments[1]);
@@ -1932,6 +2149,13 @@ async function handleRequest(request, env) {
         if (method === 'POST' && segments[2] === 'release') {
           return await releaseTaskHandler(db, id, await readJson(request));
         }
+        if (method === 'POST' && segments[2] === 'need-human') {
+          return await createNeedHumanHandler(db, id, await readJson(request));
+        }
+      } else if (segments.length === 4 && segments[1] === 'need-human') {
+        if (method === 'POST' && segments[3] === 'resolve') {
+          return await resolveNeedHumanHandler(db, decodeURIComponent(segments[2]), await readJson(request));
+        }
       }
       return jsonError(405, 'METHOD_NOT_ALLOWED', '路径 ' + path + ' 不支持 ' + method);
     } catch (err) {
@@ -1939,6 +2163,27 @@ async function handleRequest(request, env) {
         return jsonError(err.httpStatus, err.code, err.message);
       }
       console.error('[sagitta-memory] unhandled task error:', err);
+      return jsonError(500, 'INTERNAL', '服务端内部错误：' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  if (segments[0] === 'need-human') {
+    // need-human 与 task 共用自举迁移；独立 GET 入口也必须 fail closed。
+    try {
+      await ensureTasksSchema(db);
+    } catch (err) {
+      return jsonError(503, 'TASK_SCHEMA_UNAVAILABLE', '任务 schema migration 失败，need-human 路由暂不可用');
+    }
+    try {
+      if (segments.length === 1 && method === 'GET') {
+        return await listNeedHumanHandler(db, url);
+      }
+      return jsonError(405, 'METHOD_NOT_ALLOWED', '路径 ' + path + ' 不支持 ' + method);
+    } catch (err) {
+      if (err && err.httpStatus) {
+        return jsonError(err.httpStatus, err.code, err.message);
+      }
+      console.error('[sagitta-memory] unhandled need-human error:', err);
       return jsonError(500, 'INTERNAL', '服务端内部错误：' + (err && err.message ? err.message : String(err)));
     }
   }

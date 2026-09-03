@@ -428,7 +428,7 @@ window.__ModuleLoader__.load({
         headMain.append(
           createElement("span", { class: "saa-eyebrow" }, "SAGITTA / AGENT CONTROL"),
           createElement("div", { class: "saa-title" }, "自主推进"),
-          createElement("div", { class: "saa-subtitle" }, "只读任务摘要 · 自动跟随悬浮球"),
+          createElement("div", { class: "saa-subtitle" }, "只读任务摘要 · 任务驱动自主推进"),
           createElement("div", { class: "saa-session" }, `当前作用会话：${currentSessionLabel(ctx)}`)
         );
         const actions = createElement("div", { class: "saa-actions" });
@@ -447,7 +447,7 @@ window.__ModuleLoader__.load({
         const status = createElement("div", { class: "saa-status" });
         status.append(
           row("模式", lastState?.mode === "auto" ? "自主推进" : "自由聊天"),
-          row("Idle", lastState?.idleSince === null || lastState?.idleSince === undefined ? "未计时" : `${formatDuration(lastState.idleSince)}（计时中）`),
+          row("任务驱动", lastState?.enabled ? (lastState?.ready ? "等待任务检查" : "无可推进任务") : "已熄火"),
           row("上次注入", formatTime(lastState?.injectedAt)),
           row("条件", lastState?.degraded ? `云端降级：${lastState.degradedReason || "稍后重试"}` : lastState?.hasPendingWork ? "有待处理工作" : lastState?.ready ? "可推进" : "暂不可推进")
         );
