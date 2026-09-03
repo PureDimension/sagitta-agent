@@ -773,9 +773,10 @@ export function registerMemoryTools(ctx, client) {
   // 状态机：open | in_progress | blocked | waiting | done；priority 0普通/1高/2紧急；
   // checkbox=1 表示"涟漪待处理"项（auto-advance 悬浮窗"待处理需求"区读 GET /task?checkbox=1&status=open）。
   // archived=1 为软删（列表/搜索默认排除）；done/blocked 通过 pending + confirm 才成为终态。
-  // 认领制（task-ownership-p2 §6）：task_list 投影 claim_state（unclaimed|claimed，"mine" 由模型按
-  // 已持有 claim_token 本地判断）；task_claim 认领（成功唯一一次下发 claim_token，模型持有）；
-  // task_release 释放（需 task_id+claim_token）；owner_agent_id/claim_token 不进 TASK_FIELDS 投影。
+  // 认领制（task-ownership-p2 §6）：task_list/详情投影 claim_state（unclaimed|claimed|mine，
+  // mine=请求带 X-Agent-Id 且与有效租约 owner 匹配，仅认领者本人可见——2026-09-03 W4 起 worker 下发）；
+  // task_claim 认领（成功唯一一次下发 claim_token，模型持有）；task_release 释放（需 task_id+claim_token）；
+  // owner_agent_id/claim_token 不进 TASK_FIELDS 投影（owner 对模型无感知；token 只在 claim 响应下发一次）。
 
   const nullableString = () => ({ oneOf: [{ type: "string" }, { type: "null" }] });
   const nullablePendingStatus = () => ({
@@ -803,10 +804,10 @@ export function registerMemoryTools(ctx, client) {
     confirmation_id: nullableString(),
     idempotent: { type: "boolean" },
     archived: { type: "integer", required: true },
-    // task-ownership-p2 §6：认领状态（unclaimed=未认领可认领；claimed=他人认领中、租约内）。
-    // "mine" 由调用方按已持有 claim_token 本地判断，Worker 不下发、工具不声明；
+    // task-ownership-p2 §6：认领状态（unclaimed=未认领可认领；claimed=他人认领中、租约内；
+    // mine=本调用方认领（X-Agent-Id 匹配 owner），worker 2026-09-03 W4 起下发，仅认领者本人可见）。
     // owner_agent_id / claim_token 刻意不进投影（owner 对模型无感知；token 只在 claim 响应下发一次）。
-    claim_state: { type: "string", enum: ["unclaimed", "claimed"] },
+    claim_state: { type: "string", enum: ["unclaimed", "claimed", "mine"] },
   };
   const TASK_STATUSES = ["open", "in_progress", "blocked", "waiting", "done"];
   const TASK_CREATE_STATUSES = ["open", "in_progress", "waiting"];
@@ -837,7 +838,7 @@ export function registerMemoryTools(ctx, client) {
       "done/blocked 只有 pending_done/pending_blocked 申请并经 task_confirm accept 后才是终态，pending 时带 confirmation_id；" +
       "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。\n" +
       "每条任务带 claim_state（task-ownership-p2）：unclaimed=未认领（可认领）；claimed=他人认领中（租约内），" +
-      "未认领才可认领。若你持有某任务的 claim_token（task_claim 成功响应唯一一次下发），该任务即视为你自己认领的（mine），" +
+      "未认领才可认领；mine=你自己认领的（worker 对带 X-Agent-Id 的认领者本人下发）。若你持有某任务的 claim_token（task_claim 成功响应唯一一次下发），该任务即视为你自己认领的（mine），" +
       "可继续推进或 task_release 释放；token 不在此列表中出现，请勿向任何日志/记忆写入 token。",
     parameters: {
       project: { type: "string", description: "项目过滤（如 research/lmy-diffusion-accel、sagitta-agent）。" },

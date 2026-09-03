@@ -91,8 +91,8 @@ export function pickTask(task) {
     pending_status: task.pending_status ?? null,
     archived: Number(task.archived ?? 0),
   };
-  // task-ownership-p2 §6：claim_state 派生（unclaimed | claimed）投影进列表/详情；
-  // "mine" 由调用方按已持有 claim_token 本地判断（Worker 不下发 mine）。
+  // task-ownership-p2 §6：claim_state 派生（unclaimed | claimed | mine）投影进列表/详情；
+  // mine=请求带 X-Agent-Id 且与有效租约 owner 匹配（Worker 2026-09-03 W4 起对认领者本人下发 mine）。
   // owner_agent_id / claim_token 永不投影（owner 对模型无感知；token 只在 claim 响应下发一次）。
   if (task.claim_state !== undefined && task.claim_state !== null) result.claim_state = String(task.claim_state);
   if (task.task_id !== undefined && task.task_id !== null) result.task_id = String(task.task_id);
