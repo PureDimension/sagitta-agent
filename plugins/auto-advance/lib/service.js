@@ -437,6 +437,8 @@ class AutoAdvanceService extends TypertRemoteService {
       const stale = readTasks(this.config.tasksPath, this.logger());
       return {
         ...stale,
+        pendingRequests: [],
+        pendingRequestsError: `need-human 列表暂不可用（任务 API 不可用：${renderError(error)}）`,
         source: "file-stale",
         error: `任务 API 暂时不可用（${renderError(error)}）；当前为 file-stale 文件快照${stale.error ? `；${stale.error}` : ""}`
       };
@@ -976,6 +978,13 @@ function taskApiUrl(workerApiUrl, page = 1, size = DEFAULT_TASK_PAGE_SIZE) {
   return url;
 }
 
+function needHumanApiUrl(workerApiUrl) {
+  const baseUrl = workerApiUrl.replace(/\/+$/u, "");
+  const url = new URL(`${baseUrl}/need-human`);
+  url.searchParams.set("status", "open");
+  return url;
+}
+
 function taskApiUpdatedAt(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string" || value.trim().length === 0) return null;
@@ -1020,26 +1029,29 @@ function mapApiTask(item) {
   return task;
 }
 
-function mapApiTaskSnapshot(items, tasksPath, source = "cloud") {
+function mapApiTaskSnapshot(items, tasksPath, source = "cloud", pendingRequests = [], pendingRequestsError) {
   let updatedAt = null;
-  const pendingRequests = [];
   const byProject = new Map();
-  for (const item of items) {
+  for (const item of Array.isArray(items) ? items : []) {
     const task = mapApiTask(item);
     // temp tasks are execution-only and must not appear in the floating UI.
     if (isTempTask(task, item)) continue;
     const itemUpdatedAt = task.updatedAt;
     if (itemUpdatedAt !== null && (updatedAt === null || itemUpdatedAt > updatedAt)) updatedAt = itemUpdatedAt;
-    // v2 uses open need-human entries. Keep checkbox as a temporary display
-    // fallback until the P2 memory/Worker projection is deployed.
-    if ((hasOpenNeedHuman(item) || task.hasCheckbox) && task.status !== "done") pendingRequests.push(task);
     if (!byProject.has(task.project)) byProject.set(task.project, []);
     byProject.get(task.project).push(task);
   }
   const sections = [...byProject.entries()]
     .map(([title, items]) => ({ title, items }))
     .sort((a, b) => b.items.length - a.items.length || a.title.localeCompare(b.title));
-  return { path: tasksPath, updatedAt, sections, pendingRequests, source };
+  return {
+    path: tasksPath,
+    updatedAt,
+    sections,
+    pendingRequests: Array.isArray(pendingRequests) ? pendingRequests : [],
+    ...(typeof pendingRequestsError === "string" && pendingRequestsError.length > 0 ? { pendingRequestsError } : {}),
+    source
+  };
 }
 
 // 复用 @sagitta/memory 的 http.js（CONNECT 隧道 + 传输层重试），读云端 /task。
@@ -1107,11 +1119,10 @@ function linkedAbortSignal(signal, timeoutMs) {
   };
 }
 
-async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
+async function requestTaskApiJson(apiConfig, config, url, signal) {
   if (completeTaskApiConfig(apiConfig) === undefined) {
     throw taskApiUnavailable("Worker API 认证或地址配置不完整");
   }
-  const url = taskApiUrl(apiConfig.workerApiUrl, page, config.taskPageSize);
   assertTaskTransportPolicy(apiConfig.workerApiUrl, config.proxy);
   const requestHeaders = buildTaskAuthHeaders(apiConfig);
   const timeoutMs = config.taskApiTimeoutMs;
@@ -1157,6 +1168,15 @@ async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
   } catch (error) {
     throw taskApiUnavailable("响应不是合法 JSON", error);
   }
+  return payload;
+}
+
+async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
+  if (completeTaskApiConfig(apiConfig) === undefined) {
+    throw taskApiUnavailable("Worker API 认证或地址配置不完整");
+  }
+  const url = taskApiUrl(apiConfig.workerApiUrl, page, config.taskPageSize);
+  const payload = await requestTaskApiJson(apiConfig, config, url, signal);
   try {
     const pageData = validateCloudTaskPage(payload);
     logger?.debug?.(`sagitta-auto-advance: task API returned page=${pageData.page} items=${pageData.items.length} total=${pageData.total}`);
@@ -1164,6 +1184,46 @@ async function requestTaskApiPage(apiConfig, config, page, signal, logger) {
   } catch (error) {
     throw taskApiUnavailableFrom(error);
   }
+}
+
+function unwrapTaskApiPayload(value) {
+  return isRecord(value) && value.ok === true && isRecord(value.data) ? value.data : value;
+}
+
+function mapNeedHumanItem(item) {
+  if (!isRecord(item)) return undefined;
+  const content = cleanMarkdown(typeof item.content === "string" ? item.content : "") || "未命名需求";
+  const taskTitle = cleanMarkdown(typeof item.task_title === "string" ? item.task_title : "");
+  const taskProject = cleanMarkdown(typeof item.task_project === "string" ? item.task_project : "");
+  const taskId = typeof item.task_id === "string" ? item.task_id.trim() : "";
+  const taskLabel = taskTitle || taskId || "未命名任务";
+  const projectLabel = taskProject.length > 0 ? `（项目：${taskProject}）` : "";
+  const suggestion = cleanMarkdown(typeof item.suggestion === "string" ? item.suggestion : "");
+  const body = [`所属任务：${taskLabel}${projectLabel}`, suggestion.length > 0 ? `建议：${suggestion}` : ""]
+    .filter((value) => value.length > 0)
+    .join(" · ");
+  return {
+    title: content,
+    hasCheckbox: false,
+    body,
+    needHumanId: typeof item.id === "string" ? item.id : typeof item.nh_id === "string" ? item.nh_id : "",
+    taskId,
+    taskTitle,
+    project: taskProject,
+    createdAt: taskApiUpdatedAt(item.created_at ?? item.createdAt)
+  };
+}
+
+async function readOpenNeedHumanFromApi(apiConfig, config) {
+  const payload = await requestTaskApiJson(apiConfig, config, needHumanApiUrl(apiConfig.workerApiUrl), undefined);
+  const data = unwrapTaskApiPayload(payload);
+  const rawItems = data?.items ?? data?.need_humans ?? data?.needHuman;
+  if (!Array.isArray(rawItems)) throw taskApiUnavailable("/need-human 响应缺少 items 列表");
+  return rawItems
+    .filter((item) => item?.status === undefined || item.status === "open")
+    .map(mapNeedHumanItem)
+    .filter((item) => item !== undefined)
+    .sort((first, second) => (second.createdAt ?? Number.NEGATIVE_INFINITY) - (first.createdAt ?? Number.NEGATIVE_INFINITY));
 }
 
 async function readCloudTaskSnapshotStrict(apiConfig, config, signal, logger) {
@@ -1182,36 +1242,28 @@ async function readCloudTaskSnapshotStrict(apiConfig, config, signal, logger) {
 
 async function readTasksFromApi(apiConfig, config, logger) {
   const snapshot = await readCloudTaskSnapshotStrict(apiConfig, config, undefined, logger);
-  return mapApiTaskSnapshot(snapshot.items, config.tasksPath, "cloud");
+  let pendingRequests = [];
+  let pendingRequestsError;
+  try {
+    pendingRequests = await readOpenNeedHumanFromApi(apiConfig, config);
+  } catch (error) {
+    pendingRequestsError = renderError(error);
+    logger?.warn?.(`sagitta-auto-advance: open need-human unavailable; showing an empty pending list: ${pendingRequestsError}`);
+  }
+  return mapApiTaskSnapshot(snapshot.items, config.tasksPath, "cloud", pendingRequests, pendingRequestsError);
 }
 
 function readTasks(path, logger) {
   try {
     const stat = readFileSync(path, { encoding: "utf8" });
     const sections = [];
-    const pendingRequests = [];
     let current = { title: "TASKS", items: [] };
     let tableColumns;
-    let reportInboxLevel;
-    let collectPendingRequests = false;
-    let pendingRequestDraft;
-    const flushPendingRequest = () => {
-      if (pendingRequestDraft === undefined) return;
-      pendingRequests.push(parsePendingRequest(pendingRequestDraft.text, pendingRequestDraft.body, pendingRequestDraft.hasCheckbox));
-      pendingRequestDraft = undefined;
-    };
     sections.push(current);
     for (const line of stat.split(/\r?\n/u)) {
       const heading = /^(#{1,6})\s+(.+?)\s*$/u.exec(line);
       if (heading !== null) {
-        flushPendingRequest();
-        const level = heading[1].length;
         const title = heading[2];
-        const isReportHeading = isReportInboxHeading(title);
-        const isPendingHeading = reportInboxLevel !== undefined && level > reportInboxLevel && isPendingRequestsHeading(title);
-        if (isReportHeading) reportInboxLevel = level;
-        else if (reportInboxLevel !== undefined && level <= reportInboxLevel) reportInboxLevel = undefined;
-        collectPendingRequests = isPendingHeading;
         current = { title, items: [] };
         tableColumns = undefined;
         sections.push(current);
@@ -1219,15 +1271,7 @@ function readTasks(path, logger) {
       }
       const task = /^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$/u.exec(line);
       if (task !== null) {
-        flushPendingRequest();
         current.items.push({ text: task[2], done: task[1].toLowerCase() === "x" });
-        if (collectPendingRequests && task[1] === " ") {
-          pendingRequestDraft = { text: task[2], body: [], hasCheckbox: true };
-        }
-        continue;
-      }
-      if (collectPendingRequests && pendingRequestDraft !== undefined && /^\s{2,}\S/u.test(line)) {
-        pendingRequestDraft.body.push(line.trim());
         continue;
       }
       const cells = parseTableRow(line);
@@ -1246,29 +1290,11 @@ function readTasks(path, logger) {
       const status = tableColumns.status >= 0 ? cleanMarkdown(cells[tableColumns.status] ?? "") : "";
       current.items.push({ text: status.length > 0 ? `${text}（${status}）` : text, done: /✅|完成/u.test(status) });
     }
-    flushPendingRequest();
-    return { path, updatedAt: statMtime(path), sections: sections.filter((section) => section.items.length > 0), pendingRequests, source: "file" };
+    return { path, updatedAt: statMtime(path), sections: sections.filter((section) => section.items.length > 0), pendingRequests: [], source: "file" };
   } catch (error) {
     logger?.warn?.(`sagitta-auto-advance: cannot read task file: ${renderError(error)}`);
     return { path, updatedAt: null, sections: [], pendingRequests: [], source: "file", error: "TASKS.md 暂时不可读" };
   }
-}
-
-function isReportInboxHeading(title) {
-  return /(?:§\s*2\b|汇报箱)/iu.test(title);
-}
-
-function isPendingRequestsHeading(title) {
-  return /需\s*涟漪\s*确认\s*[\/／]\s*行动/iu.test(title);
-}
-
-function parsePendingRequest(text, bodyLines, hasCheckbox) {
-  const firstLine = text.trim();
-  const titleMatch = /^\*\*(.+?)\*\*/u.exec(firstLine);
-  const title = cleanMarkdown(titleMatch?.[1] ?? firstLine) || "未命名需求";
-  const inlineBody = titleMatch === null ? "" : cleanMarkdown(firstLine.slice(titleMatch[0].length));
-  const body = [inlineBody, ...bodyLines.map(cleanMarkdown)].filter((value) => value.length > 0).join(" ");
-  return { title, hasCheckbox: hasCheckbox === true, body };
 }
 
 function parseTableRow(line) {

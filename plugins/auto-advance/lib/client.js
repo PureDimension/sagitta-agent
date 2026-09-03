@@ -76,18 +76,24 @@ window.__ModuleLoader__.load({
             if (request === null || typeof request.title !== "string" || typeof request.hasCheckbox !== "boolean" || typeof request.body !== "string") throw new Error("invalid pending request");
           }
         }
+        if (value.pendingRequestsError !== undefined && typeof value.pendingRequestsError !== "string") throw new Error("invalid pending request error");
         return value;
       });
     }
 
+    const IN_PROGRESS_META = Object.freeze({ label: "进行中", icon: "⟳", priority: 4 });
+    const COMPLETED_META = Object.freeze({ label: "已完成", icon: "✓", priority: 2 });
     const STATUS_META = Object.freeze({
-      running: Object.freeze({ label: "进行中", icon: "⟳", priority: 4 }),
+      open: Object.freeze({ label: "待认领", icon: "□", priority: 1 }),
+      in_progress: IN_PROGRESS_META,
       blocked: Object.freeze({ label: "阻塞中", icon: "🔒", priority: 3 }),
-      completed: Object.freeze({ label: "已完成", icon: "✓", priority: 2 }),
+      completed: COMPLETED_META,
+      done: COMPLETED_META,
       waiting: Object.freeze({ label: "等待中", icon: "◷", priority: 1 })
     });
+    const STATUS_ALIASES = Object.freeze({ done: "completed" });
     const STATUS_DETECTORS = Object.freeze([
-      Object.freeze({ status: "running", pattern: /(?:🔄|进行中|推进中|开发中|处理中|执行中|active|running)/iu }),
+      Object.freeze({ status: "in_progress", pattern: /(?:🔄|进行中|推进中|开发中|处理中|执行中|active|running)/iu }),
       Object.freeze({ status: "blocked", pattern: /(?:🚩|阻塞|阻碍|blocked|block)/iu }),
       Object.freeze({ status: "completed", pattern: /(?:✅|已完成|完成|结案|closed|done|completed)/iu }),
       Object.freeze({ status: "waiting", pattern: /(?:⏳|🕒|等待|待处理|待确认|pending|waiting|todo)/iu })
@@ -146,13 +152,15 @@ window.__ModuleLoader__.load({
       .saa-task-meta { display: flex; align-items: center; gap: 7px; margin-top: 6px; }
       .saa-task-status { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 999px; background: rgba(255,255,255,.07); color: #b9c7d8; font-size: 10px; font-weight: 650; white-space: nowrap; }
       .saa-task-icon { display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center; font-size: 12px; line-height: 1; }
-      .saa-task-icon[data-status="running"] { color: #70a4ff; animation: saa-spin 1.4s linear infinite; }
+      .saa-task-icon[data-status="open"] { color: #9fbfff; }
+      .saa-task-icon[data-status="in_progress"] { color: #70a4ff; animation: saa-spin 1.4s linear infinite; }
       .saa-task-icon[data-status="blocked"] { color: #ffb870; font-size: 11px; }
-      .saa-task-icon[data-status="completed"] { color: #65d6a0; font-size: 14px; font-weight: 700; }
+      .saa-task-icon[data-status="completed"], .saa-task-icon[data-status="done"] { color: #65d6a0; font-size: 14px; font-weight: 700; }
       .saa-task-icon[data-status="waiting"] { color: #9eacc0; }
-      .saa-task-status[data-status="running"] { background: rgba(83,135,234,.15); color: #8cb5ff; }
+      .saa-task-status[data-status="open"] { background: rgba(83,135,234,.11); color: #aac5ff; }
+      .saa-task-status[data-status="in_progress"] { background: rgba(83,135,234,.15); color: #8cb5ff; }
       .saa-task-status[data-status="blocked"] { background: rgba(232,151,68,.14); color: #ffc17e; }
-      .saa-task-status[data-status="completed"] { background: rgba(72,188,130,.13); color: #82dfb1; }
+      .saa-task-status[data-status="completed"], .saa-task-status[data-status="done"] { background: rgba(72,188,130,.13); color: #82dfb1; }
       .saa-task-status[data-status="waiting"] { background: rgba(148,165,187,.13); color: #bec9d7; }
       .saa-task-updated { color: #73859c; font-size: 10px; }
       .saa-empty, .saa-error { padding: 13px; border-radius: 11px; background: rgba(255,255,255,.04); color: #899bb2; }
@@ -161,14 +169,17 @@ window.__ModuleLoader__.load({
       .saa-error { color: #ffaaa8; }
       @keyframes saa-panel-in { from { opacity: 0; } to { opacity: 1; } }
       @keyframes saa-spin { to { transform: rotate(360deg); } }
-      @media (prefers-reduced-motion: reduce) { .saa-panel, .saa-ball, .saa-project, .saa-toggle, .saa-close { animation: none; transition: none; } .saa-task-icon[data-status="running"] { animation: none; } }
+      @media (prefers-reduced-motion: reduce) { .saa-panel, .saa-ball, .saa-project, .saa-toggle, .saa-close { animation: none; transition: none; } .saa-task-icon[data-status="in_progress"] { animation: none; } }
     `;
 
-    function statusFromValue(value, done) {
+    function statusFromValue(value, done, allowLegacyGuess = false) {
       const explicit = safeText(value).trim().toLowerCase();
-      if (Object.prototype.hasOwnProperty.call(STATUS_META, explicit)) return explicit;
-      for (const detector of STATUS_DETECTORS) if (detector.pattern.test(safeText(value))) return detector.status;
-      return done === true ? "completed" : "waiting";
+      const canonical = STATUS_ALIASES[explicit] ?? explicit;
+      if (Object.prototype.hasOwnProperty.call(STATUS_META, canonical)) return canonical;
+      if (allowLegacyGuess) {
+        for (const detector of STATUS_DETECTORS) if (detector.pattern.test(safeText(value))) return detector.status;
+      }
+      return done === true ? "completed" : "open";
     }
 
     function startsLikeStatus(value) {
@@ -200,11 +211,13 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    function normalizeTask(item, order) {
+    function normalizeTask(item, order, allowLegacyStatusGuess = false) {
       const rawText = safeText(item?.text).trim();
-      const split = splitStatusSuffix(rawText);
-      const explicitStatus = safeText(item?.status);
-      const status = statusFromValue(explicitStatus || split.status || rawText, item?.done === true);
+      const hasExplicitStatus = safeText(item?.status).trim().length > 0;
+      const split = allowLegacyStatusGuess && !hasExplicitStatus ? splitStatusSuffix(rawText) : { text: rawText, status: "" };
+      const status = hasExplicitStatus
+        ? statusFromValue(item.status, item?.done === true)
+        : statusFromValue(split.status, item?.done === true, allowLegacyStatusGuess);
       return {
         text: split.text || rawText || "未命名事项",
         status,
@@ -247,10 +260,11 @@ window.__ModuleLoader__.load({
     function taskGroups(snapshot) {
       const groups = new Map();
       let order = 0;
+      const allowLegacyStatusGuess = snapshot?.source === "file-stale";
       for (const section of Array.isArray(snapshot?.sections) ? snapshot.sections : []) {
         const title = safeText(section?.title).trim() || "未分类";
         if (isReportInboxSection(title)) continue;
-        const items = (Array.isArray(section?.items) ? section.items : []).map((item) => normalizeTask(item, order++));
+        const items = (Array.isArray(section?.items) ? section.items : []).map((item) => normalizeTask(item, order++, allowLegacyStatusGuess));
         if (items.length === 0) continue;
         if (isLegacyFlatSection(title, items)) {
           for (const item of items) {
@@ -462,15 +476,18 @@ window.__ModuleLoader__.load({
         const pendingTitle = createElement("div", { class: "saa-task-title saa-pending-heading" });
         pendingTitle.append(createElement("span", {}, "🔔 待处理需求"), createElement("span", { class: "saa-task-count" }, `${pending.length} 项`));
         taskScroll.append(pendingTitle);
+        if (tasks?.pendingRequestsError) {
+          taskScroll.append(createElement("div", { class: "saa-error saa-pending-empty" }, `⚠ 待处理需求暂不可用：${tasks.pendingRequestsError}`));
+        }
         if (pending.length === 0) {
-          taskScroll.append(createElement("div", { class: "saa-empty saa-pending-empty" }, "暂无待处理需求"));
+          if (!tasks?.pendingRequestsError) taskScroll.append(createElement("div", { class: "saa-empty saa-pending-empty" }, "暂无待处理需求"));
         } else {
           const pendingList = createElement("ul", { class: "saa-pending-list" });
           for (const request of pending) {
             const requestTitle = request.title.trim() || "未命名需求";
             const requestBody = safeText(request.body).trim();
             const requestItem = createElement("li", { class: "saa-pending-item" });
-            requestItem.append(createElement("span", { class: "saa-pending-checkbox", "aria-hidden": "true" }, request.hasCheckbox === true ? "□" : "•"));
+            requestItem.append(createElement("span", { class: "saa-pending-checkbox", "aria-hidden": "true" }, "•"));
             const requestContent = createElement("div", { class: "saa-pending-content" });
             requestContent.append(createElement("div", { class: "saa-pending-item-title" }, requestTitle));
             if (requestBody.length > 0) requestContent.append(createElement("div", { class: "saa-pending-body" }, requestBody));
