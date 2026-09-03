@@ -49,6 +49,27 @@ export function validateClaimLease(value) {
   return value;
 }
 
+/**
+ * 投影 task_need_human 响应，兼容 Worker 的 id/nh_id 及旧响应别名。
+ * type 缺省按旧数据语义归一为 need；notify 原样保留。
+ */
+export function pickNeedHuman(raw) {
+  const src = raw?.need_human ?? raw?.needHuman ?? raw?.item ?? raw ?? {};
+  const resolved = src.status === "resolved" || src.resolved === true || src.resolved_at;
+  return {
+    nh_id: String(src.nh_id ?? src.need_human_id ?? src.id ?? ""),
+    task_id: String(src.task_id ?? src.taskId ?? ""),
+    type: src.type === "notify" ? "notify" : "need",
+    content: String(src.content ?? ""),
+    suggestion: src.suggestion === undefined || src.suggestion === null ? null : String(src.suggestion),
+    status: resolved ? "resolved" : "open",
+    resolve_kind: src.resolve_kind === undefined || src.resolve_kind === null ? null : String(src.resolve_kind),
+    created_at: String(src.created_at ?? src.created ?? ""),
+    resolved_at: src.resolved_at === undefined || src.resolved_at === null ? null : String(src.resolved_at),
+    updated_at: src.updated_at === undefined || src.updated_at === null ? null : String(src.updated_at),
+  };
+}
+
 export function pickTask(task) {
   if (!task) return null;
   const result = {

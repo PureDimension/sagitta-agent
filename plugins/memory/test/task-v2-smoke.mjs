@@ -50,10 +50,11 @@ const server = createServer(async (req, res) => {
   requests.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), body, agentId: req.headers["x-agent-id"] });
 
   if (req.method === "POST" && url.pathname === "/task/tsk-need/need-human") {
-    assert.deepEqual(body, { content: "请确认是否保留旧接口", suggestion: "建议保留兼容层" });
+    assert.deepEqual(body, { content: "请确认是否保留旧接口", type: "need", suggestion: "建议保留兼容层" });
     return json(res, 201, { ok: true, data: {
       nh_id: "nh-1",
       task_id: "tsk-need",
+      type: body.type,
       content: body.content,
       suggestion: body.suggestion,
       status: "open",
@@ -63,11 +64,27 @@ const server = createServer(async (req, res) => {
       updated_at: null,
     } });
   }
+  if (req.method === "POST" && url.pathname === "/task/tsk-notify/need-human") {
+    assert.deepEqual(body, { content: "部署完成，可安排验证", type: "notify" });
+    return json(res, 201, { ok: true, data: {
+      nh_id: "nh-2",
+      task_id: "tsk-notify",
+      type: body.type,
+      content: body.content,
+      suggestion: null,
+      status: "open",
+      resolve_kind: null,
+      created_at: "2026-09-03T00:00:02.500Z",
+      resolved_at: null,
+      updated_at: null,
+    } });
+  }
   if (req.method === "POST" && url.pathname === "/task/need-human/nh-1/resolve") {
     assert.deepEqual(body, { resolve_kind: "abandoned" });
     return json(res, 200, { ok: true, data: {
       nh_id: "nh-1",
       task_id: "tsk-need",
+      type: "need",
       content: "请确认是否保留旧接口",
       suggestion: "建议保留兼容层",
       status: "resolved",
@@ -80,15 +97,27 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/need-human") {
     assert.equal(url.searchParams.get("status"), "open");
     return json(res, 200, { ok: true, data: {
-      total: 1,
+      total: 2,
       items: [{
         id: "nh-open",
         task_id: "tsk-project",
+        type: "need",
         content: "需要涟漪选方案 A/B",
         suggestion: null,
         status: "open",
         resolve_kind: null,
         created_at: "2026-09-03T00:00:04.000Z",
+        resolved_at: null,
+        updated_at: null,
+      }, {
+        id: "nh-notify",
+        task_id: "tsk-notify",
+        type: "notify",
+        content: "部署完成，可安排验证",
+        suggestion: null,
+        status: "open",
+        resolve_kind: null,
+        created_at: "2026-09-03T00:00:05.000Z",
         resolved_at: null,
         updated_at: null,
       }],
@@ -163,13 +192,18 @@ const client = new SagittaMemoryClient({
 
 try {
   // need-human：记 / 解 / 跨任务列。
-  const createdNeedHuman = await client.createNeedHuman("tsk-need", "请确认是否保留旧接口", "建议保留兼容层");
+  const createdNeedHuman = await client.createNeedHuman("tsk-need", "请确认是否保留旧接口", "建议保留兼容层", "need");
   assert.equal(createdNeedHuman.nh_id, "nh-1");
+  assert.equal(createdNeedHuman.type, "need");
+  const createdNotify = await client.createNeedHuman("tsk-notify", "部署完成，可安排验证", undefined, "notify");
+  assert.equal(createdNotify.type, "notify");
   const resolvedNeedHuman = await client.resolveNeedHuman("nh-1", "abandoned");
   assert.equal(resolvedNeedHuman.status, "resolved");
+  assert.equal(resolvedNeedHuman.type, "need");
   const openNeedHumans = await client.listNeedHuman("open");
-  assert.equal(openNeedHumans.total, 1);
-  assert.equal(openNeedHumans.items[0].task_id, "tsk-project");
+  assert.equal(openNeedHumans.total, 2);
+  assert.deepEqual(openNeedHumans.items.map((item) => item.type), ["need", "notify"]);
+  assert.equal(openNeedHumans.items[1].type, "notify");
 
   // temp：创建不带 project；kind 过滤与 owner=me 视图。
   const createdTemp = await client.createTask({ kind: "temp", title: "临时两调用任务" });
@@ -211,7 +245,7 @@ try {
   assert.equal(gate.assertBound(undefined, agent).length, 0);
   assert.equal("claim_token" in pickTask(claimed), false);
 
-  console.log("memory task v2 smoke: PASS (need-human create/resolve/list, temp create/filter, claim recall mock, task_assert_bound gate)");
+  console.log("memory task v2 smoke: PASS (need/notify create + resolve/list type passthrough, temp create/filter, claim recall mock, task_assert_bound gate)");
 } finally {
   server.close();
 }

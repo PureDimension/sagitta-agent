@@ -435,10 +435,19 @@ export class SagittaMemoryClient {
     });
   }
 
-  /** 记录任务需要涟漪参与/决定（task-system-v2 §2.3）。 */
-  async createNeedHuman(taskId, content, suggestion, signal) {
+  /**
+   * 记录任务需要涟漪参与/决定（task-system-v2 §2.3/§10.1）。
+   * type=need 阻塞 done；type=notify 仅告知涟漪，不阻塞 done。
+   */
+  async createNeedHuman(taskId, content, suggestion, type = "need", signal) {
+    // 兼容旧的 positional 调用 createNeedHuman(taskId, content, suggestion, signal)。
+    if (type !== undefined && type !== null && typeof type !== "string") {
+      signal = type;
+      type = "need";
+    }
     const body = {
       content,
+      type: type ?? "need",
       ...(suggestion !== undefined && suggestion !== null ? { suggestion } : {}),
     };
     return await this.request(`/task/${encodeURIComponent(taskId)}/need-human`, {
