@@ -4,6 +4,7 @@ import {
   AUTONOMOUS_PROMPT,
   IN_PERSON_CHALLENGE,
   AUTONOMOUS_CHALLENGE,
+  AUTONOMOUS_TURN_END_CHALLENGE,
   STOP_MARKER,
   splitCloudTaskSnapshotStrict,
   parseRoundCloseText,
@@ -15,7 +16,7 @@ const name = "sagitta-auto-advance";
 const inject = ["agents", "goals", "sessions", "sagitta-manager", "sagitta-async-work"];
 
 const Config = z.object({
-  idleTimeoutMs: z.number().default(300000).description("Task-driven polling delay; idle time alone never starts autonomous work."),
+  idleTimeoutMs: z.number().default(15000).description("Task-driven polling delay; idle time alone never starts autonomous work."),
   statePath: z.string().description("JSON file used to persist the per-session mode. Defaults to the resolved Sagitta workspace."),
   tasksPath: z.string().description("Read-only Markdown task file shown by the client panel. Defaults to the resolved Sagitta workspace."),
   proxy: z.string().default(process.env.DSH_MEMORY_PROXY || "direct").description("HTTP 代理（CONNECT 隧道）用于读云端 /task；与 memory 共用 DSH_MEMORY_PROXY；'direct' 或空串仅允许 loopback。"),
@@ -47,6 +48,7 @@ export {
   AUTONOMOUS_PROMPT,
   IN_PERSON_CHALLENGE,
   AUTONOMOUS_CHALLENGE,
+  AUTONOMOUS_TURN_END_CHALLENGE,
   Config,
   STOP_MARKER,
   splitCloudTaskSnapshotStrict,

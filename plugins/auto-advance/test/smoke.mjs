@@ -8,6 +8,9 @@ import {
   AUTONOMOUS_PROMPT,
   IN_PERSON_CHALLENGE,
   AUTONOMOUS_CHALLENGE,
+  AUTONOMOUS_TURN_END_CHALLENGE,
+  TASK_RECHECK_DELAY_MS,
+  normalizeConfig,
   buildTaskAuthHeaders,
   isLoopbackUrl,
   hasOpenNeedHuman,
@@ -59,6 +62,11 @@ assert.equal(buildTaskAuthHeaders({ accessClientId: "id", accessClientSecret: "s
 assert.equal(isLoopbackUrl("http://127.0.0.1:8787"), true);
 assert.equal(isLoopbackUrl("https://worker.example.test"), false);
 assert.doesNotMatch(AUTONOMOUS_PROMPT, /round[_-]?close/iu);
+assert.equal(normalizeConfig({
+  statePath: join(tmpdir(), "sagitta-auto-advance-default-state.json"),
+  tasksPath: join(tmpdir(), "sagitta-auto-advance-default-TASKS.md"),
+}).idleTimeoutMs, 15000);
+assert.equal(TASK_RECHECK_DELAY_MS, 30000, "pending/running recheck remains quieter than the 15s idle probe");
 assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "notify", status: "open" }] }), false);
 assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "need", status: "open" }] }), true);
 assert.equal(hasOpenNeedHuman({ open_need_human: true, open_need_human_type: "notify" }), false);
@@ -72,6 +80,7 @@ assert.equal(mappedNotifyOnly.sections[0].items[0].open_need_human, false);
 
 let responseMode = "owned";
 const resolvedRequests = [];
+const blockedRequests = [];
 const taskReadAgentIds = [];
 const pendingNeedHumans = [
   {
@@ -113,6 +122,20 @@ const server = createServer(async (request, response) => {
     } }));
     return;
   }
+  const patchMatch = /^\/task\/([^/]+)$/u.exec(requestUrl.pathname);
+  if (request.method === "PATCH" && patchMatch !== null) {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    blockedRequests.push({
+      id: decodeURIComponent(patchMatch[1]),
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      authorization: request.headers.authorization,
+      agentId: request.headers["x-agent-id"] ?? null,
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, data: { ok: true } }));
+    return;
+  }
   if (request.method === "GET" && requestUrl.pathname === "/need-human") {
     const items = pendingNeedHumans.filter((item) => !resolvedRequests.some((resolved) => resolved.id === item.id));
     response.writeHead(200, { "content-type": "application/json" });
@@ -145,7 +168,7 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const workerUrl = `http://127.0.0.1:${server.address().port}`;
 
-function makeHarness({ api = true } = {}) {
+function makeHarness({ api = true, runningWork = false } = {}) {
   const agent = {
     id: "agent-smoke",
     status: "idle",
@@ -154,6 +177,7 @@ function makeHarness({ api = true } = {}) {
     followup(message) { this.followups.push(message); },
   };
   const events = [];
+  const asyncWork = { listActive: () => runningWork ? [{ status: "running", task_id: "tsk-work" }] : [] };
   const ctx = {
     fiber: { state: 2 },
     agents: {
@@ -161,7 +185,7 @@ function makeHarness({ api = true } = {}) {
       get: (id) => id === agent.id ? agent : undefined,
       isOwnedBy: () => false,
     },
-    get: (name) => name === "sagitta-async-work" ? { listActive: () => [] } : undefined,
+    get: (name) => name === "sagitta-async-work" ? asyncWork : undefined,
     logger: { warn() {}, debug() {} },
     emit: (_event, payload) => events.push(payload),
   };
@@ -179,6 +203,7 @@ function makeHarness({ api = true } = {}) {
     idleTimeoutMs: 1000,
   };
   service.persistedModes = new Map();
+  service.listeners = new Set();
   service.persistModes = () => {};
   service.broadcast = (_state, reason) => events.push({ reason });
   const state = {
@@ -207,6 +232,7 @@ function makeHarness({ api = true } = {}) {
     service,
     state,
     agent,
+    ctx,
     events,
   };
 }
@@ -343,19 +369,70 @@ try {
   assert.match(clientSource, /remoteApi\.resolveNeedHuman/u);
   assert.match(clientSource, /await refresh\(true\)/u);
   rmSync(directory, { recursive: true, force: true });
+
+  // 模拟 DSH 的 process SIGINT/SIGTERM → fiber.dispose：当前快照中的 owned
+  // in_progress 任务并行 PATCH blocked，携带写 token 与 session agent id。
+  responseMode = "owned";
+  const shutdownHarness = makeHarness();
+  shutdownHarness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
+    pages: [{
+      total: 3, page: 1, size: 200, has_more: false, source: "cloud",
+      items: [
+        task("tsk-shutdown-a", "in_progress", null, { claim_state: "mine" }),
+        task("tsk-shutdown-b", "in_progress", null, { claim_state: "mine" }, 19),
+        task("tsk-shutdown-done", "done", null, {}, 18),
+      ],
+    }],
+  });
+  assert.deepEqual(shutdownHarness.service.ownedInProgressTasks(shutdownHarness.state, shutdownHarness.state.cloudSnapshot).map((item) => item.task_id), ["tsk-shutdown-a", "tsk-shutdown-b"]);
+  assert.equal(shutdownHarness.service.resolveTaskApiConfig().workerApiUrl, workerUrl);
+  assert.equal(shutdownHarness.service.resolveTaskApiConfig().d1WriteToken, "smoke-write-token");
+  shutdownHarness.service.processShutdownRequested = true;
+  await shutdownHarness.service.blockOwnedTasksOnProcessShutdown();
+  assert.deepEqual(blockedRequests.slice(-2).sort((first, second) => first.id.localeCompare(second.id)), [
+    {
+      id: "tsk-shutdown-a",
+      body: { status: "blocked", blocked_reason: "sagitta 进程中断退出" },
+      authorization: "Bearer smoke-write-token",
+      agentId: "agent-smoke",
+    },
+    {
+      id: "tsk-shutdown-b",
+      body: { status: "blocked", blocked_reason: "sagitta 进程中断退出" },
+      authorization: "Bearer smoke-write-token",
+      agentId: "agent-smoke",
+    },
+  ]);
+
+  const normalDisposeHarness = makeHarness();
+  normalDisposeHarness.state.cloudSnapshot = shutdownHarness.state.cloudSnapshot;
+  normalDisposeHarness.service.processShutdownRequested = false;
+  await normalDisposeHarness.service.disposeLifecycle();
+  assert.equal(blockedRequests.length, 2, "normal plugin disposal must not mark tasks blocked");
+
+  const normalStopHarness = makeHarness({ api: false });
+  normalStopHarness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
+    pages: [{
+      total: 1, page: 1, size: 200, has_more: false, source: "cloud",
+      items: [task("tsk-stop-done", "done", null, {}, 18)],
+    }],
+  });
+  assert.equal(normalStopHarness.service.stopByProtocol(normalStopHarness.state), true);
+  assert.equal(blockedRequests.length, 2, "stopByProtocol must not mark tasks blocked");
+
   console.log("auto-advance smoke: PASS (need/notify mapping, notify resolve POST + refresh, task-driven branches, cloud defer, stale UI fallback)");
 } finally {
   server.close();
 }
 
-function challengeHarness(autonomousMode) {
-  const harness = makeHarness({ api: false });
+function challengeHarness(autonomousMode, { pendingStatus = null, runningWork = false } = {}) {
+  const harness = makeHarness({ api: false, runningWork });
   harness.state.autonomousMode = autonomousMode;
   harness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
     pages: [{
       total: 2, page: 1, size: 200, has_more: false, source: "cloud",
       items: [
-        task("tsk-work", "in_progress", null, { claim_state: "mine" }),
+        task("tsk-work", "in_progress", pendingStatus, { claim_state: "mine" }),
         task("tsk-temp", "in_progress", null, { claim_state: "mine", type: "temp" }),
       ],
     }],
@@ -387,5 +464,29 @@ const tempResult = await temp.service.handleAssistantMessage(temp.state, {
 });
 assert.equal(tempResult.ok, true);
 assert.equal(temp.agent.followups.length, 0);
+
+// autonomous 回合正常结束但仍有可收尾的 owned in_progress 时，注入轻量质询；
+// 有绑定运行中的工作或已有 pending 申请时均不拦。
+const turnEnd = challengeHarness(true);
+const turnEndResult = await turnEnd.service.handleTurnEnd(turnEnd.state, { data: { reason: { kind: "completed" } } });
+assert.equal(turnEndResult.challenged, true);
+assert.equal(turnEnd.agent.followups.length, 1);
+assert.ok(turnEnd.agent.followups[0].content[0].text.includes(AUTONOMOUS_TURN_END_CHALLENGE));
+assert.match(turnEnd.agent.followups[0].content[0].text, /tsk-work/u);
+
+const runningTurnEnd = challengeHarness(true, { runningWork: true });
+const runningTurnEndResult = await runningTurnEnd.service.handleTurnEnd(runningTurnEnd.state, { data: { reason: { kind: "completed" } } });
+assert.equal(runningTurnEndResult.ok, true);
+assert.equal(runningTurnEnd.agent.followups.length, 0);
+
+const pendingTurnEnd = challengeHarness(true, { pendingStatus: "pending_blocked" });
+const pendingTurnEndResult = await pendingTurnEnd.service.handleTurnEnd(pendingTurnEnd.state, { data: { reason: { kind: "completed" } } });
+assert.equal(pendingTurnEndResult.ok, true);
+assert.equal(pendingTurnEnd.agent.followups.length, 0);
+
+const presentTurnEnd = challengeHarness(false);
+const presentTurnEndResult = await presentTurnEnd.service.handleTurnEnd(presentTurnEnd.state, { data: { reason: { kind: "completed" } } });
+assert.equal(presentTurnEndResult.ignored, true);
+assert.equal(presentTurnEnd.agent.followups.length, 0);
 
 console.log("auto-advance challenge smoke: PASS (in-person/autonomous wording + temp exemption)");

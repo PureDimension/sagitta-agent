@@ -15,14 +15,18 @@ import { parseRoundCloseMessage, parseRoundCloseText, validateRoundClosePayload 
 const AUTONOMOUS_PROMPT = "涟漪已离开。请继续尽可能多完成下面已由你认领的 in_progress 任务；先做能自主推进的工作，并在完成或阻塞前自测、自查、核对验收点。终态请使用任务工具更新。";
 const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？是否已对交付内容做了审计（自测/自查）？若标 blocked，请确认已没有自主可推进部分；若标 done，请确认交付完整且没有 open need-human。";
 const AUTONOMOUS_CHALLENGE = "涟漪已离开。确认没有能自主推进的部分了？若需涟漪，记 need-human 后标 blocked；若完成，确认验收点都过了再 done。标记 blocked 前应先把能拆的拆、能自测的自测。";
+const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：要么完成、标 blocked、释放任务，要么说明理由。";
 
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
 const STATUS_EVENT = "sagitta-auto-advance/status";
 const ASYNC_WORK_SETTLED_EVENT = "async-work/settled";
-const DEFAULT_IDLE_TIMEOUT_MS = 300000;
+const DEFAULT_IDLE_TIMEOUT_MS = 15000;
 const DEFAULT_TASK_API_TIMEOUT_MS = 3000;
 const DEFAULT_TASK_PAGE_SIZE = 200;
+const TASK_RECHECK_DELAY_MS = 30000;
+const PROCESS_SHUTDOWN_TASK_BUDGET_MS = 4500;
+const PROCESS_SHUTDOWN_BLOCKED_REASON = "sagitta 进程中断退出";
 const CLOUD_RETRY_DELAYS_MS = [30000, 120000, 300000];
 const CLOUD_RETRY_JITTER = 0.2;
 const LEGACY_WORKSPACE_CANDIDATES = [
@@ -323,6 +327,9 @@ class AutoAdvanceService extends TypertRemoteService {
     this.states = new Map();
     this.listeners = new Set();
     this.persistedModes = this.loadModes();
+    this.processShutdownRequested = false;
+    this.processShutdownHandlers = [];
+    this.installProcessShutdownHooks();
 
     ctx.on("agent/created", ({ agent }) => {
       const state = this.stateFor(agent);
@@ -333,7 +340,9 @@ class AutoAdvanceService extends TypertRemoteService {
       if (state === undefined) return;
       state.disposed = true;
       this.clearTimer(state);
-      this.states.delete(agent);
+      // Keep the state until the process-shutdown disposer has collected its
+      // last cloud snapshot. Normal agent disposal still releases it here.
+      if (this.processShutdownRequested !== true) this.states.delete(agent);
       this.broadcast(state);
     });
     ctx.on("agent/session-start", ({ agent }) => {
@@ -405,6 +414,12 @@ class AutoAdvanceService extends TypertRemoteService {
         void this.handleAssistantMessage(state, event.data?.message).catch((error) => {
           safeLog(() => this.logger(), "warn", `sagitta-auto-advance: assistant protocol handling failed: ${renderError(error)}`);
         });
+        return;
+      }
+      if (event.type === "turn/end") {
+        void this.handleTurnEnd(state, event).catch((error) => {
+          safeLog(() => this.logger(), "warn", `sagitta-auto-advance: turn-end protocol handling failed: ${renderError(error)}`);
+        });
       }
     });
 
@@ -422,11 +437,7 @@ class AutoAdvanceService extends TypertRemoteService {
       }, "sagitta-auto-advance: job listeners");
     });
 
-    ctx.effect(() => () => {
-      for (const state of this.states.values()) this.clearTimer(state);
-      this.states.clear();
-      this.listeners.clear();
-    }, "sagitta-auto-advance: timers");
+    ctx.effect(() => () => this.disposeLifecycle(), "sagitta-auto-advance: timers");
 
     for (const agent of ctx.agents.list()) this.stateFor(agent);
   }
@@ -435,6 +446,44 @@ class AutoAdvanceService extends TypertRemoteService {
   onStatus(listener) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  installProcessShutdownHooks() {
+    const markShutdown = () => {
+      this.processShutdownRequested = true;
+    };
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      try {
+        process.on(signal, markShutdown);
+        this.processShutdownHandlers.push([signal, markShutdown]);
+      } catch {
+        // Some embedded runtimes do not expose every POSIX signal.
+      }
+    }
+  }
+
+  removeProcessShutdownHooks() {
+    for (const [signal, handler] of this.processShutdownHandlers ?? []) {
+      try {
+        process.removeListener(signal, handler);
+      } catch {
+        // Teardown must remain best effort.
+      }
+    }
+    this.processShutdownHandlers = [];
+  }
+
+  async disposeLifecycle() {
+    try {
+      if (this.processShutdownRequested === true) await this.blockOwnedTasksOnProcessShutdown();
+    } catch {
+      // Process teardown must never be held up by task API failures.
+    } finally {
+      for (const state of this.states.values()) this.clearTimer(state);
+      this.states.clear();
+      this.listeners.clear();
+      this.removeProcessShutdownHooks();
+    }
   }
 
   getState(agent) {
@@ -839,6 +888,49 @@ class AutoAdvanceService extends TypertRemoteService {
     return observed.transitions.length > 0 || observed.ownershipChanged ? { ok: true } : { ignored: true };
   }
 
+  async taskSnapshotForTurnEnd(state) {
+    const taskApi = this.resolveTaskApiConfig();
+    if (completeTaskApiConfig(taskApi) === undefined) return state.cloudSnapshot;
+    try {
+      // A terminal request may have landed after the last idle poll. Refresh
+      // before challenging so pending_done/pending_blocked is authoritative.
+      return await readCloudTaskSnapshotStrict(taskApi, this.config, undefined, this.logger(), state.agent.id);
+    } catch {
+      // Fail closed: an unavailable cloud snapshot must not manufacture a
+      // turn-ending challenge from stale local state.
+      return undefined;
+    }
+  }
+
+  async handleTurnEnd(state, event) {
+    if (state?.disposed === true || state?.enabled !== true || state.autonomousMode !== true) return { ignored: true };
+    if (event?.data?.reason?.kind === "aborted") return { ignored: true };
+    if (hasPendingInbox(state.agent)) return { ignored: true };
+
+    const snapshot = await this.taskSnapshotForTurnEnd(state);
+    if (snapshot === undefined || !this.isLive(state) || state.enabled !== true || state.autonomousMode !== true) {
+      return { ignored: true };
+    }
+    state.cloudSnapshot = snapshot;
+    this.syncOwnedTasks(state, snapshot);
+    if (hasPendingInbox(state.agent)) return { ignored: true };
+
+    const unfinished = this.ownedInProgressTasks(state, snapshot).filter((task) =>
+      !isTempTask(task) && task?.pending_status === null && !this.hasRunningWork(state.agent, task.task_id ?? task.id)
+    );
+    if (unfinished.length === 0) return { ok: true };
+
+    const taskLines = unfinished.map((task) => `task_id=${task.task_id ?? task.id}`);
+    this.queueNotice(
+      state,
+      `${AUTONOMOUS_TURN_END_CHALLENGE}\n未收尾任务：${taskLines.join("，")}`,
+      "autonomous in-progress task challenge",
+      "injected: autonomous-in-progress-challenge",
+      { autonomous: true }
+    );
+    return { ok: false, challenged: true, taskIds: unfinished.map((task) => task.task_id ?? task.id) };
+  }
+
   async handleStopMarker(state) {
     return this.stopByProtocol(state);
   }
@@ -863,7 +955,9 @@ class AutoAdvanceService extends TypertRemoteService {
     if (!this.isCurrentRun(state, generation) || state.timer !== undefined) return;
     state.retrying = true;
     state.idleSince = null;
-    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, Math.min(30000, this.config.idleTimeoutMs));
+    // Keep pending/running work quiet for longer than the ordinary 15s idle
+    // probe; this is a recheck, not another prompt injection cadence.
+    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, TASK_RECHECK_DELAY_MS);
     state.timer.unref?.();
     this.broadcast(state, reason);
   }
@@ -986,6 +1080,78 @@ class AutoAdvanceService extends TypertRemoteService {
     return true;
   }
 
+  async shutdownSnapshotFor(state, taskApi, signal) {
+    if (state.cloudSnapshot !== undefined) return state.cloudSnapshot;
+    if (completeTaskApiConfig(taskApi) === undefined) return undefined;
+    try {
+      return await readCloudTaskSnapshotStrict(taskApi, this.config, signal, this.logger(), state.agent.id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  async blockOwnedTasksOnProcessShutdown() {
+    const states = [...this.states.values()];
+    for (const state of states) {
+      state.disposed = true;
+      this.clearTimer(state);
+    }
+    if (states.length === 0) return;
+
+    let taskApi;
+    try {
+      taskApi = this.resolveTaskApiConfig();
+    } catch {
+      return;
+    }
+    if (completeTaskApiConfig(taskApi, "write") === undefined) return;
+
+    const controller = new AbortController();
+    let deadlineTimer;
+    const deadline = new Promise((resolve) => {
+      deadlineTimer = setTimeout(() => {
+        controller.abort();
+        resolve();
+      }, PROCESS_SHUTDOWN_TASK_BUDGET_MS);
+    });
+    const work = (async () => {
+      const groups = await Promise.all(states.map(async (state) => {
+        const snapshot = await this.shutdownSnapshotFor(state, taskApi, controller.signal);
+        return snapshot === undefined ? [] : this.ownedInProgressTasks(state, snapshot);
+      }));
+      const patches = [];
+      for (let index = 0; index < states.length; index++) {
+        for (const task of groups[index]) {
+          const taskId = nonEmptyString(task?.task_id ?? task?.id);
+          if (taskId === undefined) continue;
+          patches.push(requestTaskApiJson(
+            taskApi,
+            this.config,
+            taskPatchApiUrl(taskApi.workerApiUrl, taskId),
+            controller.signal,
+            {
+              method: "PATCH",
+              operation: "write",
+              agentId: states[index].agent.id,
+              body: { status: "blocked", blocked_reason: PROCESS_SHUTDOWN_BLOCKED_REASON }
+            }
+          ));
+        }
+      }
+      await Promise.allSettled(patches);
+    })().catch(() => {
+      // Individual API failures are already best effort during shutdown.
+    });
+    try {
+      await Promise.race([work, deadline]);
+    } catch {
+      // A signal path is best effort; never reject fiber.dispose().
+    } finally {
+      clearTimeout(deadlineTimer);
+      controller.abort();
+    }
+  }
+
   touchOwners(agent, reason) {
     for (const state of this.states.values()) {
       if (state.agent === agent || this.ctx.agents.isOwnedBy(agent.id, state.agent)) this.resetTimer(state, reason);
@@ -1068,6 +1234,11 @@ function taskApiUrl(workerApiUrl, page = 1, size = DEFAULT_TASK_PAGE_SIZE) {
   url.searchParams.set("page", String(page));
   url.searchParams.set("size", String(size));
   return url;
+}
+
+function taskPatchApiUrl(workerApiUrl, taskId) {
+  const baseUrl = workerApiUrl.replace(/\/+$/u, "");
+  return new URL(`${baseUrl}/task/${encodeURIComponent(taskId)}`);
 }
 
 function needHumanApiUrl(workerApiUrl) {
@@ -1426,7 +1597,10 @@ export {
   AUTONOMOUS_PROMPT,
   IN_PERSON_CHALLENGE,
   AUTONOMOUS_CHALLENGE,
+  AUTONOMOUS_TURN_END_CHALLENGE,
   STOP_MARKER,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  TASK_RECHECK_DELAY_MS,
   hasPendingInbox,
   isExactStopMessage,
   readTasks,
@@ -1440,5 +1614,6 @@ export {
   validateRoundClosePayload,
   buildTaskAuthHeaders,
   isLoopbackUrl,
-  resolveConfiguredPaths
+  resolveConfiguredPaths,
+  normalizeConfig
 };
