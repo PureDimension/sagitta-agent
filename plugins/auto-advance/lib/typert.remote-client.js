@@ -15,7 +15,16 @@ const stateSchema = z.object({
 });
 const taskSchema = z.object({
   text: z.string().readonly(),
-  done: z.boolean().readonly()
+  title: z.string().readonly().optional(),
+  done: z.boolean().readonly(),
+  // 2026-09-04：与 typert.host.js 同步补齐——client 收到 getTasks 结果时若
+  // 按本 schema parse（zod 默认 strip 未知键），缺 status/updatedAt/project
+  // 会让 in_progress 任务丢失状态、UI 只显示已完成任务。
+  status: z.string().readonly().optional(),
+  updatedAt: z.union([z.number(), z.null()]).readonly().optional(),
+  project: z.string().readonly().optional(),
+  task_id: z.string().readonly().optional(),
+  kind: z.string().readonly().optional()
 });
 const pendingRequestSchema = z.object({
   title: z.string().readonly(),
