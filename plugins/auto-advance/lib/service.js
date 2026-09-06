@@ -19,6 +19,7 @@ const AUTONOMOUS_CHALLENGE = "涟漪已离开。确认没有能自主推进的�
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
 const STATUS_EVENT = "sagitta-auto-advance/status";
+const ASYNC_WORK_SETTLED_EVENT = "async-work/settled";
 const DEFAULT_IDLE_TIMEOUT_MS = 300000;
 const DEFAULT_TASK_API_TIMEOUT_MS = 3000;
 const DEFAULT_TASK_PAGE_SIZE = 200;
@@ -380,6 +381,9 @@ class AutoAdvanceService extends TypertRemoteService {
     ctx.on("goal/changed", ({ agent }) => {
       this.resetTimer(this.stateFor(agent), "goal-changed");
     });
+    ctx.on(ASYNC_WORK_SETTLED_EVENT, (settled) => {
+      this.handleAsyncWorkSettled(settled);
+    });
     ctx.on("session/event", (session, event) => {
       const agent = ctx.agents.get(session.id);
       if (agent === undefined || agent.session !== session) return;
@@ -573,6 +577,23 @@ class AutoAdvanceService extends TypertRemoteService {
     } catch {
       return undefined;
     }
+  }
+
+  handleAsyncWorkSettled(settled) {
+    const ownerId = nonEmptyString(settled?.ownerId ?? settled?.owner_id);
+    if (ownerId === undefined) return false;
+    const agent = this.ctx.agents.get(ownerId);
+    if (agent === undefined || agent.status !== "idle") return false;
+    const state = this.states.get(agent);
+    if (state === undefined || state.requestController !== undefined) return false;
+
+    // Settlement only shortens the wait. The existing onTimer qualification
+    // still decides whether pending work, another running work, or need
+    // semantics permit an injection.
+    this.resetTimer(state, "async-work-settled");
+    const generation = state.timerGeneration;
+    void this.onTimer(state, generation);
+    return true;
   }
 
   hasRunningWork(agent, taskId) {

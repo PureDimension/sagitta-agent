@@ -58,6 +58,16 @@ function cloneWork(work) {
   return { ...work };
 }
 
+function settledPayload(work) {
+  return {
+    ownerId: work.owner_id,
+    workId: work.work_id,
+    taskId: work.task_id,
+    status: work.status,
+    reason: work.reason,
+  };
+}
+
 /**
  * Process-scoped bounded-work registry.
  *
@@ -71,6 +81,7 @@ class AsyncWorkRegistry {
     this.clock = clock;
     this.idFactory = idFactory;
     this.byOwner = new Map();
+    this.settledListeners = new Set();
     this.closed = false;
   }
 
@@ -120,7 +131,26 @@ class AsyncWorkRegistry {
     work.status = status;
     work.ended_at = isoTime(endedAt);
     work.reason = reason ?? null;
+    const payload = settledPayload(work);
+    for (const listener of [...this.settledListeners]) {
+      try {
+        const result = listener({ ...payload });
+        if (result !== undefined && result !== null && typeof result.then === "function") {
+          Promise.resolve(result).catch(() => {});
+        }
+      } catch {
+        // Settlement is already committed; a listener must not break it.
+      }
+    }
     return work;
+  }
+
+  /** Register a listener for every transition into a terminal status. */
+  onSettled(listener) {
+    if (typeof listener !== "function") throw new TypeError("onSettled listener 必须是函数");
+    this._ensureOpen();
+    this.settledListeners.add(listener);
+    return () => this.settledListeners.delete(listener);
   }
 
   register({ ownerId, taskId, kind = "generic", desc = "", timeoutMs } = {}) {
@@ -247,6 +277,7 @@ class AsyncWorkRegistry {
       }
     }
     this.byOwner.clear();
+    this.settledListeners.clear();
     this.closed = true;
     return cancelled;
   }

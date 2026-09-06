@@ -181,9 +181,7 @@ function makeHarness({ api = true } = {}) {
   service.persistedModes = new Map();
   service.persistModes = () => {};
   service.broadcast = (_state, reason) => events.push({ reason });
-  return {
-    service,
-    state: {
+  const state = {
       agent,
       enabled: true,
       stoppedByProtocol: false,
@@ -203,11 +201,41 @@ function makeHarness({ api = true } = {}) {
       degradedReason: null,
       cloudSnapshot: undefined,
       lastProtocolNotice: null,
-    },
+  };
+  service.states = new Map([[agent, state]]);
+  return {
+    service,
+    state,
     agent,
     events,
   };
 }
+
+// async-work settlement is only an early wake-up; the actual check remains
+// onTimer's existing qualification path. It must be immediate while idle.
+const settleWakeHarness = makeHarness({ api: false });
+let settleWakeReason;
+let settleChecks = 0;
+settleWakeHarness.service.resetTimer = (_state, reason) => {
+  settleWakeReason = reason;
+  settleWakeHarness.state.timerGeneration += 1;
+};
+settleWakeHarness.service.onTimer = (_state, generation) => {
+  settleChecks++;
+  assert.equal(generation, settleWakeHarness.state.timerGeneration);
+};
+assert.equal(settleWakeHarness.service.handleAsyncWorkSettled({
+  ownerId: "agent-smoke",
+  workId: "work-settled",
+  taskId: "task-settled",
+  status: "completed",
+  reason: null,
+}), true);
+assert.equal(settleWakeReason, "async-work-settled");
+assert.equal(settleChecks, 1, "settlement must check immediately, without idleTimeout");
+settleWakeHarness.agent.status = "running";
+assert.equal(settleWakeHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", status: "failed" }), false);
+assert.equal(settleChecks, 1, "a running agent must not be interrupted by settlement");
 
 try {
   // 有已认领 in_progress 才注入自主推进；提示只带轻量任务清单，取消 round-close 强制。

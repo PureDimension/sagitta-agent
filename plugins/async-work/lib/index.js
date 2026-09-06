@@ -19,6 +19,7 @@ import {
 } from "./registry.js";
 
 const name = "sagitta-async-work";
+const ASYNC_WORK_SETTLED_EVENT = "async-work/settled";
 const inject = ["tools"];
 
 const Config = z.object({
@@ -172,6 +173,13 @@ class AsyncWorkService extends Service {
     this.registry = new AsyncWorkRegistry({
       defaultTimeoutMs: configuredTimeout === undefined ? DEFAULT_TIMEOUT_MS : normalizeDefaultTimeout(configuredTimeout),
     });
+    this.disposeSettled = this.registry.onSettled((payload) => {
+      try {
+        this.ctx.emit?.(ASYNC_WORK_SETTLED_EVENT, payload);
+      } catch {
+        // Event delivery is advisory; registry settlement must remain committed.
+      }
+    });
     this.unavailableReason = null;
   }
 
@@ -225,7 +233,10 @@ class AsyncWorkService extends Service {
   }
 
   dispose() {
-    return this.registry.dispose();
+    const cancelled = this.registry.dispose();
+    this.disposeSettled?.();
+    this.disposeSettled = undefined;
+    return cancelled;
   }
 }
 
@@ -250,6 +261,7 @@ export {
   AsyncWorkError,
   AsyncWorkRegistry,
   AsyncWorkService,
+  ASYNC_WORK_SETTLED_EVENT,
   Config,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
