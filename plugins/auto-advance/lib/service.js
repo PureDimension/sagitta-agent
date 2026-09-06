@@ -649,7 +649,8 @@ class AutoAdvanceService extends TypertRemoteService {
 
   actionableOwnedTasks(state, snapshot = state.cloudSnapshot) {
     return this.ownedInProgressTasks(state, snapshot).filter((task) =>
-      task?.pending_status === null && !hasOpenNeedHuman(task) && !this.hasRunningWork(state.agent, task.task_id ?? task.id)
+      // need 型 open 条目只阻塞 done 申请；need 之外仍可自主推进的工作不应被挡住。
+      task?.pending_status === null && !this.hasRunningWork(state.agent, task.task_id ?? task.id)
     );
   }
 
@@ -904,7 +905,9 @@ class AutoAdvanceService extends TypertRemoteService {
         const lines = actionable.map((task) => {
           const title = typeof task.title === "string" ? task.title.trim() : "";
           const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
-          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}`;
+          const needCount = openNeedHumanCount(task);
+          const needNote = needCount > 0 ? ` ⚠ 有 ${needCount} 条待涟漪处理项，need 之外部分继续推进` : "";
+          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}${needNote}`;
         });
         const prompt = [AUTONOMOUS_PROMPT, "", "当前我认领的 in_progress 任务：", ...lines].join("\n");
         this.queuePrompt(state, generation, prompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
@@ -912,10 +915,9 @@ class AutoAdvanceService extends TypertRemoteService {
       }
 
       if (owned.length > 0) {
-        // A task with an open need-human or pending confirmation is already
-        // waiting for the user/model interaction that created it. Do not
-        // inject the same question again; keep a quiet poll for resolution.
-        this.scheduleTaskRecheck(state, generation, "defer: need-human");
+        // Need 型 open 条目不阻塞推进；走到这里仅表示所有 owned 任务都在
+        // 等 pending 申请确认或绑定的有界工作运行中。不要重复注入，安静轮询。
+        this.scheduleTaskRecheck(state, generation, "defer: pending-or-running-work");
         return;
       }
 

@@ -132,6 +132,6 @@ checkbox→need-human 汇聚；waiting→删；round_close→删；blocked_by→
 
 - **done 前置拦截**：申请 done（生成 pending_done）时若存在 open need-human（type=need）→ 服务端拒绝并报错（不生成 pending_done）；agent 只能改标 blocked 或先 resolve need-human。A 方案（拒绝+报错，不自动转 blocked）。
 - **type 字段**：need_human 表加 `type`（need | notify）。
-  - `need`：需要涟漪参与才能继续 → 阻塞 done（未清不许 done）
+  - `need`：需要涟漪参与该部分 → 只阻塞 done（未清不许 done），不阻塞任务推进
   - `notify`：告知涟漪（如"已部署可验证"）→ 不阻塞 done；涟漪在前端点击确认 → resolved（agent 不介入）
 - hasOpenNeedHuman 判定只算 type=need，不算 notify。

@@ -123,7 +123,11 @@ const server = createServer(async (request, response) => {
     owned: [task("tsk-mine", "in_progress", null, { claim_state: "mine" }, 20)],
     open: [task("tsk-open", "open", null, { claim_state: "unclaimed" }, 20)],
     empty: [task("tsk-done", "done", null, {}, 20), task("tsk-blocked", "blocked", null, {}, 19)],
-    need: [task("tsk-mine", "in_progress", null, { claim_state: "mine", open_need_human: true }, 20)],
+    need: [task("tsk-mine", "in_progress", null, {
+      claim_state: "mine",
+      need_humans: [{ id: "nh-need", type: "need", status: "open" }],
+      body: "need 之外仍有可自主推进工作",
+    }, 20)],
     pending: [task("tsk-mine", "in_progress", "pending_blocked", { claim_state: "mine" }, 20)],
     error: null,
   };
@@ -262,14 +266,18 @@ try {
   assert.equal(emptyHarness.state.enabled, false);
   assert.ok(emptyHarness.events.some((event) => event.reason === "autostop: no-in-progress"));
 
-  // 已挂 open need-human / pending 的任务不重复提示，保留安静轮询等待状态变化。
+  // 有 open need-human 但没有 pending/有界工作时，继续注入，让模型推进 need 之外的工作。
   responseMode = "need";
   const needHarness = makeHarness();
   await needHarness.service.onTimer(needHarness.state, 1);
-  assert.equal(needHarness.agent.followups.length, 0);
+  assert.ok(needHarness.agent.followups.length > 0);
+  assert.match(needHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
+  assert.match(needHarness.agent.followups[0].content[0].text, /自主推进/u);
+  assert.match(needHarness.agent.followups[0].content[0].text, /need 之外部分继续推进/u);
   assert.equal(needHarness.state.enabled, true);
-  assert.ok(needHarness.state.timer !== undefined);
-  needHarness.service.clearTimer(needHarness.state);
+  assert.equal(needHarness.state.pendingAutoMode, "away");
+
+  // 有 pending 申请时仍静默等待确认，不重复注入。
   responseMode = "pending";
   const pendingHarness = makeHarness();
   await pendingHarness.service.onTimer(pendingHarness.state, 1);
