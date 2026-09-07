@@ -228,9 +228,9 @@ Worker 的 `serializeTask` 会带出数据库行，但 memory 的 `TASK_FIELDS` 
 
 两个 agent、codex 回调和 auto-advance 可能同时更新同一任务。当前 PATCH 没有 `expected_updated_at`/revision，`body` 又是覆盖写。pending 请求、确认、拒绝、round close 也没有历史表；只看当前 `updated_at` 无法回答谁在何时请求/确认过终态。至少需要条件更新和幂等键；若审计要求成立，增加 task event 表比继续堆管理字段更稳妥。
 
-### 7. 当前 profile 配置仍明确保留 `taskFallback: true`
+### 7. 历史 profile 配置曾明确保留 `taskFallback: true`
 
-安装脚本在 auto-advance 配置中写入 `taskFallback: true`（`scripts/install-profile-deps.ps1:380-386`），而设计稿已经决定 C1-C2 退场、云端是唯一事实源。必须移除该配置，或明确它只能服务于只读面板、永远不能服务于自主推进资格判断。否则实施后会出现“面板看到云端错误、推进却从旧 TASKS.md 继续”的隐性双源。
+安装脚本/运行 patch 历史上曾保留 `taskFallback: true`，而设计稿已经决定 C1-C2 退场、云端是唯一事实源；当前运行 patch 已移除该无效字段。文件 stale fallback 只服务只读面板，永远不能服务于自主推进资格判断，避免“面板看到云端错误、推进却从旧 TASKS.md 继续”的隐性双源。
 
 ### 8. Access-only 配置在 auto-advance 与 memory task 工具中的行为不一致
 

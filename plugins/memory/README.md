@@ -78,6 +78,11 @@ DSH 自带工具插件完全一致。两条路径任选：
 | `proxy` | `direct`（部署包默认） | HTTP 代理（https 走 CONNECT 隧道）；`direct`/空串 = 直连 |
 | `timeoutMs` | `20000` | 单请求超时 |
 
+Windows 本机安装器为访问 `workers.dev` 的网络环境在新 profile 中 bootstrap
+`http://127.0.0.1:7897`；已有 profile patch 的 `proxy` 现值优先，`direct` 仍是插件自身默认，
+因此这不是 memory 代码默认被改写。若本机没有该代理，请在 profile patch 或 `DSH_MEMORY_PROXY`
+中显式使用 `direct` 或其他可用代理。
+
 Worker API URL、D1 read token 与 D1 write token 不属于 memory 的 Config，统一在
 Sagitta Manager 中配置。每次请求都会读取 manager 当前快照：recall/list/search 与
 delegation read 使用 D1 read token；remember/consolidate/verify 与 delegation write

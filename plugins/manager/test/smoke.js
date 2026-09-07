@@ -57,6 +57,8 @@ assert.deepEqual(service.getApiConfig(), {
   workerUploadToken: stored.workerUploadToken,
   d1ReadToken: stored.d1ReadToken,
   d1WriteToken: stored.d1WriteToken,
+  accessClientId: "",
+  accessClientSecret: "",
   cfAccountId: stored.cfAccountId,
   cfScriptName: stored.cfScriptName
 });
@@ -102,7 +104,7 @@ assert.equal(warnings.some((message) => message.includes("settings provider unav
 
 const schemaJson = Config.toJSON();
 const schemaText = JSON.stringify(schemaJson);
-assert.equal((schemaText.match(/"role":"secret"/g) ?? []).length, 3);
+assert.equal((schemaText.match(/"role":"secret"/g) ?? []).length, 5);
 assert.equal(schemaText.includes("cfAccountId"), true);
 assert.equal(schemaText.includes("cfScriptName"), true);
 
