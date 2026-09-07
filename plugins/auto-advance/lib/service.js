@@ -1101,10 +1101,25 @@ class AutoAdvanceService extends TypertRemoteService {
           const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
           const needCount = openNeedHumanCount(task);
           const needNote = needCount > 0 ? ` ⚠ 有 ${needCount} 条待涟漪处理项，need 之外部分继续推进` : "";
-          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}${acceptanceSummary(task.acceptance)}${needNote}`;
+          const accCount = acceptanceLineCount(task.acceptance);
+          const accNote = accCount > 0 ? ` acceptance=${accCount}项期望目标(见下)` : "";
+          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}${accNote}${needNote}`;
         });
         const prompt = [AUTONOMOUS_PROMPT, "", "当前我认领的 in_progress 任务：", ...lines].join("\n");
-        this.queuePrompt(state, generation, prompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
+        // 涟漪语义（09-07）：把每个任务的 acceptance 完整清单附在任务列表后，
+        // 提醒逐项核对——每一项是否还有可在人工介入之前推进的空间。
+        // 插件无 LLM 判断不了满足与否；注入完整清单让模型自己逐项对照。
+        const accBlocks = actionable
+          .map((task) => {
+            const id = task.task_id ?? task.id;
+            const accText = acceptanceBlock(task.acceptance);
+            return accText ? `\n[${id}] 期望目标：\n${accText}` : "";
+          })
+          .filter((block) => block.length > 0);
+        const fullPrompt = accBlocks.length > 0
+          ? `${prompt}\n\n请逐项核对每个任务的期望目标：确认每一项是否还有可在人工介入之前推进的空间；有就推进，没有才按收口规则处理（need-human+blocked / notify / done）。${accBlocks.join("\n")}`
+          : prompt;
+        this.queuePrompt(state, generation, fullPrompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
         return;
       }
 
@@ -1349,12 +1364,23 @@ function cleanBody(value) {
     .trim();
 }
 
-function acceptanceSummary(value) {
-  if (typeof value !== "string" || value.trim().length === 0) return "";
-  const lines = value.match(/^\s*-\s+\[[ xX]\]\s+\S.*$/gmu) ?? [];
+function acceptanceLines(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return [];
+  return value.match(/^\s*-\s+\[[ xX]\]\s+\S.*$/gmu) ?? [];
+}
+
+function acceptanceLineCount(value) {
+  return acceptanceLines(value).length;
+}
+
+function acceptanceBlock(value) {
+  // 涟漪语义（09-07）：acceptance 是"期望目标 checklist"，插件无 LLM 判断
+  // 不了是否满足；注入的价值是把完整清单带给模型，让它逐项检查每一项
+  // 是否还有可在人工介入之前推进的空间。返回 checklist 行（原样保留
+  // `- [ ]`/`- [x]` 前缀），空则返回空串。
+  const lines = acceptanceLines(value);
   if (lines.length === 0) return "";
-  const incomplete = lines.filter((line) => !/^\s*-\s+\[[xX]\]/u.test(line)).length;
-  return ` acceptance=${lines.length}项/未完成${incomplete}`;
+  return lines.map((l) => l.trim()).join("\n");
 }
 
 function mapApiTask(item) {

@@ -339,7 +339,10 @@ try {
   assert.match(ownedHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /tsk-mine/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /当前我认领的 in_progress 任务/u);
-  assert.match(ownedHarness.agent.followups[0].content[0].text, /acceptance=2项\/未完成1/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /acceptance=2项期望目标\(见下\)/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /\[tsk-mine\] 期望目标/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /- \[ \] target one/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /逐项核对每个任务的期望目标/u);
   assert.doesNotMatch(ownedHarness.agent.followups[0].content[0].text, /task_round_close|round-close/iu);
   assert.equal(ownedHarness.state.pendingAutoMode, "away");
 
