@@ -189,6 +189,12 @@ function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
     status: "idle",
     inbox: { nextStep: [], nextTurn: [] },
     followups: [],
+    directDrives: [],
+    send(message, target, wakeup) {
+      this.directDrives.push({ message, target, wakeup });
+      this.followups.push(message);
+      this.inbox.nextTurn.push(message);
+    },
     followup(message) {
       this.followups.push(message);
       this.inbox.nextTurn.push(message);
@@ -271,6 +277,9 @@ chatSettleHarness.state.autonomousMode = true;
 assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), true);
 assert.equal(chatSettleHarness.agent.followups.length, 1, "disabled autonomous mode must still receive settlement notice");
 assert.equal(chatSettleHarness.agent.inbox.nextTurn.length, 1, "idle settlement must enter next-turn inbox");
+assert.equal(chatSettleHarness.agent.directDrives.length, 1, "idle settlement must explicitly wake the agent driver");
+assert.equal(chatSettleHarness.agent.directDrives[0].target, "next-turn");
+assert.equal(chatSettleHarness.agent.directDrives[0].wakeup, true);
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /异步任务已完成/u);
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /work_id=work-settled/u);
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /task_id=task-settled/u);
@@ -282,6 +291,7 @@ assert.equal(chatSettleHarness.agent.followups.length, 1);
 const enabledSettleHarness = makeHarness({ api: false, enabled: true });
 assert.equal(enabledSettleHarness.service.handleAsyncWorkSettled(completedWork), true, "enabled settlement must still queue a notice");
 assert.equal(enabledSettleHarness.agent.inbox.nextTurn.length, 1);
+assert.equal(enabledSettleHarness.agent.directDrives.length, 1);
 
 // A settlement racing a running turn is queued for the next turn instead of
 // waiting for an agent/status idle event.
@@ -291,6 +301,7 @@ runningSettleHarness.agent.status = "running";
 assert.equal(runningSettleHarness.service.handleAsyncWorkSettled(runningWorkSettlement), true);
 assert.equal(runningSettleHarness.agent.followups.length, 1, "running agent must queue settlement notice");
 assert.equal(runningSettleHarness.agent.inbox.nextTurn.length, 1, "running agent must retain settlement in next-turn inbox");
+assert.equal(runningSettleHarness.agent.directDrives.length, 0, "running agent must not be directly interrupted");
 
 const inFlightSettleHarness = makeHarness({ api: false, enabled: false });
 inFlightSettleHarness.state.requestController = {};
@@ -302,6 +313,7 @@ assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({
 }), true);
 assert.equal(inFlightSettleHarness.agent.followups.length, 1, "settlement must queue while a request is in flight");
 assert.equal(inFlightSettleHarness.agent.inbox.nextTurn.length, 1, "in-flight settlement must remain in next-turn inbox");
+assert.equal(inFlightSettleHarness.agent.directDrives.length, 0, "in-flight settlement must use the deferred queue path");
 inFlightSettleHarness.state.disposed = true;
 inFlightSettleHarness.state.requestController = undefined;
 assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", workId: "work-disposed", status: "completed" }), false);

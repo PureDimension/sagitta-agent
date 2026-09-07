@@ -679,12 +679,17 @@ class AutoAdvanceService extends TypertRemoteService {
       settledWorkIds.add(key);
     }
 
+    // A settled work item must wake an actually idle agent immediately. Keep
+    // the ordinary follow-up path while a turn or the auto-advance cloud read
+    // is active; those paths already own the next safe turn boundary.
+    const directDrive = agent.status === "idle" && state.requestController === undefined;
+
     const queued = this.queueNotice(
       state,
       settledWorkNotice(settled),
       "async work settled",
       "injected: async-work-settled",
-      { autonomous: false, allowDisabled: true }
+      { autonomous: false, allowDisabled: true, directDrive }
     );
     if (!queued && key !== undefined) settledWorkIds.delete(key);
     return queued;
@@ -850,7 +855,7 @@ class AutoAdvanceService extends TypertRemoteService {
     return this.queueNotice(state, text, summary, reason, { autonomous });
   }
 
-  queueNotice(state, text, summary, reason, { autonomous = false, allowDisabled = false } = {}) {
+  queueNotice(state, text, summary, reason, { autonomous = false, allowDisabled = false, directDrive = false } = {}) {
     if (state === undefined || state.disposed === true || (!allowDisabled && state.enabled !== true) || !this.isLive(state)) return false;
     const message = createUserMessage({
       content: [{ type: "text", text }],
@@ -866,7 +871,7 @@ class AutoAdvanceService extends TypertRemoteService {
     state.pendingAutoMode = autonomous ? "away" : "present";
     state.injectedAt = Date.now();
     state.idleSince = null;
-    agentFollowup(state.agent, message);
+    agentFollowup(state.agent, message, { directDrive });
     this.broadcast(state, reason);
     return true;
   }
@@ -1284,7 +1289,13 @@ class AutoAdvanceService extends TypertRemoteService {
   }
 }
 
-function agentFollowup(agent, message) {
+function agentFollowup(agent, message, { directDrive = false } = {}) {
+  if (directDrive && typeof agent.send === "function") {
+    // `send(..., true)` is the public DSH primitive that makes the wake-up
+    // explicit: persist into next-turn and start/latch the agent driver.
+    agent.send(message, "next-turn", true);
+    return;
+  }
   agent.followup(message);
 }
 
