@@ -14,8 +14,7 @@ Sagitta 的 Cordis 自主推进插件，包含：
 
 ## 间隔配置
 
-最终默认值是 `idleTimeoutMs: 300000`（300 秒），现在表示任务驱动轮询/续推的延迟，idle 本身不会触发自主推进。本地短间隔测试时，在 profile 的
-`cordis.patch.yml` 临时覆盖为例如 `idleTimeoutMs: 10000`；测试完恢复为 `300000`。
+代码默认值是 `idleTimeoutMs: 15000`（15 秒，09-07 涟漪拍板），表示任务驱动轮询/续推的延迟。**注意**：install-profile-deps.ps1 会在 profile 的 `cordis.patch.yml` 写入显式 `idleTimeoutMs`（现值优先、覆盖代码默认），该写入值须与代码默认一致（当前 15000）；如临时调短测试，改 patch 后记得同步改 install 脚本源头的硬编码值，避免下次安装把旧值写回。settle 事件（异步任务完成）在 chat 模式也触发轻量"异步任务已完成"通知，不依赖该轮询；轮询仅用于自主推进模式下的任务驱动注入。
 
 模式状态写入 `statePath`，任务文件由后端读取 `tasksPath`；两者显式配置优先。未配置时，
 后端依次使用 `SAGITTA_WORKSPACE`、包含 `TASKS.md` 的兼容工作区候选，最后才使用当前工作

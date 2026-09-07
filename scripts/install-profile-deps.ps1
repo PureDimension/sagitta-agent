@@ -382,7 +382,7 @@ $patchEntries = [ordered]@{
     'sagitta-auto-advance' = @(
         '- id: sagitta-auto-advance'
         '  config:'
-        '    idleTimeoutMs: 300000'
+        '    idleTimeoutMs: 15000   # 15s 快速注入（09-07 涟漪拍板；与 service.js DEFAULT_IDLE_TIMEOUT_MS 一致）'
         "    statePath: $statePathYaml"
         "    tasksPath: $tasksPathYaml"
     )
