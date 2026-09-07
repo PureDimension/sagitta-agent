@@ -80,6 +80,35 @@ function nonEmptyString(value) {
   return result.length > 0 ? result : undefined;
 }
 
+function settledWorkInfo(settled) {
+  return {
+    workId: nonEmptyString(settled?.workId ?? settled?.work_id),
+    taskId: nonEmptyString(settled?.taskId ?? settled?.task_id),
+    status: nonEmptyString(settled?.status),
+    kind: nonEmptyString(settled?.kind),
+    reason: nonEmptyString(settled?.reason)
+  };
+}
+
+function settledWorkKey(settled) {
+  const info = settledWorkInfo(settled);
+  if (info.workId !== undefined) return `work:${info.workId}`;
+  const fallback = [info.taskId, info.status, info.kind, info.reason].filter((value) => value !== undefined);
+  return fallback.length > 0 ? `settled:${fallback.join("|")}` : undefined;
+}
+
+function settledWorkNotice(settled) {
+  const info = settledWorkInfo(settled);
+  const details = [
+    `task_id=${info.taskId ?? "unknown"}`,
+    `status=${info.status ?? "unknown"}`,
+    info.workId === undefined ? undefined : `work_id=${info.workId}`,
+    info.kind === undefined ? undefined : `kind=${info.kind}`,
+    info.reason === undefined ? undefined : `reason=${info.reason}`
+  ].filter((value) => value !== undefined);
+  return `异步任务已完成：${details.join(" ")}，可继续推进或汇报结果。`;
+}
+
 function normalizeTaskApiConfig(config = {}) {
   const raw = isRecord(config) ? config : {};
   const nested = isRecord(raw.apiConfig) ? raw.apiConfig : isRecord(raw.taskApiConfig) ? raw.taskApiConfig : {};
@@ -357,13 +386,18 @@ class AutoAdvanceService extends TypertRemoteService {
       state.ownedTaskIds = new Set();
       state.autonomousMode = false;
       state.pendingAutoMode = undefined;
+      state.settledWorkIds = new Set();
+      state.pendingSettlements = new Map();
       state.lastProtocolNotice = null;
       this.resetTimer(state, "session-start");
     });
     ctx.on("agent/status", ({ agent, status }) => {
       const state = this.stateFor(agent);
       this.touchOwners(agent, "child-status");
-      if (status === "idle") this.maybeArm(state);
+      if (status === "idle") {
+        this.maybeArm(state);
+        this.flushPendingAsyncWorkSettled(state);
+      }
       else this.resetTimer(state, "agent-running");
     });
     ctx.on("agent/inbox/inserted", ({ agent, message }) => {
@@ -610,6 +644,8 @@ class AutoAdvanceService extends TypertRemoteService {
       ownedTaskIds: new Set(),
       autonomousMode: false,
       pendingAutoMode: undefined,
+      settledWorkIds: new Set(),
+      pendingSettlements: new Map(),
       lastProtocolNotice: null
     };
     this.states.set(agent, state);
@@ -632,17 +668,60 @@ class AutoAdvanceService extends TypertRemoteService {
     const ownerId = nonEmptyString(settled?.ownerId ?? settled?.owner_id);
     if (ownerId === undefined) return false;
     const agent = this.ctx.agents.get(ownerId);
-    if (agent === undefined || agent.status !== "idle") return false;
+    if (agent === undefined) return false;
     const state = this.states.get(agent);
-    if (state === undefined || state.requestController !== undefined) return false;
+    if (state === undefined || state.disposed === true || state.requestController !== undefined) return false;
 
-    // Settlement only shortens the wait. The existing onTimer qualification
-    // still decides whether pending work, another running work, or need
-    // semantics permit an injection.
+    const key = settledWorkKey(settled);
+    const settledWorkIds = state.settledWorkIds instanceof Set ? state.settledWorkIds : (state.settledWorkIds = new Set());
+    const pendingSettlements = state.pendingSettlements instanceof Map ? state.pendingSettlements : (state.pendingSettlements = new Map());
+    if (key !== undefined && settledWorkIds.has(key)) return false;
+
+    if (agent.status !== "idle") {
+      if (key !== undefined && !pendingSettlements.has(key)) pendingSettlements.set(key, settled);
+      // Do not interrupt a running turn, but make the next idle transition
+      // re-check immediately instead of waiting on a stale timer.
+      this.resetTimer(state, "async-work-settled");
+      return false;
+    }
+
+    if (key !== undefined) {
+      pendingSettlements.delete(key);
+      // Mark before queueing/onTimer so a duplicate event cannot race the
+      // synchronous follow-up insertion or the async cloud read.
+      settledWorkIds.add(key);
+    }
+
     this.resetTimer(state, "async-work-settled");
-    const generation = state.timerGeneration;
-    void this.onTimer(state, generation);
-    return true;
+    if (state.enabled === true) {
+      // Autonomous mode keeps its existing full qualification/injection path;
+      // the settlement only makes that check immediate.
+      const generation = state.timerGeneration;
+      void this.onTimer(state, generation);
+      return true;
+    }
+
+    const queued = this.queueNotice(
+      state,
+      settledWorkNotice(settled),
+      "async work settled",
+      "injected: async-work-settled",
+      { autonomous: false, allowDisabled: true }
+    );
+    if (!queued && key !== undefined) settledWorkIds.delete(key);
+    return queued;
+  }
+
+  flushPendingAsyncWorkSettled(state) {
+    const pendingSettlements = state?.pendingSettlements;
+    if (!(pendingSettlements instanceof Map) || pendingSettlements.size === 0) return false;
+    let handled = false;
+    for (const settled of [...pendingSettlements.values()]) {
+      const result = this.handleAsyncWorkSettled(settled);
+      handled = result || handled;
+      if (state.requestController !== undefined) break;
+    }
+    return handled;
   }
 
   hasRunningWork(agent, taskId) {
@@ -805,8 +884,8 @@ class AutoAdvanceService extends TypertRemoteService {
     return this.queueNotice(state, text, summary, reason, { autonomous });
   }
 
-  queueNotice(state, text, summary, reason, { autonomous = false } = {}) {
-    if (state?.disposed === true || state?.enabled !== true || !this.isLive(state)) return false;
+  queueNotice(state, text, summary, reason, { autonomous = false, allowDisabled = false } = {}) {
+    if (state === undefined || state.disposed === true || (!allowDisabled && state.enabled !== true) || !this.isLive(state)) return false;
     const message = createUserMessage({
       content: [{ type: "text", text }],
       source: {

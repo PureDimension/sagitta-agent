@@ -168,7 +168,7 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const workerUrl = `http://127.0.0.1:${server.address().port}`;
 
-function makeHarness({ api = true, runningWork = false } = {}) {
+function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
   const agent = {
     id: "agent-smoke",
     status: "idle",
@@ -208,7 +208,7 @@ function makeHarness({ api = true, runningWork = false } = {}) {
   service.broadcast = (_state, reason) => events.push({ reason });
   const state = {
       agent,
-      enabled: true,
+      enabled,
       stoppedByProtocol: false,
       disposed: false,
       timer: undefined,
@@ -218,6 +218,8 @@ function makeHarness({ api = true, runningWork = false } = {}) {
       lastAutoMessageId: undefined,
       pendingAutoMode: undefined,
       autonomousMode: false,
+      settledWorkIds: new Set(),
+      pendingSettlements: new Map(),
       ownedTaskIds: new Set(),
       requestController: undefined,
       retryAttempt: 0,
@@ -237,31 +239,81 @@ function makeHarness({ api = true, runningWork = false } = {}) {
   };
 }
 
-// async-work settlement is only an early wake-up; the actual check remains
-// onTimer's existing qualification path. It must be immediate while idle.
-const settleWakeHarness = makeHarness({ api: false });
-let settleWakeReason;
-let settleChecks = 0;
-settleWakeHarness.service.resetTimer = (_state, reason) => {
-  settleWakeReason = reason;
-  settleWakeHarness.state.timerGeneration += 1;
+// Settlement is a basic wake-up even when autonomous mode is disabled. The
+// notice carries the settled work identity and is idempotent per work.
+const chatSettleHarness = makeHarness({ api: false, enabled: false });
+let chatSettleResetCount = 0;
+chatSettleHarness.service.resetTimer = (_state, reason) => {
+  chatSettleResetCount++;
+  assert.equal(reason, "async-work-settled");
 };
-settleWakeHarness.service.onTimer = (_state, generation) => {
-  settleChecks++;
-  assert.equal(generation, settleWakeHarness.state.timerGeneration);
-};
-assert.equal(settleWakeHarness.service.handleAsyncWorkSettled({
+const completedWork = {
   ownerId: "agent-smoke",
   workId: "work-settled",
   taskId: "task-settled",
+  kind: "codex",
   status: "completed",
   reason: null,
-}), true);
-assert.equal(settleWakeReason, "async-work-settled");
-assert.equal(settleChecks, 1, "settlement must check immediately, without idleTimeout");
-settleWakeHarness.agent.status = "running";
-assert.equal(settleWakeHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", status: "failed" }), false);
-assert.equal(settleChecks, 1, "a running agent must not be interrupted by settlement");
+};
+chatSettleHarness.state.autonomousMode = true;
+assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), true);
+assert.equal(chatSettleHarness.agent.followups.length, 1, "disabled autonomous mode must still receive settlement notice");
+assert.match(chatSettleHarness.agent.followups[0].content[0].text, /异步任务已完成/u);
+assert.match(chatSettleHarness.agent.followups[0].content[0].text, /work_id=work-settled/u);
+assert.match(chatSettleHarness.agent.followups[0].content[0].text, /task_id=task-settled/u);
+assert.match(chatSettleHarness.agent.followups[0].content[0].text, /status=completed/u);
+assert.match(chatSettleHarness.agent.followups[0].content[0].text, /kind=codex/u);
+assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), false, "the same work must not notify twice");
+assert.equal(chatSettleHarness.agent.followups.length, 1);
+assert.equal(chatSettleResetCount, 1);
+
+// An enabled settlement keeps the existing full onTimer path and must not
+// produce a second lightweight notice for the same work.
+const autoSettleHarness = makeHarness({ api: false, enabled: true });
+let autoSettleChecks = 0;
+autoSettleHarness.service.resetTimer = (_state, reason) => {
+  assert.equal(reason, "async-work-settled");
+  autoSettleHarness.state.timerGeneration += 1;
+};
+autoSettleHarness.service.onTimer = (_state, generation) => {
+  autoSettleChecks++;
+  assert.equal(generation, autoSettleHarness.state.timerGeneration);
+};
+assert.equal(autoSettleHarness.service.handleAsyncWorkSettled(completedWork), true);
+assert.equal(autoSettleChecks, 1, "enabled settlement must check immediately, without idleTimeout");
+assert.equal(autoSettleHarness.agent.followups.length, 0, "enabled settlement must use only the full path");
+assert.equal(autoSettleHarness.service.handleAsyncWorkSettled(completedWork), false);
+assert.equal(autoSettleChecks, 1, "enabled settlement must be idempotent");
+
+// A settlement racing a running turn is deferred without injecting into that
+// turn; the pending work is delivered once the agent becomes idle.
+const runningSettleHarness = makeHarness({ api: false, enabled: false });
+let runningSettleResetCount = 0;
+runningSettleHarness.service.resetTimer = (_state, reason) => {
+  runningSettleResetCount++;
+  assert.equal(reason, "async-work-settled");
+};
+const runningWorkSettlement = { ownerId: "agent-smoke", workId: "work-running", taskId: "task-running", status: "completed" };
+runningSettleHarness.agent.status = "running";
+assert.equal(runningSettleHarness.service.handleAsyncWorkSettled(runningWorkSettlement), false);
+assert.equal(runningSettleHarness.agent.followups.length, 0, "running agent must not be interrupted by settlement");
+assert.equal(runningSettleResetCount, 1, "running settlement must reset the timer for the next idle check");
+runningSettleHarness.agent.status = "idle";
+assert.equal(runningSettleHarness.service.flushPendingAsyncWorkSettled(runningSettleHarness.state), true);
+assert.equal(runningSettleHarness.agent.followups.length, 1, "deferred settlement must wake the next idle turn");
+
+const inFlightSettleHarness = makeHarness({ api: false, enabled: false });
+inFlightSettleHarness.state.requestController = {};
+assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({
+  ownerId: "agent-smoke",
+  workId: "work-in-flight",
+  taskId: "task-in-flight",
+  status: "completed",
+}), false);
+assert.equal(inFlightSettleHarness.agent.followups.length, 0, "settlement must not inject while a request is in flight");
+inFlightSettleHarness.state.disposed = true;
+inFlightSettleHarness.state.requestController = undefined;
+assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", workId: "work-disposed", status: "completed" }), false);
 
 try {
   // 有已认领 in_progress 才注入自主推进；提示只带轻量任务清单，取消 round-close 强制。
