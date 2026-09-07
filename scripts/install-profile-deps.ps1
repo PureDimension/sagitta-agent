@@ -210,6 +210,42 @@ function Invoke-PackageInstall {
     }
 }
 
+function Copy-PluginTree {
+    param(
+        [string]$SourcePath,
+        [string]$TargetPath
+    )
+    foreach ($item in (Get-ChildItem -LiteralPath $SourcePath -Force)) {
+        if ($item.Name -in @('node_modules', '.git')) { continue }
+        $destination = Join-Path $TargetPath $item.Name
+        if ($item.PSIsContainer) {
+            if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+                New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            }
+            Copy-PluginTree -SourcePath $item.FullName -TargetPath $destination
+        } else {
+            Copy-Item -LiteralPath $item.FullName -Destination $destination -Force
+        }
+    }
+}
+
+function Sync-LocalPluginFiles {
+    param(
+        [string]$SourcePath,
+        [string]$TargetPath
+    )
+    $sourceFull = [IO.Path]::GetFullPath($SourcePath).TrimEnd('\')
+    $targetFull = [IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
+    if ($sourceFull -ieq $targetFull) { return }
+    if (-not (Test-Path -LiteralPath $TargetPath -PathType Container)) {
+        throw "Local plugin dependency was not materialized: $TargetPath"
+    }
+    # pnpm may retain a copied file: dependency when only source contents
+    # changed. Copy the checked-out package after install so restart loads the
+    # current repository code instead of a stale hoisted copy.
+    Copy-PluginTree -SourcePath $SourcePath -TargetPath $TargetPath
+}
+
 if ([string]::IsNullOrWhiteSpace($RepoPath)) {
     $RepoPath = if (-not [string]::IsNullOrWhiteSpace($env:SAGITTA_AGENT_DIR)) { $env:SAGITTA_AGENT_DIR } else { Join-Path $PSScriptRoot '..' }
 }
@@ -496,6 +532,7 @@ foreach ($packageName in $plugins.Keys) {
     if (-not (Test-Path -LiteralPath $installedPath)) {
         throw "Package manager completed but the local plugin is not resolvable: $packageName"
     }
+    Sync-LocalPluginFiles -SourcePath (Join-Path $RepoPath $plugins[$packageName]) -TargetPath $installedPath
 }
-Write-Host '[install-profile-deps] local plugin dependencies are resolvable.'
+Write-Host '[install-profile-deps] local plugin dependencies are installed and synchronized.'
 return [pscustomobject]@{ Status = 'installed'; Profile = $ProfilePath; PackageManager = $packageManager.Command }

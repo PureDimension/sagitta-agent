@@ -7,6 +7,7 @@ import { checkRepository } from "../lib/git.js";
 import { expandPresetTemplate, parseComposition, sha256, syncPreset } from "../lib/preset.js";
 import { runStartupMaintenance } from "../lib/service.js";
 import { deployWorker } from "../lib/worker.js";
+import { installProfileDependencies, syncLocalFileDependencies } from "../lib/install.js";
 
 function logger() {
   return { info() {}, debug() {} };
@@ -78,6 +79,35 @@ test("preset validation and ownership marker do not overwrite a user edit", asyn
     });
     assert.equal(second.status, "candidate");
     assert.match(await readFile(path.join(targetDir, "agent.cordis.yml"), "utf8"), /custom/);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("local file dependencies synchronize source changes after a no-op package install", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "sagitta-updater-install-"));
+  try {
+    const source = path.join(tempRoot, "source-memory");
+    const profile = path.join(tempRoot, "profile");
+    const target = path.join(profile, "node_modules", "@sagitta", "memory");
+    await mkdir(path.join(source, "lib"), { recursive: true });
+    await mkdir(path.join(target, "lib"), { recursive: true });
+    await writeFile(path.join(source, "package.json"), JSON.stringify({ name: "@sagitta/memory", version: "1.3.0" }), "utf8");
+    await writeFile(path.join(source, "lib", "task-contract.js"), "export const acceptance = true;\n", "utf8");
+    await writeFile(path.join(target, "package.json"), JSON.stringify({ name: "@sagitta/memory", version: "1.3.0" }), "utf8");
+    await writeFile(path.join(target, "lib", "task-contract.js"), "export const acceptance = false;\n", "utf8");
+    await writeFile(path.join(profile, "package.json"), JSON.stringify({ dependencies: { "@sagitta/memory": `file:${source}` } }), "utf8");
+    await syncLocalFileDependencies(profile);
+    assert.equal(await readFile(path.join(target, "lib", "task-contract.js"), "utf8"), "export const acceptance = true;\n");
+
+    let commandCalled = false;
+    const result = await installProfileDependencies({
+      profileDir: profile,
+      packageManager: "pnpm",
+      command: async () => { commandCalled = true; }
+    });
+    assert.equal(commandCalled, true);
+    assert.equal(result.syncedLocalDependencies, 1);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
