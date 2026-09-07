@@ -791,7 +791,7 @@ export function registerMemoryTools(ctx, client) {
     kind: { type: "string", required: true, enum: ["normal", "temp"] },
     project: { type: "string", required: true },
     title: { type: "string", required: true },
-    acceptance: { type: "string", required: true },
+    acceptance: nullableString(),
     status: { type: "string", required: true },
     priority: { type: "integer", required: true },
     checkbox: { type: "integer", required: true },
