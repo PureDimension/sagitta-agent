@@ -378,7 +378,7 @@ try {
   await needHarness.service.onTimer(needHarness.state, 1);
   assert.ok(needHarness.agent.followups.length > 0);
   assert.match(needHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
-  assert.match(needHarness.agent.followups[0].content[0].text, /自主推进/u);
+  assert.match(needHarness.agent.followups[0].content[0].text, /无可推进/u);
   assert.match(needHarness.agent.followups[0].content[0].text, /need 之外部分继续推进/u);
   assert.equal(needHarness.state.enabled, true);
   assert.equal(needHarness.state.pendingAutoMode, "away");

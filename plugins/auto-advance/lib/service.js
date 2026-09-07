@@ -12,10 +12,10 @@ import { parseRoundCloseMessage, parseRoundCloseText, validateRoundClosePayload 
  * Model-facing v2 prompt. Task state is written by the memory task tools;
  * auto-advance only decides whether there is owned work worth continuing.
  */
-const AUTONOMOUS_PROMPT = "涟漪已离开。请继续尽可能多完成下面已由你认领的 in_progress 任务；先做能自主推进的工作，并在完成或阻塞前自测、自查、核对验收点。终态请使用任务工具更新。";
-const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？是否已对交付内容做了审计（自测/自查）？若标 blocked，请确认已没有自主可推进部分；若标 done，请确认交付完整且没有 open need-human。";
-const AUTONOMOUS_CHALLENGE = "涟漪已离开。确认没有能自主推进的部分了？若需涟漪，记 need-human 后标 blocked；若完成，确认验收点都过了再 done。标记 blocked 前应先把能拆的拆、能自测的自测。";
-const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：要么完成、标 blocked、释放任务，要么说明理由。";
+const AUTONOMOUS_PROMPT = "涟漪已离开。由于存在 in_progress 任务，请继续尽可能推进所有不需人工的任务，直到无可推进。确实无自主可推进处，能自测的自测、能拆的拆，然后收口：需人工介入才能完成时创建 need-human（type=need）并标 blocked；需人工了解重大决策时发 notify（待确认，不阻塞 done）；达到交付标准就标 done。禁止为逃避收口母任务无限开旁支/temp 新任务。每轮收尾都核对当前 in_progress 是否真无可推进，可推进就继续，不可推进按上述规则收口。终态请使用任务工具更新。";
+const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进，能自测的已自测、能拆的已拆？确需人工完成时创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。禁止用旁支/temp 新任务逃避收口。";
+const AUTONOMOUS_CHALLENGE = "涟漪已离开。先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进？能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口。确需人工完成时创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。";
+const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：先继续推进所有不需人工的部分至无可推进，能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口；确需人工完成时创建 need-human（type=need）并标 blocked；重大决策发 notify（待确认，不阻塞 done）；达到交付标准就完成、标 done、释放任务。";
 
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
