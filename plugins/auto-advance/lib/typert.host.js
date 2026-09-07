@@ -26,7 +26,8 @@ const taskSchema = z.object({
   blockedReason: z.union([z.string(), z.null()]).readonly().optional(),
   project: z.string().readonly().optional(),
   task_id: z.string().readonly().optional(),
-  kind: z.string().readonly().optional()
+  kind: z.string().readonly().optional(),
+  claimState: z.string().readonly().optional()
 });
 const pendingRequestSchema = z.object({
   title: z.string().readonly(),
@@ -139,7 +140,7 @@ export const TYPERT = {
       ],
       types: [
         { name: "AutoAdvanceState", declaration: "export interface AutoAdvanceState { readonly enabled: boolean; readonly mode: 'auto' | 'chat'; readonly idleSince: number | null; readonly injectedAt: number | null; readonly ready: boolean; readonly hasPendingWork: boolean; readonly stoppedByProtocol: boolean; readonly agentStatus: string; readonly degraded: boolean; readonly degradedReason: string | null; }" },
-        { name: "TaskSnapshot", declaration: "export interface TaskSnapshot { readonly path: string; readonly updatedAt: number | null; readonly source?: 'cloud' | 'file' | 'file-stale'; readonly sections: readonly { readonly title: string; readonly items: readonly { readonly text: string; readonly title?: string; readonly done: boolean; readonly status?: string; readonly acceptance?: string; readonly updatedAt?: number | null; readonly blockedReason?: string | null; readonly project?: string; readonly task_id?: string; readonly kind?: string; }[]; }[]; readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string; readonly type: 'need' | 'notify'; readonly needHumanId: string; }[]; readonly error?: string; }" },
+        { name: "TaskSnapshot", declaration: "export interface TaskSnapshot { readonly path: string; readonly updatedAt: number | null; readonly source?: 'cloud' | 'file' | 'file-stale'; readonly sections: readonly { readonly title: string; readonly items: readonly { readonly text: string; readonly title?: string; readonly done: boolean; readonly status?: string; readonly acceptance?: string; readonly updatedAt?: number | null; readonly blockedReason?: string | null; readonly project?: string; readonly task_id?: string; readonly kind?: string; readonly claimState?: string; }[]; }[]; readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string; readonly type: 'need' | 'notify'; readonly needHumanId: string; }[]; readonly error?: string; }" },
         { name: "AsyncWorkSnapshot", declaration: "export interface AsyncWorkSnapshot { readonly running: readonly { readonly work_id: string; readonly task_id: string; readonly kind: string; readonly desc: string; readonly started_at: string; readonly timeout_ms: number; readonly status: 'running'; }[]; readonly recent: readonly { readonly work_id: string; readonly task_id: string; readonly kind: string; readonly desc: string; readonly started_at: string; readonly ended_at: string; readonly timeout_ms: number; readonly status: 'completed' | 'failed' | 'cancelled' | 'expired'; readonly reason: string | null; }[]; }" },
         { name: "NeedHumanResolution", declaration: "export interface NeedHumanResolution { readonly needHumanId: string; readonly taskId: string; readonly type: 'need' | 'notify'; readonly status: string; }" }
       ]

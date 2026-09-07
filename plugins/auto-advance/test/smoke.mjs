@@ -89,11 +89,13 @@ const mappedStatusItems = mappedStatusSnapshot.sections.flatMap((section) => sec
 assert.deepEqual(mappedStatusItems.map((item) => item.status), ["in_progress", "blocked", "open", "in_progress"]);
 assert.equal(mappedStatusItems.find((item) => item.task_id === "tsk-ui-progress").acceptance, "- [ ] target one\n- [x] target two");
 assert.equal(mappedStatusItems.find((item) => item.task_id === "tsk-ui-temp").kind, "temp");
+assert.equal(mappedStatusItems.find((item) => item.task_id === "tsk-ui-progress").claimState, "mine");
 
 let responseMode = "owned";
 const resolvedRequests = [];
 const blockedRequests = [];
 const taskReadAgentIds = [];
+const taskReadUrls = [];
 const pendingNeedHumans = [
   {
     id: "nh-notify",
@@ -121,6 +123,7 @@ const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
   if (request.method === "GET" && requestUrl.pathname === "/task") {
     taskReadAgentIds.push(request.headers["x-agent-id"] ?? null);
+    taskReadUrls.push(requestUrl);
   }
   const resolveMatch = /^\/task\/need-human\/([^/]+)\/resolve$/u.exec(requestUrl.pathname);
   if (request.method === "POST" && resolveMatch !== null) {
@@ -377,6 +380,7 @@ try {
   const ownedHarness = makeHarness();
   const pendingSnapshot = await ownedHarness.service.getTasks();
   assert.equal(taskReadAgentIds.at(-1), "agent-smoke", "UI task read must use the selected session id");
+  assert.equal(taskReadUrls.at(-1).searchParams.get("include_temp"), "1", "UI task read must include the selected agent's temp lease");
   const pendingItems = pendingSnapshot.sections.flatMap((section) => section.items);
   assert.equal(pendingItems.find((item) => item.task_id === "tsk-mine").status, "in_progress");
   assert.equal(pendingItems.find((item) => item.task_id === "tsk-mine").acceptance, "- [ ] target one\n- [x] target two");
@@ -484,6 +488,9 @@ try {
   assert.match(clientSource, /📢 待你确认/u);
   assert.match(clientSource, /remoteApi\.resolveNeedHuman/u);
   assert.match(clientSource, /await refresh\(true\)/u);
+  assert.match(clientSource, /filter\(isClaimableOpenTask\)/u);
+  assert.match(clientSource, /const tempTasks = allTasks\.filter\(isTempTask\)/u);
+  assert.doesNotMatch(clientSource, /if \(total === 0\) return null/u, "async-work header entry remains visible with an empty registry");
   let clientPlugin;
   runInNewContext(clientSource, {
     window: {
@@ -527,11 +534,13 @@ try {
       status: "in_progress",
       acceptance: "- [ ] target one",
       kind: "temp",
+      claimState: "mine",
       project: "smoke"
     }] }]
   });
   assert.equal(parsedClientSnapshot.sections[0].items[0].acceptance, "- [ ] target one");
   assert.equal(parsedClientSnapshot.sections[0].items[0].kind, "temp");
+  assert.equal(parsedClientSnapshot.sections[0].items[0].claimState, "mine");
   const getAsyncWorksDescriptor = mountedRemotes[0].descriptors.find((descriptor) => descriptor.method === "getAsyncWorks");
   const parsedAsyncWorks = getAsyncWorksDescriptor.result.schema.parse({
     running: [{

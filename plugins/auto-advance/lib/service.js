@@ -1366,6 +1366,9 @@ function taskApiUrl(workerApiUrl, page = 1, size = DEFAULT_TASK_PAGE_SIZE) {
   const url = new URL(`${baseUrl}/task`);
   url.searchParams.set("page", String(page));
   url.searchParams.set("size", String(size));
+  // The default Worker projection hides temp rows. Include only the current
+  // agent's valid temp lease; normal rows are unchanged by this flag.
+  url.searchParams.set("include_temp", "1");
   return url;
 }
 
@@ -1436,6 +1439,7 @@ function mapApiTask(item) {
     status: typeof item?.status === "string" ? item.status : "open",
     acceptance: typeof item?.acceptance === "string" ? item.acceptance : "",
     kind: temp ? "temp" : rawKind || "task",
+    claimState: typeof item?.claim_state === "string" ? item.claim_state : undefined,
     updatedAt: taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt),
     createdAt: taskApiUpdatedAt(item?.created_at ?? item?.createdAt),
     pendingStatus: item?.pending_status ?? null,

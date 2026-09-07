@@ -95,6 +95,7 @@ window.__ModuleLoader__.load({
             if (item.project !== undefined && typeof item.project !== "string") throw new Error("invalid task project");
             if (item.task_id !== undefined && typeof item.task_id !== "string") throw new Error("invalid task id");
             if (item.blockedReason !== undefined && item.blockedReason !== null && typeof item.blockedReason !== "string") throw new Error("invalid blocked reason");
+            if (item.claimState !== undefined && typeof item.claimState !== "string") throw new Error("invalid task claim state");
           }
         }
         if (value.pendingRequests !== undefined) {
@@ -323,6 +324,7 @@ window.__ModuleLoader__.load({
         updatedAt: parseTaskDate(item?.updatedAt ?? rawText),
         acceptance: safeText(item?.acceptance).trim(),
         kind: safeText(item?.kind ?? item?.type).trim().toLowerCase() || "task",
+        claimState: safeText(item?.claimState ?? item?.claim_state).trim().toLowerCase(),
         blockedReason: safeText(item?.blockedReason).trim(),
         order,
         project: safeText(item?.project ?? item?.projectName ?? item?.group).trim()
@@ -354,6 +356,10 @@ window.__ModuleLoader__.load({
     function isTempTask(task) {
       const kind = safeText(task?.kind).trim().toLowerCase();
       return kind === "temp" || kind === "temporary";
+    }
+
+    function isClaimableOpenTask(task) {
+      return task?.status === "open" && task?.claimState !== "claimed";
     }
 
     function acceptanceSummary(value) {
@@ -558,8 +564,6 @@ window.__ModuleLoader__.load({
           };
         }, [open]);
 
-        if (total === 0) return null;
-
         const workRow = (work, terminal) => {
           const status = safeText(work?.status);
           const duration = asyncWorkDuration(work, now, terminal);
@@ -592,6 +596,7 @@ window.__ModuleLoader__.load({
           rows.push(heading("最近结束", recent.length));
           rows.push(...recent.filter((work) => terminalStatuses.has(work?.status)).map((work) => workRow(work, true)));
         }
+        if (rows.length === 0) rows.push(h("div", { className: "saw-empty" }, "暂无异步工作"));
         return h("div", {
           ref: rootRef,
           "data-sagitta-async-work-header": "root",
@@ -907,17 +912,17 @@ window.__ModuleLoader__.load({
         appendPendingSection(taskScroll, needs, "need");
         appendPendingSection(taskScroll, notifications, "notify");
         const allTasks = normalizedTaskItems(tasks);
-        const inProgressTasks = tasksByStatus(tasks, "in_progress");
-        const blockedTasks = tasksByStatus(tasks, "blocked");
-        const openTasks = tasksByStatus(tasks, "open");
-        const otherTempTasks = allTasks.filter((task) => isTempTask(task) && !["in_progress", "blocked", "open"].includes(task.status));
+        const inProgressTasks = tasksByStatus(tasks, "in_progress").filter((task) => !isTempTask(task));
+        const blockedTasks = tasksByStatus(tasks, "blocked").filter((task) => !isTempTask(task));
+        const openTasks = tasksByStatus(tasks, "open").filter(isClaimableOpenTask).filter((task) => !isTempTask(task));
+        const tempTasks = allTasks.filter(isTempTask);
         const stateTitle = createElement("div", { class: "saa-task-title" });
         stateTitle.append(createElement("span", {}, "任务状态"), createElement("span", { class: "saa-task-count" }, `${allTasks.length} 个任务`));
         taskScroll.append(stateTitle);
         appendTaskStatusSection(taskScroll, "进行中", inProgressTasks, "暂无进行中任务");
         appendTaskStatusSection(taskScroll, "阻塞中", blockedTasks, "暂无阻塞任务");
         appendTaskStatusSection(taskScroll, "可推进", openTasks, "暂无可推进任务");
-        if (otherTempTasks.length > 0) appendTaskStatusSection(taskScroll, "临时任务", otherTempTasks, "暂无临时任务");
+        if (tempTasks.length > 0) appendTaskStatusSection(taskScroll, "临时任务", tempTasks, "暂无临时任务");
         const taskTitle = createElement("div", { class: "saa-task-title" });
         taskTitle.append(createElement("span", {}, "项目进度"), createElement("span", { class: "saa-task-count" }, `${groups.length} 个项目`));
         taskScroll.append(taskTitle);

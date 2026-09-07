@@ -26,7 +26,8 @@ const taskSchema = z.object({
   blockedReason: z.union([z.string(), z.null()]).readonly().optional(),
   project: z.string().readonly().optional(),
   task_id: z.string().readonly().optional(),
-  kind: z.string().readonly().optional()
+  kind: z.string().readonly().optional(),
+  claimState: z.string().readonly().optional()
 });
 const pendingRequestSchema = z.object({
   title: z.string().readonly(),
