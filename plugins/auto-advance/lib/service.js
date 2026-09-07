@@ -12,10 +12,10 @@ import { parseRoundCloseMessage, parseRoundCloseText, validateRoundClosePayload 
  * Model-facing v2 prompt. Task state is written by the memory task tools;
  * auto-advance only decides whether there is owned work worth continuing.
  */
-const AUTONOMOUS_PROMPT = "涟漪已离开。由于存在 in_progress 任务，请继续尽可能推进所有不需人工的任务，直到无可推进。确实无自主可推进处，能自测的自测、能拆的拆，然后收口：只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked（need 之外还有可推进就继续推进，不要因为有 need-human 就 block）；需人工了解重大决策时发 notify（待确认，不阻塞 done）；达到交付标准就标 done。禁止为逃避收口母任务无限开旁支/temp 新任务。每轮收尾都核对当前 in_progress 是否真无可推进，可推进就继续，不可推进按上述规则收口。终态请使用任务工具更新。";
-const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进，能自测的已自测、能拆的已拆？只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked（need 之外还有可推进就继续推进）；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。禁止用旁支/temp 新任务逃避收口。";
-const AUTONOMOUS_CHALLENGE = "涟漪已离开。先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进？能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口。只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。";
-const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：先继续推进所有不需人工的部分至无可推进，能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口；只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked；重大决策发 notify（待确认，不阻塞 done）；达到交付标准就完成、标 done、释放任务。";
+const AUTONOMOUS_PROMPT = "涟漪已离开。由于存在 in_progress 任务，请继续尽可能推进所有不需人工的任务，直到无可推进。遇到明确的 bug（含远端/服务端代码错误）直接修复推进到底，不要因选择非常明确的小问题阻塞——顶多发 notify 告知即可；只有方向性取舍、需涟漪个人输入（凭据/激活码/权限）、或不可逆高风险（无备份的破坏性操作/动生产数据）才停下找他。确实无自主可推进处，能自测的自测、能拆的拆，然后收口：只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked（need 之外还有可推进就继续推进，不要因为有 need-human 就 block）；需人工了解重大决策时发 notify（待确认，不阻塞 done）；达到交付标准就标 done。禁止为逃避收口母任务无限开旁支/temp 新任务。每轮收尾都核对当前 in_progress 是否真无可推进，可推进就继续，不可推进按上述规则收口。终态请使用任务工具更新。";
+const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进，能自测的已自测、能拆的已拆？明确 bug 应直接修复推进（含远端/服务端），选择明确的小问题不阻塞（顶多 notify）；只有方向性取舍、需涟漪个人输入、不可逆高风险才停下。只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked（need 之外还有可推进就继续推进）；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。禁止用旁支/temp 新任务逃避收口。";
+const AUTONOMOUS_CHALLENGE = "涟漪已离开。先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进？能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口。明确 bug 直接修复推进（含远端/服务端），选择明确的小问题不阻塞（顶多 notify）。只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。";
+const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：先继续推进所有不需人工的部分至无可推进，能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口；明确 bug 直接修复推进（含远端/服务端），选择明确的小问题不阻塞（顶多 notify）。只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked；重大决策发 notify（待确认，不阻塞 done）；达到交付标准就完成、标 done、释放任务。";
 
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
@@ -962,10 +962,10 @@ class AutoAdvanceService extends TypertRemoteService {
           this.ownedTaskSet(state).add(id);
           ownershipChanged = true;
         }
-        if (args.status === "done" || args.status === "blocked") transitions.push({ id, args });
       }
-      // Keep old tool clients observable during the transition, but do not
-      // require or parse round-close text anymore.
+      // v3: ordinary task_update done/blocked is a direct terminal write.
+      // Autonomous close remains challengeable only through round-close,
+      // whose Worker path creates pending_status and requires confirm.
       if (name === "task_round_close" || name.endsWith(".task_round_close")) {
         if (args.action === "done" || args.action === "blocked") transitions.push({ id, args });
       }
