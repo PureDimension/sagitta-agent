@@ -12,10 +12,10 @@ import { parseRoundCloseMessage, parseRoundCloseText, validateRoundClosePayload 
  * Model-facing v2 prompt. Task state is written by the memory task tools;
  * auto-advance only decides whether there is owned work worth continuing.
  */
-const AUTONOMOUS_PROMPT = "涟漪已离开。由于存在 in_progress 任务，请继续尽可能推进所有不需人工的任务，直到无可推进。确实无自主可推进处，能自测的自测、能拆的拆，然后收口：需人工介入才能完成时创建 need-human（type=need）并标 blocked；需人工了解重大决策时发 notify（待确认，不阻塞 done）；达到交付标准就标 done。禁止为逃避收口母任务无限开旁支/temp 新任务。每轮收尾都核对当前 in_progress 是否真无可推进，可推进就继续，不可推进按上述规则收口。终态请使用任务工具更新。";
-const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进，能自测的已自测、能拆的已拆？确需人工完成时创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。禁止用旁支/temp 新任务逃避收口。";
-const AUTONOMOUS_CHALLENGE = "涟漪已离开。先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进？能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口。确需人工完成时创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。";
-const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：先继续推进所有不需人工的部分至无可推进，能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口；确需人工完成时创建 need-human（type=need）并标 blocked；重大决策发 notify（待确认，不阻塞 done）；达到交付标准就完成、标 done、释放任务。";
+const AUTONOMOUS_PROMPT = "涟漪已离开。由于存在 in_progress 任务，请继续尽可能推进所有不需人工的任务，直到无可推进。确实无自主可推进处，能自测的自测、能拆的拆，然后收口：只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked（need 之外还有可推进就继续推进，不要因为有 need-human 就 block）；需人工了解重大决策时发 notify（待确认，不阻塞 done）；达到交付标准就标 done。禁止为逃避收口母任务无限开旁支/temp 新任务。每轮收尾都核对当前 in_progress 是否真无可推进，可推进就继续，不可推进按上述规则收口。终态请使用任务工具更新。";
+const IN_PERSON_CHALLENGE = "确认已推进到必须涟漪处理的地步？先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进，能自测的已自测、能拆的已拆？只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked（need 之外还有可推进就继续推进）；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。禁止用旁支/temp 新任务逃避收口。";
+const AUTONOMOUS_CHALLENGE = "涟漪已离开。先核对当前 in_progress：所有不需人工的工作是否已推进到无可推进？能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口。只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked；重大决策待确认时发 notify，不阻塞 done；达到交付标准才标 done。";
+const AUTONOMOUS_TURN_END_CHALLENGE = "涟漪已离开。仍有 in_progress 任务未收尾：先继续推进所有不需人工的部分至无可推进，能拆的拆、能自测的自测，禁止开旁支/temp 任务逃避收口；只有【除 need-human 之外没有其他可独自推进的事】时才创建 need-human（type=need）并标 blocked；重大决策发 notify（待确认，不阻塞 done）；达到交付标准就完成、标 done、释放任务。";
 
 const STOP_MARKER = "【停止自主推进】";
 const PLUGIN_ID = "auto-advance";
@@ -1150,7 +1150,7 @@ class AutoAdvanceService extends TypertRemoteService {
           })
           .filter((block) => block.length > 0);
         const fullPrompt = accBlocks.length > 0
-          ? `${prompt}\n\n请逐项核对每个任务的期望目标：确认每一项是否还有可在人工介入之前推进的空间；有就推进，没有才按收口规则处理（need-human+blocked / notify / done）。${accBlocks.join("\n")}`
+          ? `${prompt}\n\n请逐项核对每个任务的期望目标：确认每一项是否还有可在人工介入之前推进的空间；有就推进，没有才按收口规则处理——需人工且【除 need-human 外已无其他可独自推进项】才 need-human+blocked；重大决策发 notify（不阻塞 done）；期望目标全达则 done。${accBlocks.join("\n")}`
           : prompt;
         this.queuePrompt(state, generation, fullPrompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
         return;

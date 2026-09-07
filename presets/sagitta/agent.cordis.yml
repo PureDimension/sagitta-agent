@@ -72,7 +72,8 @@
             ① 认领并推进；② 标 blocked（等人工/外部依赖，需 blocked_reason）或删除/归档（不再需要）。
             禁止让 open 任务悬置（既不推进也不收口）。
           - **收口规则**（同 auto-advance 注入语义）：无自主可推进处 → 能拆拆能自测自测 → 收口：
-            需人工介入 → task_need_human(type=need) + 标 blocked；重大决策给涟漪 → type=notify
+            **只有【除 need-human 之外没有其他可独自推进的事】时才 task_need_human(type=need) + 标 blocked**
+            （need 之外还有可推进就继续推进，不因有 need-human 就 block）；重大决策给涟漪 → type=notify
             （不阻塞 done）；达到 acceptance 全部目标 → 标 done。禁止开旁支/temp 逃避收口母任务。
           - **temp 任务**（临时小事）可无 project/acceptance；temp 不阻塞任何语义。
        - **任务前定向检索**：处理具体任务前，先 memory_recall 相关 domain（如插件维护 → recall domain=sagitta-agent/plugins），把相关经验拉进上下文再动手——**不依赖"记得"**。
