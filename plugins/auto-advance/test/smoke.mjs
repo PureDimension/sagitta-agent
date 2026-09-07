@@ -175,7 +175,10 @@ function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
     status: "idle",
     inbox: { nextStep: [], nextTurn: [] },
     followups: [],
-    followup(message) { this.followups.push(message); },
+    followup(message) {
+      this.followups.push(message);
+      this.inbox.nextTurn.push(message);
+    },
   };
   const events = [];
   const asyncWork = { listActive: () => runningWork ? [{ status: "running", task_id: "tsk-work" }] : [] };
@@ -220,7 +223,6 @@ function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
       pendingAutoMode: undefined,
       autonomousMode: false,
       settledWorkIds: new Set(),
-      pendingSettlements: new Map(),
       ownedTaskIds: new Set(),
       requestController: undefined,
       retryAttempt: 0,
@@ -243,11 +245,6 @@ function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
 // Settlement is a basic wake-up even when autonomous mode is disabled. The
 // notice carries the settled work identity and is idempotent per work.
 const chatSettleHarness = makeHarness({ api: false, enabled: false });
-let chatSettleResetCount = 0;
-chatSettleHarness.service.resetTimer = (_state, reason) => {
-  chatSettleResetCount++;
-  assert.equal(reason, "async-work-settled");
-};
 const completedWork = {
   ownerId: "agent-smoke",
   workId: "work-settled",
@@ -259,6 +256,7 @@ const completedWork = {
 chatSettleHarness.state.autonomousMode = true;
 assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), true);
 assert.equal(chatSettleHarness.agent.followups.length, 1, "disabled autonomous mode must still receive settlement notice");
+assert.equal(chatSettleHarness.agent.inbox.nextTurn.length, 1, "idle settlement must enter next-turn inbox");
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /异步任务已完成/u);
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /work_id=work-settled/u);
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /task_id=task-settled/u);
@@ -266,42 +264,19 @@ assert.match(chatSettleHarness.agent.followups[0].content[0].text, /status=compl
 assert.match(chatSettleHarness.agent.followups[0].content[0].text, /kind=codex/u);
 assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), false, "the same work must not notify twice");
 assert.equal(chatSettleHarness.agent.followups.length, 1);
-assert.equal(chatSettleResetCount, 1);
 
-// An enabled settlement keeps the existing full onTimer path and must not
-// produce a second lightweight notice for the same work.
-const autoSettleHarness = makeHarness({ api: false, enabled: true });
-let autoSettleChecks = 0;
-autoSettleHarness.service.resetTimer = (_state, reason) => {
-  assert.equal(reason, "async-work-settled");
-  autoSettleHarness.state.timerGeneration += 1;
-};
-autoSettleHarness.service.onTimer = (_state, generation) => {
-  autoSettleChecks++;
-  assert.equal(generation, autoSettleHarness.state.timerGeneration);
-};
-assert.equal(autoSettleHarness.service.handleAsyncWorkSettled(completedWork), true);
-assert.equal(autoSettleChecks, 1, "enabled settlement must check immediately, without idleTimeout");
-assert.equal(autoSettleHarness.agent.followups.length, 0, "enabled settlement must use only the full path");
-assert.equal(autoSettleHarness.service.handleAsyncWorkSettled(completedWork), false);
-assert.equal(autoSettleChecks, 1, "enabled settlement must be idempotent");
+const enabledSettleHarness = makeHarness({ api: false, enabled: true });
+assert.equal(enabledSettleHarness.service.handleAsyncWorkSettled(completedWork), true, "enabled settlement must still queue a notice");
+assert.equal(enabledSettleHarness.agent.inbox.nextTurn.length, 1);
 
-// A settlement racing a running turn is deferred without injecting into that
-// turn; the pending work is delivered once the agent becomes idle.
+// A settlement racing a running turn is queued for the next turn instead of
+// waiting for an agent/status idle event.
 const runningSettleHarness = makeHarness({ api: false, enabled: false });
-let runningSettleResetCount = 0;
-runningSettleHarness.service.resetTimer = (_state, reason) => {
-  runningSettleResetCount++;
-  assert.equal(reason, "async-work-settled");
-};
 const runningWorkSettlement = { ownerId: "agent-smoke", workId: "work-running", taskId: "task-running", status: "completed" };
 runningSettleHarness.agent.status = "running";
-assert.equal(runningSettleHarness.service.handleAsyncWorkSettled(runningWorkSettlement), false);
-assert.equal(runningSettleHarness.agent.followups.length, 0, "running agent must not be interrupted by settlement");
-assert.equal(runningSettleResetCount, 1, "running settlement must reset the timer for the next idle check");
-runningSettleHarness.agent.status = "idle";
-assert.equal(runningSettleHarness.service.flushPendingAsyncWorkSettled(runningSettleHarness.state), true);
-assert.equal(runningSettleHarness.agent.followups.length, 1, "deferred settlement must wake the next idle turn");
+assert.equal(runningSettleHarness.service.handleAsyncWorkSettled(runningWorkSettlement), true);
+assert.equal(runningSettleHarness.agent.followups.length, 1, "running agent must queue settlement notice");
+assert.equal(runningSettleHarness.agent.inbox.nextTurn.length, 1, "running agent must retain settlement in next-turn inbox");
 
 const inFlightSettleHarness = makeHarness({ api: false, enabled: false });
 inFlightSettleHarness.state.requestController = {};
@@ -310,8 +285,9 @@ assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({
   workId: "work-in-flight",
   taskId: "task-in-flight",
   status: "completed",
-}), false);
-assert.equal(inFlightSettleHarness.agent.followups.length, 0, "settlement must not inject while a request is in flight");
+}), true);
+assert.equal(inFlightSettleHarness.agent.followups.length, 1, "settlement must queue while a request is in flight");
+assert.equal(inFlightSettleHarness.agent.inbox.nextTurn.length, 1, "in-flight settlement must remain in next-turn inbox");
 inFlightSettleHarness.state.disposed = true;
 inFlightSettleHarness.state.requestController = undefined;
 assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", workId: "work-disposed", status: "completed" }), false);

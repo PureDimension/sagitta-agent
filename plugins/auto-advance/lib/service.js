@@ -387,7 +387,6 @@ class AutoAdvanceService extends TypertRemoteService {
       state.autonomousMode = false;
       state.pendingAutoMode = undefined;
       state.settledWorkIds = new Set();
-      state.pendingSettlements = new Map();
       state.lastProtocolNotice = null;
       this.resetTimer(state, "session-start");
     });
@@ -396,7 +395,6 @@ class AutoAdvanceService extends TypertRemoteService {
       this.touchOwners(agent, "child-status");
       if (status === "idle") {
         this.maybeArm(state);
-        this.flushPendingAsyncWorkSettled(state);
       }
       else this.resetTimer(state, "agent-running");
     });
@@ -645,7 +643,6 @@ class AutoAdvanceService extends TypertRemoteService {
       autonomousMode: false,
       pendingAutoMode: undefined,
       settledWorkIds: new Set(),
-      pendingSettlements: new Map(),
       lastProtocolNotice: null
     };
     this.states.set(agent, state);
@@ -670,35 +667,16 @@ class AutoAdvanceService extends TypertRemoteService {
     const agent = this.ctx.agents.get(ownerId);
     if (agent === undefined) return false;
     const state = this.states.get(agent);
-    if (state === undefined || state.disposed === true || state.requestController !== undefined) return false;
+    if (state === undefined || state.disposed === true) return false;
 
     const key = settledWorkKey(settled);
     const settledWorkIds = state.settledWorkIds instanceof Set ? state.settledWorkIds : (state.settledWorkIds = new Set());
-    const pendingSettlements = state.pendingSettlements instanceof Map ? state.pendingSettlements : (state.pendingSettlements = new Map());
     if (key !== undefined && settledWorkIds.has(key)) return false;
 
-    if (agent.status !== "idle") {
-      if (key !== undefined && !pendingSettlements.has(key)) pendingSettlements.set(key, settled);
-      // Do not interrupt a running turn, but make the next idle transition
-      // re-check immediately instead of waiting on a stale timer.
-      this.resetTimer(state, "async-work-settled");
-      return false;
-    }
-
     if (key !== undefined) {
-      pendingSettlements.delete(key);
-      // Mark before queueing/onTimer so a duplicate event cannot race the
-      // synchronous follow-up insertion or the async cloud read.
+      // Mark before queueing so a duplicate event cannot race the synchronous
+      // follow-up insertion.
       settledWorkIds.add(key);
-    }
-
-    this.resetTimer(state, "async-work-settled");
-    if (state.enabled === true) {
-      // Autonomous mode keeps its existing full qualification/injection path;
-      // the settlement only makes that check immediate.
-      const generation = state.timerGeneration;
-      void this.onTimer(state, generation);
-      return true;
     }
 
     const queued = this.queueNotice(
@@ -710,18 +688,6 @@ class AutoAdvanceService extends TypertRemoteService {
     );
     if (!queued && key !== undefined) settledWorkIds.delete(key);
     return queued;
-  }
-
-  flushPendingAsyncWorkSettled(state) {
-    const pendingSettlements = state?.pendingSettlements;
-    if (!(pendingSettlements instanceof Map) || pendingSettlements.size === 0) return false;
-    let handled = false;
-    for (const settled of [...pendingSettlements.values()]) {
-      const result = this.handleAsyncWorkSettled(settled);
-      handled = result || handled;
-      if (state.requestController !== undefined) break;
-    }
-    return handled;
   }
 
   hasRunningWork(agent, taskId) {
