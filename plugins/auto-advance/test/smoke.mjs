@@ -489,7 +489,7 @@ try {
   assert.match(clientSource, /remoteApi\.resolveNeedHuman/u);
   assert.match(clientSource, /await refresh\(true\)/u);
   assert.match(clientSource, /filter\(isClaimableOpenTask\)/u);
-  assert.match(clientSource, /const tempTasks = allTasks\.filter\(isTempTask\)/u);
+  assert.match(clientSource, /const tempTasks = allTasks\.filter\(\(task\) => isTempTask\(task\) && task\.status !== "done"/u);
   assert.doesNotMatch(clientSource, /if \(total === 0\) return null/u, "async-work header entry remains visible with an empty registry");
   let clientPlugin;
   runInNewContext(clientSource, {

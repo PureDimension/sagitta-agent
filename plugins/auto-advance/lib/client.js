@@ -913,14 +913,16 @@ window.__ModuleLoader__.load({
         appendPendingSection(taskScroll, notifications, "notify");
         const allTasks = normalizedTaskItems(tasks);
         const inProgressTasks = tasksByStatus(tasks, "in_progress").filter((task) => !isTempTask(task));
-        const blockedTasks = tasksByStatus(tasks, "blocked").filter((task) => !isTempTask(task));
+        const blockedTasks = tasksByStatus(tasks, "blocked").filter((task) => !isTempTask(task))
+          .concat(tasksByStatus(tasks, "waiting").filter((task) => !isTempTask(task)));
         const openTasks = tasksByStatus(tasks, "open").filter(isClaimableOpenTask).filter((task) => !isTempTask(task));
-        const tempTasks = allTasks.filter(isTempTask);
+        const tempTasks = allTasks.filter((task) => isTempTask(task) && task.status !== "done" && task.status !== "completed");
+        const stateTaskCount = inProgressTasks.length + blockedTasks.length + openTasks.length + tempTasks.length;
         const stateTitle = createElement("div", { class: "saa-task-title" });
-        stateTitle.append(createElement("span", {}, "任务状态"), createElement("span", { class: "saa-task-count" }, `${allTasks.length} 个任务`));
+        stateTitle.append(createElement("span", {}, "任务状态"), createElement("span", { class: "saa-task-count" }, `${stateTaskCount} 个任务`));
         taskScroll.append(stateTitle);
         appendTaskStatusSection(taskScroll, "进行中", inProgressTasks, "暂无进行中任务");
-        appendTaskStatusSection(taskScroll, "阻塞中", blockedTasks, "暂无阻塞任务");
+        appendTaskStatusSection(taskScroll, "阻塞/等待", blockedTasks, "暂无阻塞或等待任务");
         appendTaskStatusSection(taskScroll, "可推进", openTasks, "暂无可推进任务");
         if (tempTasks.length > 0) appendTaskStatusSection(taskScroll, "临时任务", tempTasks, "暂无临时任务");
         const taskTitle = createElement("div", { class: "saa-task-title" });
