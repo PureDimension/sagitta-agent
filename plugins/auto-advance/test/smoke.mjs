@@ -24,6 +24,7 @@ function task(id, status, pending_status = null, extra = {}, minute = 20) {
     id,
     project: "smoke",
     title: id,
+    acceptance: "- [ ] target one\n- [x] target two",
     status,
     pending_status,
     blocked_reason: pending_status === "pending_blocked" || status === "blocked" ? "等待外部依赖" : null,
@@ -338,6 +339,7 @@ try {
   assert.match(ownedHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /tsk-mine/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /当前我认领的 in_progress 任务/u);
+  assert.match(ownedHarness.agent.followups[0].content[0].text, /acceptance=2项\/未完成1/u);
   assert.doesNotMatch(ownedHarness.agent.followups[0].content[0].text, /task_round_close|round-close/iu);
   assert.equal(ownedHarness.state.pendingAutoMode, "away");
 

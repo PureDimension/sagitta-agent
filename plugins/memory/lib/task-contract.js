@@ -79,6 +79,7 @@ export function pickTask(task) {
     // 新版本会显式返回 normal|temp。
     kind: task.kind === "temp" ? "temp" : "normal",
     title: String(task.title ?? ""),
+    acceptance: typeof task.acceptance === "string" ? task.acceptance : "",
     status: String(task.status ?? ""),
     priority: Number(task.priority ?? 0),
     checkbox: Number(task.checkbox ?? 0),

@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,                -- 生成: tsk-YYYYMMDD-<hex6>
   project       TEXT NOT NULL,                   -- 所属项目（对应 TASKS §1A/1B 分类）
   title         TEXT NOT NULL,                   -- 条目一行描述
+  acceptance    TEXT DEFAULT '',                 -- markdown checklist；normal 必填，temp 可空
   status        TEXT NOT NULL DEFAULT 'open',    -- open | in_progress | blocked | waiting | done
   priority      INTEGER NOT NULL DEFAULT 0,      -- 0 普通 / 1 高 / 2 紧急
   checkbox      INTEGER NOT NULL DEFAULT 0,      -- 1=该条是涟漪待处理 checkbox
@@ -29,6 +30,18 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
 
 对齐记忆库 v1.3 契约：`id`/`status`/`archived`/`stream` 四语义与 memory 的 `entries` 一致（召回默认排除 archived）；`checkbox` 对应悬浮窗"待处理需求"区块。
 
+### acceptance（验收清单）
+
+`acceptance` 是一个 TEXT 字段，内容为多行 Markdown checklist，每行一个期望目标，例如：
+
+```markdown
+- [ ] API 返回 acceptance
+- [ ] normal 无清单时创建被拒绝
+- [x] 已完成的目标
+```
+
+至少要有一行 `- [ ] 描述`、`- [x] 描述` 或 `- [X] 描述` 才算合法。`normal` 创建时必须提供合法清单；`temp` 可以省略或保存为空。更新 normal 的 acceptance 是整体替换，不能清空或替换成无 checklist 的文本；temp 可以清空。清单是否全部达成由模型对照清单判断，Worker 不维护逐项状态机。
+
 ## 2. REST 路由（复用现有 `/mem` 基座与鉴权）
 
 前缀 `/task`（与 `/mem` 平级，同一 Worker）：
@@ -36,9 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
 | 方法 | 路径 | 用途 | 需要的 D1 token |
 |---|---|---|---|
 | GET  | `/task?project=&stream=&status=` | 列表（默认排除 archived；status 过滤可选） | read |
-| POST | `/task` | 新建（body: project/title/status/priority/checkbox/stream/body） | write |
+| POST | `/task` | 新建（body: project/title/acceptance/status/priority/checkbox/stream/body） | write |
 | GET  | `/task/{id}` | 单条 | read |
-| PATCH| `/task/{id}` | 更新 status/priority/body/title/checkbox（部分更新） | write |
+| PATCH| `/task/{id}` | 更新 status/priority/body/title/checkbox/acceptance（部分更新） | write |
 | DELETE| `/task/{id}` | 软删 → archived=1（不真删，保审计） | write |
 | POST | `/task/search` | 关键词 LIKE（与 /mem/search 同风格） | read |
 

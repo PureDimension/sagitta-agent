@@ -946,6 +946,7 @@ async function getDelegationHandler(db, taskId) {
 // D1 的 batch 是原子批次；失败必须抛出，由 task 路由进入不可用态，不能继续服务旧 schema。
 const TASK_SCHEMA_COLUMNS = [
   ['id', 'TEXT'], ['project', 'TEXT'], ['title', 'TEXT'], ['status', 'TEXT'],
+  ['acceptance', "TEXT DEFAULT ''"],
   ['priority', 'INTEGER'], ['checkbox', 'INTEGER'], ['stream', 'TEXT'], ['body', 'TEXT'],
   ['created_at', 'TEXT'], ['updated_at', 'TEXT'], ['done_at', 'TEXT'], ['archived', 'INTEGER'],
   ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'],
@@ -967,7 +968,7 @@ const TASK_NEED_HUMAN_SCHEMA_COLUMNS = [
 const TASK_SYSTEM_AGENT = 'worker';
 const TASK_PENDING_STATUSES = ['pending_done', 'pending_blocked'];
 const TASK_TERMINAL_STATUSES = ['done', 'blocked'];
-const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason'];
+const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason', 'acceptance'];
 const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
 const TASK_ROUND_ACTIONS = ['update', 'done', 'blocked'];
 const TASK_NEED_HUMAN_STATUSES = ['open', 'resolved'];
@@ -990,6 +991,7 @@ const TASKS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
   project       TEXT DEFAULT '',
   title         TEXT NOT NULL,
+  acceptance    TEXT DEFAULT '',
   kind          TEXT DEFAULT 'normal',
   status        TEXT NOT NULL DEFAULT 'open',
   priority      INTEGER NOT NULL DEFAULT 0,
@@ -1111,6 +1113,7 @@ function serializeTask(row, extra = {}, callerAgentIdValue) {
   const openNotifyCount = Number(row.open_notify_count || 0);
   const result = Object.assign({}, row, {
     kind: row.kind === undefined || row.kind === null ? 'normal' : row.kind,
+    acceptance: typeof row.acceptance === 'string' ? row.acceptance : '',
     priority: Number(row.priority),
     checkbox: Number(row.checkbox),
     archived: Number(row.archived),
@@ -1172,6 +1175,25 @@ function taskString(value, field, required = false) {
       required ? field + ' 必填' : field + ' 必须是字符串') };
   }
   return { value: required ? value.trim() : value };
+}
+
+// acceptance 是单字段 markdown checklist。收口语义由模型对照清单判断，
+// Worker 只保证 normal 有至少一条 checklist，temp 可留空。
+const ACCEPTANCE_CHECKLIST_LINE = /^\s*-\s+\[[ xX]\]\s+\S.*$/mu;
+
+function taskAcceptance(value, kind) {
+  if (value === undefined || value === null) value = '';
+  if (typeof value !== 'string') {
+    return { error: jsonError(422, 'INVALID_ACCEPTANCE', 'acceptance 必须是字符串') };
+  }
+  const normalized = value.trim();
+  if (kind === 'normal' && normalized.length === 0) {
+    return { error: jsonError(422, 'ACCEPTANCE_REQUIRED', 'normal 任务 acceptance 必须至少包含一条 markdown checklist') };
+  }
+  if (normalized.length > 0 && !ACCEPTANCE_CHECKLIST_LINE.test(normalized)) {
+    return { error: jsonError(422, 'ACCEPTANCE_FORMAT', 'acceptance 必须至少包含一条形如 - [ ] 描述 或 - [x] 描述的 checklist') };
+  }
+  return { value: normalized };
 }
 
 function taskStatus(value) {
@@ -1592,6 +1614,8 @@ async function createTaskHandler(db, body) {
     const statusError = taskStatus(status);
     if (statusError) return statusError;
   }
+  const acceptance = taskAcceptance(body.acceptance, kind);
+  if (acceptance.error) return acceptance.error;
   const priority = body.priority === undefined ? 0 : body.priority;
   const priorityError = taskPriority(priority);
   if (priorityError) return priorityError;
@@ -1612,10 +1636,10 @@ async function createTaskHandler(db, body) {
   const id = taskId();
   const now = nowIso();
   await db.prepare(
-    'INSERT INTO tasks (id, project, title, kind, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO tasks (id, project, title, acceptance, kind, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(
-    id, project.value, title.value, kind, status, priority, checkbox, stream, taskBody, now, now, '', 0
+    id, project.value, title.value, acceptance.value, kind, status, priority, checkbox, stream, taskBody, now, now, '', 0
   ).run();
 
   const row = await getTaskRow(db, id);
@@ -1632,7 +1656,7 @@ async function patchTaskHandler(db, id, body, request, env) {
     return jsonError(422, 'TASK_PATCH_FIELD_FORBIDDEN', 'PATCH 字段不在白名单中：' + forbidden.join(', '), { fields: forbidden });
   }
   const present = TASK_PATCH_FIELDS.filter(has);
-  if (present.length === 0) return jsonError(400, 'PATCH_FIELDS_REQUIRED', 'PATCH 至少需要 status/priority/body/title/checkbox 之一');
+  if (present.length === 0) return jsonError(400, 'PATCH_FIELDS_REQUIRED', 'PATCH 至少需要 status/priority/body/title/checkbox/acceptance 之一');
 
   const row = await getTaskRow(db, id);
   if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
@@ -1702,6 +1726,13 @@ async function patchTaskHandler(db, id, body, request, env) {
     return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', 'pending_blocked 必须保留非空 blocked_reason');
   }
 
+  let acceptance = row.acceptance === undefined || row.acceptance === null ? '' : row.acceptance;
+  if (has('acceptance')) {
+    const value = taskAcceptance(body.acceptance, row.kind === 'temp' ? 'temp' : 'normal');
+    if (value.error) return value.error;
+    acceptance = value.value;
+  }
+
   const sets = [];
   const params = [];
   for (const field of present) {
@@ -1730,6 +1761,9 @@ async function patchTaskHandler(db, id, body, request, env) {
       if (typeof body.body !== 'string') return jsonError(400, 'INVALID_BODY_TEXT', 'body 必须是字符串');
       sets.push('body = ?');
       params.push(body.body);
+    } else if (field === 'acceptance') {
+      sets.push('acceptance = ?');
+      params.push(acceptance);
     }
   }
 

@@ -1101,7 +1101,7 @@ class AutoAdvanceService extends TypertRemoteService {
           const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
           const needCount = openNeedHumanCount(task);
           const needNote = needCount > 0 ? ` ⚠ 有 ${needCount} 条待涟漪处理项，need 之外部分继续推进` : "";
-          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}${needNote}`;
+          return `- task_id=${task.task_id} status=in_progress${project} title=${JSON.stringify(title)}${acceptanceSummary(task.acceptance)}${needNote}`;
         });
         const prompt = [AUTONOMOUS_PROMPT, "", "当前我认领的 in_progress 任务：", ...lines].join("\n");
         this.queuePrompt(state, generation, prompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
@@ -1347,6 +1347,14 @@ function cleanBody(value) {
     .replace(/\*\*/gu, "")
     .replace(/`/gu, "")
     .trim();
+}
+
+function acceptanceSummary(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return "";
+  const lines = value.match(/^\s*-\s+\[[ xX]\]\s+\S.*$/gmu) ?? [];
+  if (lines.length === 0) return "";
+  const incomplete = lines.filter((line) => !/^\s*-\s+\[[xX]\]/u.test(line)).length;
+  return ` acceptance=${lines.length}项/未完成${incomplete}`;
 }
 
 function mapApiTask(item) {

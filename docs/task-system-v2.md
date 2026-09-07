@@ -18,10 +18,15 @@
 |---|---|
 | **项目** project | 长期方向/工作域。任务可挂项目（自动带项目记忆）或**无根**（新调研等暂不属某项目） |
 | **任务** task | 最小账目单位。`normal`（正式全流程）/ `temp`（临时小事极轻量） |
+| **验收清单** acceptance | 单个 TEXT 字段保存 Markdown checklist；normal 必填，temp 可空；全部勾选才算 done，收口时由模型对照清单判断，不做逐项状态机 |
 | **执行记录** log | 任务进展时间线（按需写） |
 | **need-human 条目** | "需要涟漪参与/决定"的记账，挂任务下；不阻塞我推进其他部分 |
 
 ---
+
+### 1.1 acceptance 格式
+
+任务的 `acceptance` 使用多行 Markdown checklist，每行一个期望目标：`- [ ] 描述`；已达成目标可以写成 `- [x] 描述`（也接受大写 `X`）。至少一条 checklist 行才合法。Worker 在 `task_create` 和更新 acceptance 时校验：normal 必须非空且合法，temp 可以省略或为空。全部 checklist 项勾选才算 done，但最终收口仍由模型对照清单判断，不维护逐项状态机。
 
 ## 2. 状态机
 

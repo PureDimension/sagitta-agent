@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,                -- 生成：tsk-YYYYMMDD-<hex6>
   project       TEXT DEFAULT '',                 -- 所属项目；temp 可为空（前端归入未分类）
   title         TEXT NOT NULL,                   -- 条目一行描述
+  acceptance    TEXT DEFAULT '',                 -- markdown checklist；normal 必填，temp 可空（由 worker 校验）
   kind          TEXT DEFAULT 'normal',           -- normal | temp
   status        TEXT NOT NULL DEFAULT 'open',    -- open | in_progress | blocked | waiting | done
   priority      INTEGER NOT NULL DEFAULT 0,      -- 0 普通 / 1 高 / 2 紧急
@@ -101,6 +102,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
 CREATE INDEX IF NOT EXISTS idx_tasks_stream  ON tasks(stream);
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
+
+-- 已部署 tasks 表的可重复迁移由 worker.ensureTasksSchema 按 PRAGMA table_info(tasks)
+-- 检查后执行；等价 SQL：ALTER TABLE tasks ADD COLUMN acceptance TEXT DEFAULT '';
 
 -- task_events：任务 round-close、终态申请与确认的不可变审计事实
 CREATE TABLE IF NOT EXISTS task_events (

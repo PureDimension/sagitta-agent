@@ -791,6 +791,7 @@ export function registerMemoryTools(ctx, client) {
     kind: { type: "string", required: true, enum: ["normal", "temp"] },
     project: { type: "string", required: true },
     title: { type: "string", required: true },
+    acceptance: { type: "string", required: true },
     status: { type: "string", required: true },
     priority: { type: "integer", required: true },
     checkbox: { type: "integer", required: true },
@@ -834,7 +835,7 @@ export function registerMemoryTools(ctx, client) {
     description:
       "任务列表（云端 D1 tasks 表，docs/task-api-p1.md）：按 project/stream/status/checkbox 过滤；" +
       "支持 kind=normal|temp；默认只列 normal，并额外带回当前 agent 自己认领的 temp；显式 kind=temp 才列 temp 任务；" +
-      "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/updated_at/done_at；" +
+      "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/acceptance/updated_at/done_at；" +
       "done/blocked 只有 pending_done/pending_blocked 申请并经 task_confirm accept 后才是终态，pending 时带 confirmation_id；" +
       "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。\n" +
       "每条任务带 claim_state（task-ownership-p2）：unclaimed=未认领（可认领）；claimed=他人认领中（租约内），" +
@@ -866,7 +867,8 @@ export function registerMemoryTools(ctx, client) {
           const st = t.status === "done" ? "✅" : t.status === "blocked" ? "🚩" : t.status === "in_progress" ? "🔄" : t.status === "waiting" ? "⏳" : "□";
           const pending = t.pending_status ? ` · ${t.pending_status}待确认` : "";
           const claim = t.claim_state === "claimed" ? " · 🔒他人认领中" : "";
-          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}${pending}${claim}）`;
+          const acceptance = t.acceptance ? `\n  acceptance：${t.acceptance}` : "";
+          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}${pending}${claim}）${acceptance}`;
         });
         return [{ type: "text", text: head + lines.join("\n") }];
       },
@@ -1079,7 +1081,7 @@ export function registerMemoryTools(ctx, client) {
   ctx.tools.register(defineTool({
     name: "task_create",
     description:
-      "创建任务（云端 D1 tasks 表）：kind=normal|temp（默认 normal）；normal 任务需 project，temp 可不传 project；title 必填；status 默认 open；priority 默认 0；" +
+      "创建任务（云端 D1 tasks 表）：kind=normal|temp（默认 normal）；normal 任务需 project 和 acceptance checklist，temp 可不传 project/acceptance；title 必填；status 默认 open；priority 默认 0；" +
       "checkbox=1 表示涟漪待处理项（会出现在悬浮窗\"待处理需求\"区）；stream 默认 company。管理字段由服务端生成。",
     parameters: {
       kind: { type: "string", enum: TASK_KINDS, description: "normal（默认，正式任务）或 temp（临时小事；可无 project）。" },
@@ -1090,6 +1092,7 @@ export function registerMemoryTools(ctx, client) {
       checkbox: { type: "boolean", description: "true=涟漪待处理项（默认 false）。" },
       stream: { type: "string", enum: TASK_STREAMS, description: "默认 company。" },
       body: { type: "string", description: "内嵌描述/notes。" },
+      acceptance: { type: "string", description: "markdown checklist；normal 必填且至少包含一行 - [ ] 描述 或 - [x] 描述，temp 可省略或为空。" },
     },
     output: {
       schema: {
@@ -1115,6 +1118,7 @@ export function registerMemoryTools(ctx, client) {
         ...(args.checkbox !== undefined ? { checkbox: args.checkbox === true ? 1 : 0 } : {}),
         ...(args.stream ? { stream: args.stream } : {}),
         ...(args.body !== undefined ? { body: args.body } : {}),
+        ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}),
       };
       const created = await client.createTask(body, exec.signal);
       return { ...pickTask(created), message: `已创建任务 ${created.id}` };
@@ -1125,7 +1129,7 @@ export function registerMemoryTools(ctx, client) {
   ctx.tools.register(defineTool({
     name: "task_update",
     description:
-      "更新任务（PATCH /task/{id}）：参数白名单仅为 status/priority/body/title/checkbox/blocked_reason，" +
+      "更新任务（PATCH /task/{id}）：参数白名单仅为 status/priority/body/title/checkbox/blocked_reason/acceptance，" +
       "可带 expected_updated_at；不得传 done_at、pending_status 或 confirm。" +
       "status=done/blocked 只是申请 pending_done/pending_blocked，返回 confirmation_id 与 updated_at，" +
       "必须再用 task_confirm accept 才进入终态；status=blocked 时 blocked_reason 必填。task_id 可从 task_list 获取。\n" +
@@ -1139,6 +1143,7 @@ export function registerMemoryTools(ctx, client) {
       body: { type: "string" },
       checkbox: { type: "boolean" },
       blocked_reason: { type: "string", description: "申请 blocked 时必填的非空阻塞原因；done 申请不得设置。" },
+      acceptance: { type: "string", description: "整体替换 markdown checklist；normal 不能清空且至少包含一行 - [ ] 描述 或 - [x] 描述，temp 可清空。" },
       expected_updated_at: { type: "string", description: "可选版本条件；必须等于当前 updated_at。" },
     },
     output: {
@@ -1171,6 +1176,7 @@ export function registerMemoryTools(ctx, client) {
         ...(args.body !== undefined ? { body: args.body } : {}),
         ...(args.checkbox !== undefined ? { checkbox: args.checkbox === true ? 1 : 0 } : {}),
         ...(args.blocked_reason !== undefined ? { blocked_reason: args.blocked_reason } : {}),
+        ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}),
         ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
       };
       if (Object.keys(body).length === 0) throw new Error("task_update 至少需要更新一个字段。");
@@ -1471,7 +1477,7 @@ export function registerMemoryTools(ctx, client) {
     name: "task_search",
     description:
       "关键词检索任务（POST /task/search，LIKE 匹配 title/body/project）：默认排除 archived。" +
-      "可选 project/stream/status 过滤；返回 pending_status/blocked_reason/updated_at/done_at，" +
+      "可选 project/stream/status 过滤；返回 pending_status/blocked_reason/acceptance/updated_at/done_at，" +
       "done/blocked 的 pending 申请须经 task_confirm 才是终态。",
     parameters: {
       query: { type: "string", required: true, description: "关键词（匹配 title/body/project）。" },
@@ -1491,7 +1497,7 @@ export function registerMemoryTools(ctx, client) {
         },
       },
       render: (_args, value) => [
-        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}${t.pending_status ? ` · ${t.pending_status}待确认` : ""}${t.claim_state === "claimed" ? " · 🔒他人认领中" : ""}）`).join("\n") },
+        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}${t.pending_status ? ` · ${t.pending_status}待确认` : ""}${t.claim_state === "claimed" ? " · 🔒他人认领中" : ""}）${t.acceptance ? `\n  acceptance：${t.acceptance}` : ""}`).join("\n") },
       ],
       presentationMeta: (_args, value) => ({ total: value.total }),
     },

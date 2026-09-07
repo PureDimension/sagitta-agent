@@ -9,6 +9,7 @@ const baseTask = (id) => ({
   task_id: id,
   project: "memory-smoke",
   title: "task contract smoke",
+  acceptance: "- [ ] contract acceptance",
   status: "in_progress",
   priority: 1,
   checkbox: 0,
@@ -88,6 +89,7 @@ try {
     confirmation_id: "cnf-projection",
   });
   assert.equal(projected.id, "tsk-projection");
+  assert.equal(projected.acceptance, "- [ ] contract acceptance");
   assert.equal(projected.pending_status, "pending_blocked");
   assert.equal(projected.blocked_reason, "等待用户决定");
   assert.equal(projected.done_at, "");

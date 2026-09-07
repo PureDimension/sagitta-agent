@@ -20,6 +20,7 @@ function task(id, overrides = {}) {
     kind: "normal",
     project: "sagitta-agent",
     title: id,
+    acceptance: "- [ ] task v2 acceptance",
     status: "in_progress",
     priority: 0,
     checkbox: 0,
@@ -128,7 +129,7 @@ const server = createServer(async (req, res) => {
     assert.equal(body.kind, "temp");
     assert.equal(Object.hasOwn(body, "project"), false);
     return json(res, 201, { ok: true, data: task("tsk-temp-new", {
-      kind: "temp", project: "", title: body.title, status: "open",
+      kind: "temp", project: "", title: body.title, status: "open", acceptance: "",
     }) });
   }
   if (req.method === "GET" && url.pathname === "/task") {
@@ -209,12 +210,14 @@ try {
   const createdTemp = await client.createTask({ kind: "temp", title: "临时两调用任务" });
   assert.equal(createdTemp.kind, "temp");
   assert.equal(createdTemp.project, "");
+  assert.equal(createdTemp.acceptance, "");
   const normalTasks = await client.listTasks({ kind: "normal", agentId: agent.id });
   const ownedTempTasks = await client.listTasks({ kind: "temp", owner: "me", agentId: agent.id });
   const defaultTasks = await client.listTasks({ includeTemp: 1, agentId: agent.id });
   assert.deepEqual(normalTasks.items.map((item) => item.kind), ["normal"]);
   assert.deepEqual(ownedTempTasks.items.map((item) => item.kind), ["temp"]);
   assert.deepEqual(defaultTasks.items.map((item) => item.kind), ["normal", "temp"]);
+  assert.equal(defaultTasks.items[0].acceptance, "- [ ] task v2 acceptance");
   assert.equal(requests.some((request) => request.path === "/task" && request.query.include_temp === "1" && request.agentId === agent.id), true);
   assert.equal(requests.some((request) => request.path === "/task" && request.query.kind === "temp" && request.query.owner === "me" && request.agentId === agent.id), true);
 
