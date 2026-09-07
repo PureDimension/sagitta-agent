@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 const MIN_TIMEOUT_MS = 1000;
 const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_RECENT_LIMIT = 20;
+const DEFAULT_RECENT_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_RECENT_LIMIT = 1000;
+const MAX_RECENT_TTL_MS = 31 * 24 * 60 * 60 * 1000;
 
 const WORK_STATUSES = Object.freeze([
   "running",
@@ -50,6 +54,38 @@ function normalizeDefaultTimeout(value) {
   return validateTimeout(value, "defaultTimeoutMs");
 }
 
+function validateRecentLimit(value, field = "recentLimit") {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_RECENT_LIMIT) {
+    throw new AsyncWorkError(
+      422,
+      "INVALID_ASYNC_WORK_RECENT_LIMIT",
+      `${field} 必须是 0 至 ${MAX_RECENT_LIMIT} 的整数`
+    );
+  }
+  return value;
+}
+
+function normalizeRecentLimit(value) {
+  if (value === undefined) return DEFAULT_RECENT_LIMIT;
+  return validateRecentLimit(value);
+}
+
+function validateRecentTtlMs(value, field = "recentTtlMs") {
+  if (!Number.isInteger(value) || value <= 0 || value > MAX_RECENT_TTL_MS) {
+    throw new AsyncWorkError(
+      422,
+      "INVALID_ASYNC_WORK_RECENT_TTL",
+      `${field} 必须是 1 至 ${MAX_RECENT_TTL_MS} 毫秒的整数`
+    );
+  }
+  return value;
+}
+
+function normalizeRecentTtlMs(value) {
+  if (value === undefined) return DEFAULT_RECENT_TTL_MS;
+  return validateRecentTtlMs(value);
+}
+
 function isoTime(epochMs) {
   return new Date(epochMs).toISOString();
 }
@@ -76,11 +112,23 @@ function settledPayload(work) {
  * sole owner of work identity, task binding and lifecycle state.
  */
 class AsyncWorkRegistry {
-  constructor({ defaultTimeoutMs, clock = () => Date.now(), idFactory = () => randomUUID() } = {}) {
+  constructor({
+    defaultTimeoutMs,
+    recentLimit,
+    recentTtlMs,
+    clock = () => Date.now(),
+    idFactory = () => randomUUID()
+  } = {}) {
     this.defaultTimeoutMs = normalizeDefaultTimeout(defaultTimeoutMs);
+    this.recentLimit = normalizeRecentLimit(recentLimit);
+    this.recentTtlMs = normalizeRecentTtlMs(recentTtlMs);
     this.clock = clock;
     this.idFactory = idFactory;
     this.byOwner = new Map();
+    // Terminal records are retained separately from byOwner so a bounded
+    // history survives the normal owner-map cleanup and plugin-dispose
+    // settlement. Each entry carries its timestamp privately for TTL pruning.
+    this.recentByOwner = new Map();
     this.settledListeners = new Set();
     this.closed = false;
   }
@@ -127,10 +175,36 @@ class AsyncWorkRegistry {
     return work.status === "running" && now - work._startedAtMs >= work.timeout_ms;
   }
 
+  _pruneRecent(ownerId, now = this.clock()) {
+    const records = this.recentByOwner.get(ownerId);
+    if (records === undefined) return [];
+    if (this.recentLimit === 0) {
+      this.recentByOwner.delete(ownerId);
+      return [];
+    }
+    const retained = records
+      .filter((record) => now < record.endedAtMs + this.recentTtlMs)
+      .slice(0, this.recentLimit);
+    if (retained.length === 0) this.recentByOwner.delete(ownerId);
+    else this.recentByOwner.set(ownerId, retained);
+    return retained;
+  }
+
+  _rememberRecent(work, endedAtMs = this.clock()) {
+    if (this.recentLimit === 0) return;
+    const ownerId = work.owner_id;
+    const records = this.recentByOwner.get(ownerId) ?? [];
+    const record = { work: cloneWork(work), endedAtMs };
+    records.unshift(record);
+    this.recentByOwner.set(ownerId, records);
+    this._pruneRecent(ownerId, record.endedAtMs);
+  }
+
   _end(work, status, reason, endedAt = this.clock()) {
     work.status = status;
     work.ended_at = isoTime(endedAt);
     work.reason = reason ?? null;
+    this._rememberRecent(work, endedAt);
     const payload = settledPayload(work);
     for (const listener of [...this.settledListeners]) {
       try {
@@ -229,6 +303,14 @@ class AsyncWorkRegistry {
     return work === null ? null : cloneWork(work);
   }
 
+  /** Return newest terminal records for one owner, bounded by count and TTL. */
+  listRecent(ownerId, { limit } = {}) {
+    const normalizedOwner = requiredString(ownerId, "ownerId");
+    const normalizedLimit = limit === undefined ? this.recentLimit : validateRecentLimit(limit, "limit");
+    const records = this._pruneRecent(normalizedOwner);
+    return records.slice(0, normalizedLimit).map((record) => cloneWork(record.work));
+  }
+
   _transition(ownerId, workId, status, reason, taskId) {
     this._ensureOpen();
     this.reap(ownerId);
@@ -289,9 +371,17 @@ export {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
+  DEFAULT_RECENT_LIMIT,
+  DEFAULT_RECENT_TTL_MS,
+  MAX_RECENT_LIMIT,
+  MAX_RECENT_TTL_MS,
   TERMINAL_STATUSES,
   WORK_STATUSES,
   cloneWork,
   normalizeDefaultTimeout,
+  normalizeRecentLimit,
+  normalizeRecentTtlMs,
+  validateRecentLimit,
+  validateRecentTtlMs,
   validateTimeout,
 };

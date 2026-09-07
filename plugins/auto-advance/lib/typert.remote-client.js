@@ -52,6 +52,35 @@ const tasksSchema = z.object({
   pendingRequests: z.array(pendingRequestSchema).readonly().optional(),
   error: z.string().readonly().optional()
 });
+const asyncWorkRunningSchema = z.object({
+  work_id: z.string().readonly(),
+  task_id: z.string().readonly(),
+  kind: z.string().readonly(),
+  desc: z.string().readonly(),
+  started_at: z.string().readonly(),
+  timeout_ms: z.number().int().readonly(),
+  status: z.literal("running").readonly()
+}).readonly();
+const asyncWorkRecentSchema = z.object({
+  work_id: z.string().readonly(),
+  task_id: z.string().readonly(),
+  kind: z.string().readonly(),
+  desc: z.string().readonly(),
+  started_at: z.string().readonly(),
+  ended_at: z.string().readonly(),
+  timeout_ms: z.number().int().readonly(),
+  status: z.union([
+    z.literal("completed"),
+    z.literal("failed"),
+    z.literal("cancelled"),
+    z.literal("expired")
+  ]).readonly(),
+  reason: z.union([z.string(), z.null()]).readonly()
+}).readonly();
+const asyncWorksSchema = z.object({
+  running: z.array(asyncWorkRunningSchema).readonly(),
+  recent: z.array(asyncWorkRecentSchema).readonly()
+}).readonly();
 
 export const TYPERT_REMOTE = {
   package: "@sagitta/auto-advance",
@@ -85,6 +114,15 @@ export const TYPERT_REMOTE = {
       invocation: { kind: "direct" },
       parameters: [{ name: "agent", wire: "agentId", source: "lookup", lookup: "agent", codec: { mode: "strict", typeSymbol: "@deepseek-ai/dsh-session/types#SessionId", schema: sessionIdSchema } }],
       result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema }
+    },
+    {
+      id: "@sagitta/auto-advance#sagittaAutoAdvance/getAsyncWorks",
+      service: "sagittaAutoAdvance",
+      namespace: "sagittaAutoAdvance",
+      method: "getAsyncWorks",
+      invocation: { kind: "direct" },
+      parameters: [{ name: "agent", wire: "agentId", source: "lookup", lookup: "agent", codec: { mode: "strict", typeSymbol: "@deepseek-ai/dsh-session/types#SessionId", schema: sessionIdSchema } }],
+      result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#AsyncWorkSnapshot", schema: asyncWorksSchema }
     },
     {
       id: "@sagitta/auto-advance#sagittaAutoAdvance/resolveNeedHuman",

@@ -12,6 +12,8 @@ import {
   AsyncWorkError,
   AsyncWorkRegistry,
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_RECENT_LIMIT,
+  DEFAULT_RECENT_TTL_MS,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
   WORK_STATUSES,
@@ -25,6 +27,10 @@ const inject = ["tools"];
 const Config = z.object({
   defaultTimeoutMs: z.number().default(DEFAULT_TIMEOUT_MS)
     .description(`默认工作超时（${MIN_TIMEOUT_MS}–${MAX_TIMEOUT_MS} 毫秒）；每次 register 仍由服务端校验。`),
+  recentLimit: z.number().default(DEFAULT_RECENT_LIMIT)
+    .description("每个 owner 保留的最近终态工作数量；0 表示关闭历史环。"),
+  recentTtlMs: z.number().default(DEFAULT_RECENT_TTL_MS)
+    .description("最近终态工作保留时间（毫秒），同时受 recentLimit 限制。"),
 });
 
 const nullableString = () => ({ oneOf: [{ type: "string" }, { type: "null" }] });
@@ -172,6 +178,8 @@ class AsyncWorkService extends Service {
     const configuredTimeout = config.defaultTimeoutMs ?? config.workTimeoutMs;
     this.registry = new AsyncWorkRegistry({
       defaultTimeoutMs: configuredTimeout === undefined ? DEFAULT_TIMEOUT_MS : normalizeDefaultTimeout(configuredTimeout),
+      recentLimit: config.recentLimit,
+      recentTtlMs: config.recentTtlMs,
     });
     this.disposeSettled = this.registry.onSettled((payload) => {
       try {
@@ -210,6 +218,11 @@ class AsyncWorkService extends Service {
   get(ownerId, workId) {
     this._ensureAvailable();
     return this.registry.get(ownerId, workId);
+  }
+
+  listRecent(ownerId, options = {}) {
+    this._ensureAvailable();
+    return this.registry.listRecent(ownerId, options);
   }
 
   complete(ownerId, workId, taskId) {
@@ -264,6 +277,8 @@ export {
   ASYNC_WORK_SETTLED_EVENT,
   Config,
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_RECENT_LIMIT,
+  DEFAULT_RECENT_TTL_MS,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
   WORK_FIELDS,

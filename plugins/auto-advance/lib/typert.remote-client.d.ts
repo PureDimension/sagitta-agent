@@ -21,5 +21,27 @@ export interface NeedHumanResolution {
   readonly type: "need" | "notify";
   readonly status: string;
 }
+export interface AsyncWorkSnapshot {
+  readonly running: readonly {
+    readonly work_id: string;
+    readonly task_id: string;
+    readonly kind: string;
+    readonly desc: string;
+    readonly started_at: string;
+    readonly timeout_ms: number;
+    readonly status: "running";
+  }[];
+  readonly recent: readonly {
+    readonly work_id: string;
+    readonly task_id: string;
+    readonly kind: string;
+    readonly desc: string;
+    readonly started_at: string;
+    readonly ended_at: string;
+    readonly timeout_ms: number;
+    readonly status: "completed" | "failed" | "cancelled" | "expired";
+    readonly reason: string | null;
+  }[];
+}
 export declare const TYPERT_REMOTE: unknown;
 export default TYPERT_REMOTE;

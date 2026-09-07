@@ -5,7 +5,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-    const inject = ["remote", "sessions"];
+    const inject = ["remote", "sessions", "slots"];
     const REMOTE = {
       package: "@sagitta/auto-advance",
       descriptors: [
@@ -38,6 +38,15 @@ window.__ModuleLoader__.load({
           invocation: { kind: "direct" },
           parameters: [{ name: "agent", wire: "agentId", source: "lookup", lookup: "agent", codec: { mode: "strict", typeSymbol: "@deepseek-ai/dsh-session/types#SessionId", schema: stringSchema() } }],
           result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema() }
+        },
+        {
+          id: "@sagitta/auto-advance#sagittaAutoAdvance/getAsyncWorks",
+          service: "sagittaAutoAdvance",
+          namespace: "sagittaAutoAdvance",
+          method: "getAsyncWorks",
+          invocation: { kind: "direct" },
+          parameters: [{ name: "agent", wire: "agentId", source: "lookup", lookup: "agent", codec: { mode: "strict", typeSymbol: "@deepseek-ai/dsh-session/types#SessionId", schema: stringSchema() } }],
+          result: { mode: "strict", typeSymbol: "@sagitta/auto-advance/client#AsyncWorkSnapshot", schema: asyncWorksSchema() }
         },
         {
           id: "@sagitta/auto-advance#sagittaAutoAdvance/resolveNeedHuman",
@@ -102,6 +111,18 @@ window.__ModuleLoader__.load({
     function needHumanResolutionSchema() {
       return strictSchema((value) => {
         if (value === null || typeof value !== "object" || typeof value.needHumanId !== "string" || typeof value.taskId !== "string" || (value.type !== "need" && value.type !== "notify") || typeof value.status !== "string") throw new Error("invalid need-human resolution");
+        return value;
+      });
+    }
+    function asyncWorksSchema() {
+      return strictSchema((value) => {
+        if (value === null || typeof value !== "object" || !Array.isArray(value.running) || !Array.isArray(value.recent)) throw new Error("invalid async-work snapshot");
+        for (const work of value.running) {
+          if (work === null || typeof work !== "object" || typeof work.work_id !== "string" || typeof work.task_id !== "string" || typeof work.kind !== "string" || typeof work.desc !== "string" || typeof work.started_at !== "string" || !Number.isInteger(work.timeout_ms) || work.status !== "running") throw new Error("invalid running async-work");
+        }
+        for (const work of value.recent) {
+          if (work === null || typeof work !== "object" || typeof work.work_id !== "string" || typeof work.task_id !== "string" || typeof work.kind !== "string" || typeof work.desc !== "string" || typeof work.started_at !== "string" || typeof work.ended_at !== "string" || !Number.isInteger(work.timeout_ms) || !["completed", "failed", "cancelled", "expired"].includes(work.status) || (work.reason !== null && typeof work.reason !== "string")) throw new Error("invalid recent async-work");
+        }
         return value;
       });
     }
@@ -217,6 +238,37 @@ window.__ModuleLoader__.load({
       @keyframes saa-panel-in { from { opacity: 0; } to { opacity: 1; } }
       @keyframes saa-spin { to { transform: rotate(360deg); } }
       @media (prefers-reduced-motion: reduce) { .saa-panel, .saa-ball, .saa-project, .saa-toggle, .saa-close { animation: none; transition: none; } .saa-task-icon[data-status="in_progress"] { animation: none; } }
+    `;
+    const ASYNC_WORK_HEADER_STYLE = `
+      [data-sagitta-async-work-header] { position: relative; color: var(--dsw-alias-label-primary, #edf4ff); font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; }
+      .saw-trigger { min-height: 28px; color: var(--dsw-alias-label-tertiary, #9aaabd); background: transparent; border: 0; border-radius: 6px; padding: 3px 5px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font: inherit; font-size: 12px; line-height: 18px; white-space: nowrap; }
+      .saw-trigger:hover, .saw-trigger:focus-visible { color: var(--dsw-alias-label-secondary, #d5e0ef); background: var(--dsw-alias-fill-l1, rgba(255,255,255,.06)); }
+      .saw-trigger[data-running="true"] { color: var(--dsw-alias-label-secondary, #d5e0ef); }
+      .saw-trigger-icon { color: #77a7ff; font-size: 14px; line-height: 1; }
+      .saw-trigger[data-running="true"] .saw-trigger-icon { animation: saw-spin 1.4s linear infinite; }
+      .saw-trigger-count { color: inherit; font-variant-numeric: tabular-nums; }
+      .saw-popover { z-index: 100; box-sizing: border-box; position: absolute; top: calc(100% + 5px); left: 0; width: 370px; max-width: min(420px, calc(100vw - 32px)); max-height: min(480px, calc(100vh - 140px)); overflow: auto; padding: 5px; border: 1px solid var(--dsw-alias-border-l2, rgba(148,171,201,.25)); border-radius: 12px; background: var(--dsw-specific-menu, #182230); box-shadow: var(--dsw-shadow-lv3, 0 18px 48px rgba(0,0,0,.35)); }
+      .saw-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 5px 7px 4px; color: var(--dsw-alias-label-secondary, #d5e0ef); font-size: 11px; font-weight: 700; }
+      .saw-heading + .saw-heading { margin-top: 10px; }
+      .saw-heading-count { color: var(--dsw-alias-label-tertiary, #899bb2); font-weight: 500; }
+      .saw-row { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: start; gap: 6px; padding: 7px; border-radius: 8px; color: var(--dsw-alias-label-primary, #edf4ff); font-size: 12px; line-height: 17px; }
+      .saw-row:hover { background: var(--dsw-alias-fill-l1, rgba(255,255,255,.05)); }
+      .saw-row[data-terminal="true"] { color: var(--dsw-alias-label-tertiary, #9aaabd); }
+      .saw-status { width: 14px; color: #77a7ff; text-align: center; }
+      .saw-row[data-status="completed"] .saw-status { color: #62d49a; }
+      .saw-row[data-status="failed"] .saw-status { color: #ff8585; }
+      .saw-row[data-status="cancelled"] .saw-status { color: #e7b45e; }
+      .saw-row[data-status="expired"] .saw-status { color: #c19aff; }
+      .saw-kind { max-width: 90px; overflow: hidden; padding: 0 5px; border-radius: 4px; background: var(--dsw-alias-fill-l2, rgba(255,255,255,.09)); color: var(--dsw-alias-label-secondary, #c3d0df); font-size: 10px; line-height: 17px; text-overflow: ellipsis; white-space: nowrap; }
+      .saw-main { min-width: 0; }
+      .saw-desc { overflow: hidden; color: inherit; text-overflow: ellipsis; white-space: nowrap; }
+      .saw-task { margin-top: 1px; overflow: hidden; color: var(--dsw-alias-label-tertiary, #899bb2); font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+      .saw-reason { margin-top: 1px; overflow: hidden; color: #d9b976; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+      .saw-duration { color: var(--dsw-alias-label-tertiary, #899bb2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .saw-empty { padding: 8px 7px; color: var(--dsw-alias-label-tertiary, #899bb2); font-size: 11px; }
+      .saw-trigger:focus-visible { outline: 2px solid var(--dsw-alias-focus, #86adff); outline-offset: 2px; }
+      @keyframes saw-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .saw-trigger[data-running="true"] .saw-trigger-icon { animation: none; } }
     `;
 
     function statusFromValue(value, done, allowLegacyGuess = false) {
@@ -402,6 +454,189 @@ window.__ModuleLoader__.load({
     function safeText(value) {
       return typeof value === "string" ? value : "";
     }
+    function asyncWorkSnapshot(value) {
+      const snapshot = value?.value ?? value;
+      if (snapshot === null || typeof snapshot !== "object") return { running: [], recent: [] };
+      return {
+        running: Array.isArray(snapshot.running) ? snapshot.running : [],
+        recent: Array.isArray(snapshot.recent) ? snapshot.recent : []
+      };
+    }
+
+    function asyncWorkDuration(work, now, terminal) {
+      const started = Date.parse(safeText(work?.started_at));
+      const ended = terminal ? Date.parse(safeText(work?.ended_at)) : now;
+      if (!Number.isFinite(started) || !Number.isFinite(ended)) return "0秒";
+      const seconds = Math.max(0, Math.floor((ended - started) / 1000));
+      const minutes = Math.floor(seconds / 60);
+      const hours = Math.floor(minutes / 60);
+      if (hours > 0) return `${hours}小时${minutes % 60}分`;
+      if (minutes > 0) return `${minutes}分${seconds % 60}秒`;
+      return `${seconds}秒`;
+    }
+
+    function asyncWorkStatus(status) {
+      const labels = {
+        running: "运行中",
+        completed: "已完成",
+        failed: "失败",
+        cancelled: "已取消",
+        expired: "已过期"
+      };
+      return (labels[status] ?? safeText(status)) || "未知";
+    }
+
+    function shortWorkId(value) {
+      const text = safeText(value).trim();
+      return text.length > 10 ? `…${text.slice(-10)}` : text || "未知";
+    }
+
+    function createAsyncWorkHeaderAction(remoteApi) {
+      const React = require("react");
+      const h = React.createElement;
+      const terminalStatuses = new Set(["completed", "failed", "cancelled", "expired"]);
+
+      function AsyncWorkHeaderAction({ sessionId }) {
+        const [snapshot, setSnapshot] = React.useState(null);
+        const [open, setOpen] = React.useState(false);
+        const [now, setNow] = React.useState(() => Date.now());
+        const rootRef = React.useRef(null);
+        const triggerRef = React.useRef(null);
+
+        React.useEffect(() => {
+          let stopped = false;
+          const refresh = async () => {
+            if (typeof remoteApi?.getAsyncWorks !== "function" || !safeText(sessionId).trim()) {
+              if (!stopped) setSnapshot({ running: [], recent: [] });
+              return;
+            }
+            try {
+              const result = await remoteApi.getAsyncWorks(sessionId);
+              if (result?.ok === false) throw new Error(result.error?.message ?? "异步工作读取失败");
+              if (!stopped) setSnapshot(asyncWorkSnapshot(result));
+            } catch (error) {
+              if (!stopped) setSnapshot((current) => current ?? { running: [], recent: [] });
+              console.warn("sagitta-auto-advance: async-work header refresh failed", error);
+            }
+          };
+          void refresh();
+          const poll = window.setInterval(refresh, 2000);
+          return () => {
+            stopped = true;
+            window.clearInterval(poll);
+          };
+        }, [sessionId]);
+
+        const running = snapshot?.running ?? [];
+        const recent = snapshot?.recent ?? [];
+        const total = running.length + recent.length;
+        React.useEffect(() => {
+          if (total === 0 && open) setOpen(false);
+        }, [total, open]);
+        React.useEffect(() => {
+          if (!open || running.length === 0) return undefined;
+          setNow(Date.now());
+          const timer = window.setInterval(() => setNow(Date.now()), 1000);
+          return () => window.clearInterval(timer);
+        }, [open, running.length]);
+        React.useEffect(() => {
+          if (!open) return undefined;
+          const onPointerDown = (event) => {
+            if (!rootRef.current?.contains(event.target)) setOpen(false);
+          };
+          const onKeyDown = (event) => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            setOpen(false);
+            triggerRef.current?.focus();
+          };
+          document.addEventListener("pointerdown", onPointerDown);
+          document.addEventListener("keydown", onKeyDown);
+          return () => {
+            document.removeEventListener("pointerdown", onPointerDown);
+            document.removeEventListener("keydown", onKeyDown);
+          };
+        }, [open]);
+
+        if (total === 0) return null;
+
+        const workRow = (work, terminal) => {
+          const status = safeText(work?.status);
+          const duration = asyncWorkDuration(work, now, terminal);
+          const reason = safeText(work?.reason).trim();
+          return h("div", {
+            className: "saw-row",
+            "data-status": status,
+            "data-terminal": String(terminal),
+            key: `${terminal ? "recent" : "running"}-${safeText(work?.work_id)}`,
+            title: reason || safeText(work?.desc)
+          },
+          h("span", { className: "saw-status", "aria-hidden": "true" }, terminal ? (status === "completed" ? "✓" : status === "failed" ? "!" : status === "expired" ? "⌛" : "×") : "⟳"),
+          h("span", { className: "saw-kind", title: safeText(work?.kind) }, safeText(work?.kind) || "async"),
+          h("span", { className: "saw-main" },
+            h("span", { className: "saw-desc" }, safeText(work?.desc) || "未命名工作"),
+            h("span", { className: "saw-task" }, `task ${shortWorkId(work?.task_id)} · ${asyncWorkStatus(status)}`),
+            terminal && reason.length > 0 ? h("span", { className: "saw-reason" }, reason) : null
+          ),
+          h("span", { className: "saw-duration", title: terminal ? "工作耗时" : "已运行" }, duration));
+        };
+
+        const heading = (label, count) => h("div", { className: "saw-heading" },
+          h("span", {}, label), h("span", { className: "saw-heading-count" }, `${count} 项`));
+        const rows = [];
+        if (running.length > 0) {
+          rows.push(heading("运行中", running.length));
+          rows.push(...running.map((work) => workRow(work, false)));
+        }
+        if (recent.length > 0) {
+          rows.push(heading("最近结束", recent.length));
+          rows.push(...recent.filter((work) => terminalStatuses.has(work?.status)).map((work) => workRow(work, true)));
+        }
+        return h("div", {
+          ref: rootRef,
+          "data-sagitta-async-work-header": "root",
+          onMouseEnter: () => setOpen(true),
+          onMouseLeave: () => setOpen(false)
+        },
+        h("button", {
+          ref: triggerRef,
+          type: "button",
+          className: "saw-trigger",
+          "data-running": String(running.length > 0),
+          "aria-expanded": String(open),
+          "aria-haspopup": "dialog",
+          "aria-label": `异步工作：${running.length > 0 ? `${running.length} 项运行中，` : ""}${total} 项`,
+          onClick: () => {
+            setNow(Date.now());
+            setOpen((current) => !current);
+          }
+        }, h("span", { className: "saw-trigger-icon", "aria-hidden": "true" }, "⟳"), h("span", { className: "saw-trigger-count" }, `${total} 异步工作`)),
+        open ? h("div", { className: "saw-popover", role: "dialog", "aria-label": "异步工作列表" }, rows) : null);
+      }
+
+      return AsyncWorkHeaderAction;
+    }
+
+    function mountHeaderAction(ctx, remoteApi) {
+      if (typeof ctx?.slots?.inject !== "function" || typeof ctx?.slots?.register !== "function") return () => {};
+      let style;
+      if (typeof document !== "undefined" && document.head && document.querySelector("style[data-sagitta-async-work-header-style]") === null) {
+        style = createElement("style", { "data-sagitta-async-work-header-style": "true" });
+        style.textContent = ASYNC_WORK_HEADER_STYLE;
+        document.head.append(style);
+      }
+      const component = createAsyncWorkHeaderAction(remoteApi);
+      const disposeInjection = ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
+        name: "conversation.session.header.actions",
+        id: "sagitta-async-work",
+        order: 30
+      }, component));
+      return () => {
+        disposeInjection?.();
+        style?.remove();
+      };
+    }
+
     function createElement(tag, attrs = {}, text) {
       const element = document.createElement(tag);
       for (const [key, value] of Object.entries(attrs)) {
@@ -849,10 +1084,12 @@ window.__ModuleLoader__.load({
       const remoteApi = ctx.get("remote.sagittaAutoAdvance");
       if (remoteApi === undefined) throw new Error("sagitta-auto-advance: RPC namespace failed to mount");
       const disposeUi = mount(ctx, remoteApi);
+      const disposeHeader = mountHeaderAction(ctx, remoteApi);
       ctx.effect(() => async () => {
         disposeUi();
+        disposeHeader();
         await disposeRemote();
-      }, "sagitta-auto-advance: floating window");
+      }, "sagitta-auto-advance: floating window and async-work header");
     }
 
     exports.apply = apply;

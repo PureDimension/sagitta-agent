@@ -51,6 +51,8 @@ assert.deepEqual(registry.listActive("agent-1").map((work) => work.work_id), [wo
 const completed = registry.complete("agent-1", workA.work_id, "task-A");
 assert.equal(completed.status, "completed");
 assert.equal(completed.ended_at, "2026-08-30T00:00:00.000Z");
+assert.deepEqual(registry.listRecent("agent-1").map((work) => work.work_id), [workA.work_id]);
+assert.deepEqual(registry.listRecent("agent-2"), [], "recent ring must be isolated by owner");
 assert.deepEqual(settled.at(-1), {
   ownerId: "agent-1",
   workId: workA.work_id,
@@ -115,11 +117,47 @@ assert.deepEqual(settled.at(-1), {
 });
 disposeSettled();
 assert.deepEqual(registry.byOwner.size, 0, "dispose 清空进程范围注册表");
+assert.equal(registry.listRecent("agent-1")[0].work_id, workB.work_id, "dispose settlement must remain in recent ring");
 assert.equal(registry.reap("agent-1"), 0);
 assert.throws(
   () => registry.register({ ownerId: "agent-1", taskId: "after-dispose", kind: "test", desc: "不可登记", timeoutMs: MIN_TIMEOUT_MS }),
   (error) => error instanceof AsyncWorkError && error.status === 410
 );
+
+// Recent history is newest-first, bounded by count, and expires by TTL.
+now = Date.parse("2026-08-30T00:00:00.000Z");
+let ringSequence = 0;
+const ring = new AsyncWorkRegistry({
+  clock: () => now,
+  recentLimit: 2,
+  recentTtlMs: 2000,
+  idFactory: () => `ring-${++ringSequence}`,
+});
+const ringA = ring.register({ ownerId: "ring-owner", taskId: "ring-a", kind: "install", desc: "a", timeoutMs: MAX_TIMEOUT_MS });
+ring.complete("ring-owner", ringA.work_id, "ring-a");
+now += 500;
+const ringB = ring.register({ ownerId: "ring-owner", taskId: "ring-b", kind: "model", desc: "b", timeoutMs: MAX_TIMEOUT_MS });
+ring.fail("ring-owner", ringB.work_id, "model failed", "ring-b");
+now += 500;
+const ringC = ring.register({ ownerId: "ring-owner", taskId: "ring-c", kind: "codex", desc: "c", timeoutMs: MAX_TIMEOUT_MS });
+ring.cancel("ring-owner", ringC.work_id, "ring-c");
+assert.deepEqual(ring.listRecent("ring-owner").map((work) => work.work_id), [ringC.work_id, ringB.work_id]);
+assert.deepEqual(ring.listRecent("other-owner"), []);
+assert.deepEqual(ring.listRecent("ring-owner")[0], {
+  work_id: ringC.work_id,
+  task_id: "ring-c",
+  owner_id: "ring-owner",
+  kind: "codex",
+  desc: "c",
+  started_at: "2026-08-30T00:00:01.000Z",
+  timeout_ms: MAX_TIMEOUT_MS,
+  status: "cancelled",
+  ended_at: "2026-08-30T00:00:01.000Z",
+  reason: null,
+});
+now += 2000;
+assert.deepEqual(ring.listRecent("ring-owner"), [], "recent records must expire by TTL");
+ring.dispose();
 
 let serviceModule;
 try {
@@ -142,6 +180,7 @@ if (serviceModule) {
     status: "completed",
     reason: null,
   }]);
+  assert.equal(service.listRecent("agent-service")[0].work_id, work.work_id, "service exposes the registry recent ring");
   disposeEvent();
   service.dispose();
   console.log("async-work service smoke: PASS (settlement event bridge)");

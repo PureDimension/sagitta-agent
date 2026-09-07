@@ -183,7 +183,7 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const workerUrl = `http://127.0.0.1:${server.address().port}`;
 
-function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
+function makeHarness({ api = true, runningWork = false, recentWorks = [], enabled = true } = {}) {
   const agent = {
     id: "agent-smoke",
     status: "idle",
@@ -201,7 +201,18 @@ function makeHarness({ api = true, runningWork = false, enabled = true } = {}) {
     },
   };
   const events = [];
-  const asyncWork = { listActive: () => runningWork ? [{ status: "running", task_id: "tsk-work" }] : [] };
+  const asyncWork = {
+    listActive: (ownerId) => ownerId === agent.id && runningWork ? [{
+      work_id: "work-running",
+      task_id: "tsk-work",
+      kind: "codex",
+      desc: "派单工作",
+      started_at: "2026-09-07T00:00:00.000Z",
+      timeout_ms: 60000,
+      status: "running"
+    }] : [],
+    listRecent: (ownerId) => ownerId === agent.id ? recentWorks : []
+  };
   const ctx = {
     fiber: { state: 2 },
     agents: {
@@ -317,6 +328,48 @@ assert.equal(inFlightSettleHarness.agent.directDrives.length, 0, "in-flight sett
 inFlightSettleHarness.state.disposed = true;
 inFlightSettleHarness.state.requestController = undefined;
 assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", workId: "work-disposed", status: "completed" }), false);
+
+// Header remote snapshot is owner-scoped and keeps running/recent terminal
+// records in separate, browser-safe shapes.
+const asyncSnapshotHarness = makeHarness({
+  runningWork: true,
+  recentWorks: [{
+    work_id: "work-recent",
+    task_id: "task-recent",
+    owner_id: "agent-smoke",
+    kind: "external",
+    desc: "外部系统同步",
+    started_at: "2026-09-06T23:59:00.000Z",
+    timeout_ms: 60000,
+    status: "failed",
+    ended_at: "2026-09-07T00:00:02.000Z",
+    reason: "连接失败",
+    child_metadata: { secret: "must-not-leak" }
+  }]
+});
+assert.deepEqual(asyncSnapshotHarness.service.getAsyncWorks(asyncSnapshotHarness.agent), {
+  running: [{
+    work_id: "work-running",
+    task_id: "tsk-work",
+    kind: "codex",
+    desc: "派单工作",
+    started_at: "2026-09-07T00:00:00.000Z",
+    timeout_ms: 60000,
+    status: "running"
+  }],
+  recent: [{
+    work_id: "work-recent",
+    task_id: "task-recent",
+    kind: "external",
+    desc: "外部系统同步",
+    started_at: "2026-09-06T23:59:00.000Z",
+    ended_at: "2026-09-07T00:00:02.000Z",
+    timeout_ms: 60000,
+    status: "failed",
+    reason: "连接失败"
+  }]
+});
+assert.deepEqual(asyncSnapshotHarness.service.getAsyncWorks({ id: "other-agent" }), { running: [], recent: [] }, "async-work remote must not leak another owner");
 
 try {
   // 有已认领 in_progress 才注入自主推进；提示只带轻量任务清单，取消 round-close 强制。
@@ -436,17 +489,33 @@ try {
     window: {
       __ModuleLoader__: {
         load(bundle) {
-          clientPlugin = bundle.factory(() => { throw new Error("unexpected client bundle require"); });
+          clientPlugin = bundle.factory((id) => {
+            if (id === "react") return { createElement: (...args) => args };
+            throw new Error(`unexpected client bundle require: ${id}`);
+          });
         }
       }
     }
   });
   const mountedRemotes = [];
+  const headerRegistrations = [];
   await clientPlugin.apply({
     remote: { $mount: async (remote) => { mountedRemotes.push(remote); return async () => {}; } },
     get: () => ({}),
-    effect: () => {}
+    effect: () => {},
+    slots: {
+      inject(name, callback) {
+        assert.equal(name, "conversation.session.header.actions");
+        return callback();
+      },
+      register(options, component) {
+        headerRegistrations.push({ options, component });
+        return () => {};
+      }
+    }
   });
+  assert.equal(headerRegistrations[0].options.id, "sagitta-async-work");
+  assert.equal(headerRegistrations[0].options.name, "conversation.session.header.actions");
   const getTasksDescriptor = mountedRemotes[0].descriptors.find((descriptor) => descriptor.method === "getTasks");
   const parsedClientSnapshot = getTasksDescriptor.result.schema.parse({
     path: "smoke-TASKS.md",
@@ -463,6 +532,32 @@ try {
   });
   assert.equal(parsedClientSnapshot.sections[0].items[0].acceptance, "- [ ] target one");
   assert.equal(parsedClientSnapshot.sections[0].items[0].kind, "temp");
+  const getAsyncWorksDescriptor = mountedRemotes[0].descriptors.find((descriptor) => descriptor.method === "getAsyncWorks");
+  const parsedAsyncWorks = getAsyncWorksDescriptor.result.schema.parse({
+    running: [{
+      work_id: "work-running",
+      task_id: "task-running",
+      kind: "codex",
+      desc: "派单",
+      started_at: "2026-09-07T00:00:00.000Z",
+      timeout_ms: 60000,
+      status: "running"
+    }],
+    recent: [{
+      work_id: "work-failed",
+      task_id: "task-failed",
+      kind: "external",
+      desc: "外部同步",
+      started_at: "2026-09-06T23:59:00.000Z",
+      ended_at: "2026-09-07T00:00:03.000Z",
+      timeout_ms: 60000,
+      status: "failed",
+      reason: "连接失败"
+    }]
+  });
+  assert.equal(parsedAsyncWorks.running[0].status, "running");
+  assert.equal(parsedAsyncWorks.recent[0].status, "failed");
+  assert.match(clientSource, /ctx\.slots\.inject\("conversation\.session\.header\.actions"/u);
   rmSync(directory, { recursive: true, force: true });
 
   // 模拟 DSH 的 process SIGINT/SIGTERM → fiber.dispose：当前快照中的 owned

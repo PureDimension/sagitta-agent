@@ -27,6 +27,7 @@ const DEFAULT_TASK_PAGE_SIZE = 200;
 const TASK_RECHECK_DELAY_MS = 30000;
 const PROCESS_SHUTDOWN_TASK_BUDGET_MS = 4500;
 const PROCESS_SHUTDOWN_BLOCKED_REASON = "sagitta 进程中断退出";
+const ASYNC_WORK_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "expired"]);
 const CLOUD_RETRY_DELAYS_MS = [30000, 120000, 300000];
 const CLOUD_RETRY_JITTER = 0.2;
 const LEGACY_WORKSPACE_CANDIDATES = [
@@ -38,7 +39,7 @@ const LEGACY_WORKSPACE_CANDIDATES = [
 ];
 
 const REMOTE_INITIALIZERS = [];
-for (const method of ["getState", "setMode", "getTasks", "resolveNeedHuman"]) {
+for (const method of ["getState", "setMode", "getTasks", "getAsyncWorks", "resolveNeedHuman"]) {
   Remote(method)(undefined, {
     kind: "method",
     name: method,
@@ -78,6 +79,38 @@ function nonEmptyString(value) {
   if (typeof value !== "string") return undefined;
   const result = value.trim();
   return result.length > 0 ? result : undefined;
+}
+
+function asyncWorkView(work, terminal = false) {
+  if (work === null || typeof work !== "object") return null;
+  const workId = nonEmptyString(work.work_id ?? work.workId);
+  const taskId = nonEmptyString(work.task_id ?? work.taskId);
+  const kind = nonEmptyString(work.kind);
+  const desc = typeof work.desc === "string" ? work.desc : undefined;
+  const startedAt = nonEmptyString(work.started_at ?? work.startedAt);
+  const timeoutMs = Number.isInteger(work.timeout_ms ?? work.timeoutMs) ? (work.timeout_ms ?? work.timeoutMs) : undefined;
+  const status = nonEmptyString(work.status);
+  if (workId === undefined || taskId === undefined || kind === undefined || desc === undefined ||
+    startedAt === undefined || timeoutMs === undefined || status === undefined) return null;
+  if (!terminal && status !== "running") return null;
+  if (terminal && !ASYNC_WORK_TERMINAL_STATUSES.has(status)) return null;
+  const base = {
+    work_id: workId,
+    task_id: taskId,
+    kind,
+    desc,
+    started_at: startedAt,
+    timeout_ms: timeoutMs,
+    status
+  };
+  if (!terminal) return base;
+  const endedAt = nonEmptyString(work.ended_at ?? work.endedAt);
+  if (endedAt === undefined) return null;
+  return {
+    ...base,
+    ended_at: endedAt,
+    reason: typeof work.reason === "string" && work.reason.trim().length > 0 ? work.reason.trim() : null
+  };
 }
 
 function settledWorkInfo(settled) {
@@ -560,6 +593,35 @@ class AutoAdvanceService extends TypertRemoteService {
         error: `任务 API 暂时不可用（${renderError(error)}）；当前为 file-stale 文件快照${stale.error ? `；${stale.error}` : ""}`
       };
     });
+  }
+
+  /**
+   * Read the browser-safe async-work snapshot for exactly one agent owner.
+   * listActive() also reaps timeout-bound work, so an expired item enters the
+   * registry's recent ring before this snapshot is assembled.
+   */
+  getAsyncWorks(agent) {
+    const ownerId = nonEmptyString(agent?.id);
+    const empty = { running: [], recent: [] };
+    if (ownerId === undefined) return empty;
+    const asyncWork = this.getAsyncWorkService();
+    if (asyncWork === undefined || typeof asyncWork.listActive !== "function") return empty;
+    try {
+      const running = asyncWork.listActive(ownerId)
+        .map((work) => asyncWorkView(work, false))
+        .filter((work) => work !== null)
+        .sort((first, second) => Date.parse(first.started_at) - Date.parse(second.started_at));
+      const recent = typeof asyncWork.listRecent === "function"
+        ? asyncWork.listRecent(ownerId)
+          .map((work) => asyncWorkView(work, true))
+          .filter((work) => work !== null)
+          .sort((first, second) => Date.parse(second.ended_at) - Date.parse(first.ended_at))
+        : [];
+      return { running, recent };
+    } catch (error) {
+      safeLog(() => this.logger(), "warn", `sagitta-auto-advance: async-work snapshot unavailable: ${renderError(error)}`);
+      return empty;
+    }
   }
 
   primaryTaskAgentId() {

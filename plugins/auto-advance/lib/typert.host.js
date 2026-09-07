@@ -52,6 +52,35 @@ const tasksSchema = z.object({
   pendingRequests: z.array(pendingRequestSchema).readonly().optional(),
   error: z.string().readonly().optional()
 });
+const asyncWorkRunningSchema = z.object({
+  work_id: z.string().readonly(),
+  task_id: z.string().readonly(),
+  kind: z.string().readonly(),
+  desc: z.string().readonly(),
+  started_at: z.string().readonly(),
+  timeout_ms: z.number().int().readonly(),
+  status: z.literal("running").readonly()
+}).readonly();
+const asyncWorkRecentSchema = z.object({
+  work_id: z.string().readonly(),
+  task_id: z.string().readonly(),
+  kind: z.string().readonly(),
+  desc: z.string().readonly(),
+  started_at: z.string().readonly(),
+  ended_at: z.string().readonly(),
+  timeout_ms: z.number().int().readonly(),
+  status: z.union([
+    z.literal("completed"),
+    z.literal("failed"),
+    z.literal("cancelled"),
+    z.literal("expired")
+  ]).readonly(),
+  reason: z.union([z.string(), z.null()]).readonly()
+}).readonly();
+const asyncWorksSchema = z.object({
+  running: z.array(asyncWorkRunningSchema).readonly(),
+  recent: z.array(asyncWorkRecentSchema).readonly()
+}).readonly();
 const remoteMethod = (id, method, parameters, result, sourceLocation) => ({
   id: `@sagitta/auto-advance#sagittaAutoAdvance/${method}`,
   service: "sagittaAutoAdvance",
@@ -90,6 +119,7 @@ export const TYPERT = {
     remoteMethod("getState", "getState", [lookupAgent], { typeSymbol: "@sagitta/auto-advance/client#AutoAdvanceState", schema: stateSchema }, { file: "lib/service.js", line: 227, column: 3 }),
     remoteMethod("setMode", "setMode", [lookupAgent, jsonBoolean], { typeSymbol: "@sagitta/auto-advance/client#AutoAdvanceState", schema: stateSchema }, { file: "lib/service.js", line: 231, column: 3 }),
     remoteMethod("getTasks", "getTasks", [lookupAgent], { typeSymbol: "@sagitta/auto-advance/client#TaskSnapshot", schema: tasksSchema }, { file: "lib/service.js", line: 248, column: 3 }),
+    remoteMethod("getAsyncWorks", "getAsyncWorks", [lookupAgent], { typeSymbol: "@sagitta/auto-advance/client#AsyncWorkSnapshot", schema: asyncWorksSchema }, { file: "lib/service.js", line: 584, column: 3 }),
     remoteMethod("resolveNeedHuman", "resolveNeedHuman", [jsonNeedHumanId], { typeSymbol: "@sagitta/auto-advance/client#NeedHumanResolution", schema: needHumanResolutionSchema }, { file: "lib/service.js", line: 449, column: 3 })
   ],
   model: {
@@ -104,11 +134,13 @@ export const TYPERT = {
         { kind: "method", name: "getState", signature: "@Remote('getState') getState(agent: Agent): AutoAdvanceState", summary: "Read one session's current autonomous-continuation state." },
         { kind: "method", name: "setMode", signature: "@Remote('setMode') setMode(agent: Agent, enabled: boolean): AutoAdvanceState", summary: "Persist and apply the session's autonomous-continuation mode." },
         { kind: "method", name: "getTasks", signature: "@Remote('getTasks') getTasks(agent: Agent): TaskSnapshot", summary: "Read the configured task list as the selected session." },
+        { kind: "method", name: "getAsyncWorks", signature: "@Remote('getAsyncWorks') getAsyncWorks(agent: Agent): AsyncWorkSnapshot", summary: "Read the selected session owner's running and recent async-work records." },
         { kind: "method", name: "resolveNeedHuman", signature: "@Remote('resolveNeedHuman') resolveNeedHuman(needHumanId: string): NeedHumanResolution", summary: "Resolve a notify need-human from the Ripple floating panel." }
       ],
       types: [
         { name: "AutoAdvanceState", declaration: "export interface AutoAdvanceState { readonly enabled: boolean; readonly mode: 'auto' | 'chat'; readonly idleSince: number | null; readonly injectedAt: number | null; readonly ready: boolean; readonly hasPendingWork: boolean; readonly stoppedByProtocol: boolean; readonly agentStatus: string; readonly degraded: boolean; readonly degradedReason: string | null; }" },
         { name: "TaskSnapshot", declaration: "export interface TaskSnapshot { readonly path: string; readonly updatedAt: number | null; readonly source?: 'cloud' | 'file' | 'file-stale'; readonly sections: readonly { readonly title: string; readonly items: readonly { readonly text: string; readonly title?: string; readonly done: boolean; readonly status?: string; readonly acceptance?: string; readonly updatedAt?: number | null; readonly blockedReason?: string | null; readonly project?: string; readonly task_id?: string; readonly kind?: string; }[]; }[]; readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string; readonly type: 'need' | 'notify'; readonly needHumanId: string; }[]; readonly error?: string; }" },
+        { name: "AsyncWorkSnapshot", declaration: "export interface AsyncWorkSnapshot { readonly running: readonly { readonly work_id: string; readonly task_id: string; readonly kind: string; readonly desc: string; readonly started_at: string; readonly timeout_ms: number; readonly status: 'running'; }[]; readonly recent: readonly { readonly work_id: string; readonly task_id: string; readonly kind: string; readonly desc: string; readonly started_at: string; readonly ended_at: string; readonly timeout_ms: number; readonly status: 'completed' | 'failed' | 'cancelled' | 'expired'; readonly reason: string | null; }[]; }" },
         { name: "NeedHumanResolution", declaration: "export interface NeedHumanResolution { readonly needHumanId: string; readonly taskId: string; readonly type: 'need' | 'notify'; readonly status: string; }" }
       ]
     }],
