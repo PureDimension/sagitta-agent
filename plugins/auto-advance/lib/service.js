@@ -1354,11 +1354,15 @@ function mapApiTask(item) {
   const title = cleanMarkdown(typeof titleValue === "string" ? titleValue : "") || "未命名需求";
   const project = typeof item?.project === "string" && item.project.trim() ? item.project.trim() : "未分类";
   const openNeedHumans = openNeedHumanCount(item);
+  const temp = isTempTask(item);
+  const rawKind = taskType(item);
   const task = {
     text: title,                       // 项目进度区（normalizeTask 用 text + done）
     title,                             // 待处理需求区用
     done: item?.status === "done",     // tasksSchema 硬性要求（boolean）
     status: typeof item?.status === "string" ? item.status : "open",
+    acceptance: typeof item?.acceptance === "string" ? item.acceptance : "",
+    kind: temp ? "temp" : rawKind || "task",
     updatedAt: taskApiUpdatedAt(item?.updated_at ?? item?.updatedAt),
     createdAt: taskApiUpdatedAt(item?.created_at ?? item?.createdAt),
     pendingStatus: item?.pending_status ?? null,
@@ -1383,8 +1387,6 @@ function mapApiTaskSnapshot(items, tasksPath, source = "cloud", pendingRequests 
   const byProject = new Map();
   for (const item of Array.isArray(items) ? items : []) {
     const task = mapApiTask(item);
-    // temp tasks are execution-only and must not appear in the floating UI.
-    if (isTempTask(task, item)) continue;
     const itemUpdatedAt = task.updatedAt;
     if (itemUpdatedAt !== null && (updatedAt === null || itemUpdatedAt > updatedAt)) updatedAt = itemUpdatedAt;
     if (!byProject.has(task.project)) byProject.set(task.project, []);

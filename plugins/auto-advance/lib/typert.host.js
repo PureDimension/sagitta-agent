@@ -21,7 +21,9 @@ const taskSchema = z.object({
   // status/updatedAt/project 等被剥掉 → client 永远收不到 in_progress 状态，
   // in_progress 任务被归一成 open，UI 每项目组 latest 恒为已完成任务。
   status: z.string().readonly().optional(),
+  acceptance: z.string().readonly().optional(),
   updatedAt: z.union([z.number(), z.null()]).readonly().optional(),
+  blockedReason: z.union([z.string(), z.null()]).readonly().optional(),
   project: z.string().readonly().optional(),
   task_id: z.string().readonly().optional(),
   kind: z.string().readonly().optional()
@@ -106,7 +108,7 @@ export const TYPERT = {
       ],
       types: [
         { name: "AutoAdvanceState", declaration: "export interface AutoAdvanceState { readonly enabled: boolean; readonly mode: 'auto' | 'chat'; readonly idleSince: number | null; readonly injectedAt: number | null; readonly ready: boolean; readonly hasPendingWork: boolean; readonly stoppedByProtocol: boolean; readonly agentStatus: string; readonly degraded: boolean; readonly degradedReason: string | null; }" },
-        { name: "TaskSnapshot", declaration: "export interface TaskSnapshot { readonly path: string; readonly updatedAt: number | null; readonly source?: 'cloud' | 'file' | 'file-stale'; readonly sections: readonly { readonly title: string; readonly items: readonly { readonly text: string; readonly title?: string; readonly done: boolean; readonly status?: string; readonly updatedAt?: number | null; readonly project?: string; readonly task_id?: string; readonly kind?: string; }[]; }[]; readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string; readonly type: 'need' | 'notify'; readonly needHumanId: string; }[]; readonly error?: string; }" },
+        { name: "TaskSnapshot", declaration: "export interface TaskSnapshot { readonly path: string; readonly updatedAt: number | null; readonly source?: 'cloud' | 'file' | 'file-stale'; readonly sections: readonly { readonly title: string; readonly items: readonly { readonly text: string; readonly title?: string; readonly done: boolean; readonly status?: string; readonly acceptance?: string; readonly updatedAt?: number | null; readonly blockedReason?: string | null; readonly project?: string; readonly task_id?: string; readonly kind?: string; }[]; }[]; readonly pendingRequests?: readonly { readonly title: string; readonly hasCheckbox: boolean; readonly body: string; readonly type: 'need' | 'notify'; readonly needHumanId: string; }[]; readonly error?: string; }" },
         { name: "NeedHumanResolution", declaration: "export interface NeedHumanResolution { readonly needHumanId: string; readonly taskId: string; readonly type: 'need' | 'notify'; readonly status: string; }" }
       ]
     }],

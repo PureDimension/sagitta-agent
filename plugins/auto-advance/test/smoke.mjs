@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import {
   AutoAdvanceService,
   AUTONOMOUS_PROMPT,
@@ -78,6 +79,16 @@ const mappedNotifyOnly = mapApiTaskSnapshot([
   }),
 ], "smoke-TASKS.md");
 assert.equal(mappedNotifyOnly.sections[0].items[0].open_need_human, false);
+const mappedStatusSnapshot = mapApiTaskSnapshot([
+  task("tsk-ui-progress", "in_progress", null, { claim_state: "mine" }, 23),
+  task("tsk-ui-blocked", "blocked", null, {}, 22),
+  task("tsk-ui-open", "open", null, {}, 21),
+  task("tsk-ui-temp", "in_progress", null, { claim_state: "mine", type: "temp" }, 20),
+], "smoke-TASKS.md");
+const mappedStatusItems = mappedStatusSnapshot.sections.flatMap((section) => section.items);
+assert.deepEqual(mappedStatusItems.map((item) => item.status), ["in_progress", "blocked", "open", "in_progress"]);
+assert.equal(mappedStatusItems.find((item) => item.task_id === "tsk-ui-progress").acceptance, "- [ ] target one\n- [x] target two");
+assert.equal(mappedStatusItems.find((item) => item.task_id === "tsk-ui-temp").kind, "temp");
 
 let responseMode = "owned";
 const resolvedRequests = [];
@@ -144,7 +155,10 @@ const server = createServer(async (request, response) => {
     return;
   }
   const modes = {
-    owned: [task("tsk-mine", "in_progress", null, { claim_state: "mine" }, 20)],
+    owned: [
+      task("tsk-mine", "in_progress", null, { claim_state: "mine" }, 20),
+      task("tsk-temp", "in_progress", null, { claim_state: "mine", type: "temp" }, 19),
+    ],
     open: [task("tsk-open", "open", null, { claim_state: "unclaimed" }, 20)],
     empty: [task("tsk-done", "done", null, {}, 20), task("tsk-blocked", "blocked", null, {}, 19)],
     need: [task("tsk-mine", "in_progress", null, {
@@ -298,6 +312,10 @@ try {
   const ownedHarness = makeHarness();
   const pendingSnapshot = await ownedHarness.service.getTasks();
   assert.equal(taskReadAgentIds.at(-1), "agent-smoke", "UI task read must use the selected session id");
+  const pendingItems = pendingSnapshot.sections.flatMap((section) => section.items);
+  assert.equal(pendingItems.find((item) => item.task_id === "tsk-mine").status, "in_progress");
+  assert.equal(pendingItems.find((item) => item.task_id === "tsk-mine").acceptance, "- [ ] target one\n- [x] target two");
+  assert.equal(pendingItems.find((item) => item.task_id === "tsk-temp").kind, "temp");
   assert.deepEqual(pendingSnapshot.pendingRequests.map((item) => item.type), ["notify", "need"]);
   assert.equal(pendingSnapshot.pendingRequests[0].needHumanId, "nh-notify");
   const resolvedNotify = await ownedHarness.service.resolveNeedHuman("nh-notify");
@@ -401,6 +419,38 @@ try {
   assert.match(clientSource, /📢 待你确认/u);
   assert.match(clientSource, /remoteApi\.resolveNeedHuman/u);
   assert.match(clientSource, /await refresh\(true\)/u);
+  let clientPlugin;
+  runInNewContext(clientSource, {
+    window: {
+      __ModuleLoader__: {
+        load(bundle) {
+          clientPlugin = bundle.factory(() => { throw new Error("unexpected client bundle require"); });
+        }
+      }
+    }
+  });
+  const mountedRemotes = [];
+  await clientPlugin.apply({
+    remote: { $mount: async (remote) => { mountedRemotes.push(remote); return async () => {}; } },
+    get: () => ({}),
+    effect: () => {}
+  });
+  const getTasksDescriptor = mountedRemotes[0].descriptors.find((descriptor) => descriptor.method === "getTasks");
+  const parsedClientSnapshot = getTasksDescriptor.result.schema.parse({
+    path: "smoke-TASKS.md",
+    updatedAt: 1,
+    source: "cloud",
+    sections: [{ title: "smoke", items: [{
+      text: "进行中任务",
+      done: false,
+      status: "in_progress",
+      acceptance: "- [ ] target one",
+      kind: "temp",
+      project: "smoke"
+    }] }]
+  });
+  assert.equal(parsedClientSnapshot.sections[0].items[0].acceptance, "- [ ] target one");
+  assert.equal(parsedClientSnapshot.sections[0].items[0].kind, "temp");
   rmSync(directory, { recursive: true, force: true });
 
   // 模拟 DSH 的 process SIGINT/SIGTERM → fiber.dispose：当前快照中的 owned

@@ -21,7 +21,9 @@ const taskSchema = z.object({
   // 按本 schema parse（zod 默认 strip 未知键），缺 status/updatedAt/project
   // 会让 in_progress 任务丢失状态、UI 只显示已完成任务。
   status: z.string().readonly().optional(),
+  acceptance: z.string().readonly().optional(),
   updatedAt: z.union([z.number(), z.null()]).readonly().optional(),
+  blockedReason: z.union([z.string(), z.null()]).readonly().optional(),
   project: z.string().readonly().optional(),
   task_id: z.string().readonly().optional(),
   kind: z.string().readonly().optional()

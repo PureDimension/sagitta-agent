@@ -77,7 +77,16 @@ window.__ModuleLoader__.load({
         if (value === null || typeof value !== "object" || typeof value.path !== "string" || (value.updatedAt !== null && typeof value.updatedAt !== "number") || !Array.isArray(value.sections) || (value.source !== undefined && !["cloud", "file", "file-stale"].includes(value.source))) throw new Error("invalid task snapshot");
         for (const section of value.sections) {
           if (section === null || typeof section.title !== "string" || !Array.isArray(section.items)) throw new Error("invalid task section");
-          for (const item of section.items) if (item === null || typeof item.text !== "string" || typeof item.done !== "boolean") throw new Error("invalid task item");
+          for (const item of section.items) {
+            if (item === null || typeof item.text !== "string" || typeof item.done !== "boolean") throw new Error("invalid task item");
+            if (item.acceptance !== undefined && typeof item.acceptance !== "string") throw new Error("invalid task acceptance");
+            if (item.kind !== undefined && typeof item.kind !== "string") throw new Error("invalid task kind");
+            if (item.status !== undefined && typeof item.status !== "string") throw new Error("invalid task status");
+            if (item.updatedAt !== undefined && item.updatedAt !== null && typeof item.updatedAt !== "number") throw new Error("invalid task updatedAt");
+            if (item.project !== undefined && typeof item.project !== "string") throw new Error("invalid task project");
+            if (item.task_id !== undefined && typeof item.task_id !== "string") throw new Error("invalid task id");
+            if (item.blockedReason !== undefined && item.blockedReason !== null && typeof item.blockedReason !== "string") throw new Error("invalid blocked reason");
+          }
         }
         if (value.pendingRequests !== undefined) {
           if (!Array.isArray(value.pendingRequests)) throw new Error("invalid pending request list");
@@ -169,10 +178,13 @@ window.__ModuleLoader__.load({
       .saa-project-mark { width: 5px; height: 5px; flex: 0 0 auto; border-radius: 50%; background: var(--saa-brand); box-shadow: 0 0 8px rgba(110,158,255,.7); }
       .saa-project-name { min-width: 0; overflow: hidden; color: #e9f1fc; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
       .saa-task { display: flex; align-items: flex-start; gap: 9px; padding: 0 11px 11px; }
+      .saa-task[data-kind="temp"] .saa-task-text { color: #d4b6ff; }
       .saa-task-main { min-width: 0; flex: 1 1 auto; }
       .saa-task-text { color: #bdcbe0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+      .saa-task-project { margin-top: 3px; color: #8295ad; font-size: 10px; overflow-wrap: anywhere; }
       .saa-task-meta { display: flex; align-items: center; gap: 7px; margin-top: 6px; }
       .saa-task-status { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 999px; background: rgba(255,255,255,.07); color: #b9c7d8; font-size: 10px; font-weight: 650; white-space: nowrap; }
+      .saa-task-kind { display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 7px; background: rgba(171,120,235,.18); color: #d4b6ff; font-size: 10px; font-weight: 700; }
       .saa-task-icon { display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center; font-size: 12px; line-height: 1; }
       .saa-task-icon[data-status="open"] { color: #9fbfff; }
       .saa-task-icon[data-status="in_progress"] { color: #70a4ff; animation: saa-spin 1.4s linear infinite; }
@@ -184,6 +196,19 @@ window.__ModuleLoader__.load({
       .saa-task-status[data-status="blocked"] { background: rgba(232,151,68,.14); color: #ffc17e; }
       .saa-task-status[data-status="completed"], .saa-task-status[data-status="done"] { background: rgba(72,188,130,.13); color: #82dfb1; }
       .saa-task-status[data-status="waiting"] { background: rgba(148,165,187,.13); color: #bec9d7; }
+      .saa-task-card-list { display: grid; gap: 7px; margin: 0 0 5px; padding: 0; list-style: none; }
+      .saa-task-card { display: flex; align-items: flex-start; gap: 9px; padding: 10px 11px; border: 1px solid rgba(148,171,201,.15); border-radius: 12px; background: rgba(255,255,255,.04); }
+      .saa-task-card[data-status="in_progress"] { border-color: rgba(110,158,255,.27); background: linear-gradient(145deg,rgba(83,135,234,.12),rgba(255,255,255,.035)); }
+      .saa-task-card[data-status="blocked"] { border-color: rgba(232,151,68,.3); background: linear-gradient(145deg,rgba(232,151,68,.11),rgba(255,255,255,.035)); }
+      .saa-task-card[data-status="open"] { border-color: rgba(110,158,255,.18); }
+      .saa-task-card[data-kind="temp"] { border-color: rgba(171,120,235,.46); background: linear-gradient(145deg,rgba(171,120,235,.17),rgba(255,255,255,.035)); }
+      .saa-task-card .saa-task-icon { margin-top: 2px; }
+      .saa-status-heading { margin-top: 14px; }
+      .saa-status-empty { margin-bottom: 5px; padding: 9px 11px; font-size: 11px; }
+      .saa-task-acceptance { margin-top: 6px; color: #aebed4; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+      .saa-task-acceptance strong { color: #d1def1; font-weight: 650; }
+      .saa-task-acceptance[data-empty="true"] { color: #788aa1; }
+      .saa-task-blocked-reason { margin-top: 4px; color: #ffc17e; font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
       .saa-task-updated { color: #73859c; font-size: 10px; }
       .saa-empty, .saa-error { padding: 13px; border-radius: 11px; background: rgba(255,255,255,.04); color: #899bb2; }
       .saa-stale { margin: -2px 0 8px; color: #ffc17e; font-size: 10px; }
@@ -244,6 +269,9 @@ window.__ModuleLoader__.load({
         text: split.text || rawText || "未命名事项",
         status,
         updatedAt: parseTaskDate(item?.updatedAt ?? rawText),
+        acceptance: safeText(item?.acceptance).trim(),
+        kind: safeText(item?.kind ?? item?.type).trim().toLowerCase() || "task",
+        blockedReason: safeText(item?.blockedReason).trim(),
         order,
         project: safeText(item?.project ?? item?.projectName ?? item?.group).trim()
       };
@@ -271,6 +299,44 @@ window.__ModuleLoader__.load({
       return request?.type === "notify" ? "notify" : "need";
     }
 
+    function isTempTask(task) {
+      const kind = safeText(task?.kind).trim().toLowerCase();
+      return kind === "temp" || kind === "temporary";
+    }
+
+    function acceptanceSummary(value) {
+      const lines = safeText(value).split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+      if (lines.length === 0) return "";
+      const summary = lines.map((line) => {
+        const checkbox = /^[-*]\s+\[([ xX])\]\s*(.*)$/u.exec(line);
+        if (checkbox === null) return line;
+        return `${checkbox[1].toLowerCase() === "x" ? "✓" : "□"} ${checkbox[2]}`;
+      }).join(" · ");
+      return summary.length > 240 ? `${summary.slice(0, 237)}…` : summary;
+    }
+
+    function normalizedTaskItems(snapshot) {
+      const items = [];
+      let order = 0;
+      const allowLegacyStatusGuess = snapshot?.source === "file-stale";
+      for (const section of Array.isArray(snapshot?.sections) ? snapshot.sections : []) {
+        const title = safeText(section?.title).trim() || "未分类";
+        if (isReportInboxSection(title)) continue;
+        const sectionItems = (Array.isArray(section?.items) ? section.items : []).map((item) => normalizeTask(item, order++, allowLegacyStatusGuess));
+        if (sectionItems.length === 0) continue;
+        const legacyFlat = isLegacyFlatSection(title, sectionItems);
+        for (const item of sectionItems) {
+          const project = item.project || (legacyFlat ? item.text : title) || "未分类";
+          items.push({
+            ...item,
+            project,
+            groupKey: legacyFlat ? `${project}\u0000${item.order}` : project.toLocaleLowerCase()
+          });
+        }
+      }
+      return items;
+    }
+
     function chooseLatest(items) {
       return items.reduce((latest, candidate) => {
         if (latest === undefined) return candidate;
@@ -285,27 +351,11 @@ window.__ModuleLoader__.load({
 
     function taskGroups(snapshot) {
       const groups = new Map();
-      let order = 0;
-      const allowLegacyStatusGuess = snapshot?.source === "file-stale";
-      for (const section of Array.isArray(snapshot?.sections) ? snapshot.sections : []) {
-        const title = safeText(section?.title).trim() || "未分类";
-        if (isReportInboxSection(title)) continue;
-        const items = (Array.isArray(section?.items) ? section.items : []).map((item) => normalizeTask(item, order++, allowLegacyStatusGuess));
-        if (items.length === 0) continue;
-        if (isLegacyFlatSection(title, items)) {
-          for (const item of items) {
-            const project = item.project || item.text;
-            groups.set(`${project}\u0000${item.order}`, { title: project, items: [item], order: item.order });
-          }
-          continue;
-        }
-        for (const item of items) {
-          const project = item.project || title;
-          const key = project.toLocaleLowerCase();
-          const group = groups.get(key) ?? { title: project, items: [], order: item.order };
-          group.items.push(item);
-          groups.set(key, group);
-        }
+      for (const item of normalizedTaskItems(snapshot)) {
+        const key = item.groupKey;
+        const group = groups.get(key) ?? { title: item.project, items: [], order: item.order };
+        group.items.push(item);
+        groups.set(key, group);
       }
       return [...groups.values()]
         .map((group) => ({ ...group, latest: chooseLatest(group.items) }))
@@ -316,6 +366,12 @@ window.__ModuleLoader__.load({
           const secondDate = second.latest.updatedAt ?? Number.NEGATIVE_INFINITY;
           return secondDate - firstDate || second.latest.order - first.latest.order;
         });
+    }
+
+    function tasksByStatus(snapshot, status) {
+      return normalizedTaskItems(snapshot)
+        .filter((task) => task.status === status)
+        .sort((first, second) => (second.updatedAt ?? Number.NEGATIVE_INFINITY) - (first.updatedAt ?? Number.NEGATIVE_INFINITY) || first.order - second.order);
     }
 
     function formatDuration(since) {
@@ -356,6 +412,55 @@ window.__ModuleLoader__.load({
       if (text !== undefined) element.textContent = text;
       return element;
     }
+
+    function appendTaskDetails(container, task, showProject = true) {
+      container.append(createElement("div", { class: "saa-task-text" }, task.text));
+      if (showProject && task.project) container.append(createElement("div", { class: "saa-task-project" }, `项目：${task.project}`));
+      const acceptance = acceptanceSummary(task.acceptance);
+      container.append(createElement("div", {
+        class: "saa-task-acceptance",
+        "data-empty": String(acceptance.length === 0),
+        title: safeText(task.acceptance).trim()
+      }, `期望目标：${acceptance || "暂无 checklist"}`));
+      if (task.status === "blocked" && task.blockedReason.length > 0) {
+        container.append(createElement("div", { class: "saa-task-blocked-reason" }, `原因：${task.blockedReason}`));
+      }
+      const meta = STATUS_META[task.status] ?? STATUS_META.waiting;
+      const taskMeta = createElement("div", { class: "saa-task-meta" });
+      const taskStatus = createElement("span", { class: "saa-task-status", "data-status": task.status });
+      taskStatus.append(createElement("span", { class: "saa-task-icon", "data-status": task.status, "aria-hidden": "true" }, meta.icon), document.createTextNode(meta.label));
+      taskMeta.append(taskStatus);
+      if (isTempTask(task)) taskMeta.append(createElement("span", { class: "saa-task-kind", title: "临时任务，仅用于辅助推进" }, "temp"));
+      if (task.updatedAt !== null) taskMeta.append(createElement("span", { class: "saa-task-updated" }, `更新于 ${new Date(task.updatedAt).toLocaleDateString()}`));
+      container.append(taskMeta);
+    }
+
+    function appendTaskCard(container, task) {
+      const card = createElement("li", {
+        class: "saa-task-card",
+        "data-status": task.status,
+        "data-kind": isTempTask(task) ? "temp" : "task"
+      });
+      const icon = createElement("span", { class: "saa-task-icon", "data-status": task.status, "aria-hidden": "true" }, (STATUS_META[task.status] ?? STATUS_META.waiting).icon);
+      const main = createElement("div", { class: "saa-task-main" });
+      appendTaskDetails(main, task, true);
+      card.append(icon, main);
+      container.append(card);
+    }
+
+    function appendTaskStatusSection(container, title, items, emptyText) {
+      const heading = createElement("div", { class: "saa-task-title saa-status-heading" });
+      heading.append(createElement("span", {}, title), createElement("span", { class: "saa-task-count" }, `${items.length} 项`));
+      container.append(heading);
+      if (items.length === 0) {
+        container.append(createElement("div", { class: "saa-empty saa-status-empty" }, emptyText));
+        return;
+      }
+      const list = createElement("ul", { class: "saa-task-card-list" });
+      for (const task of items) appendTaskCard(list, task);
+      container.append(list);
+    }
+
     function mount(ctx, remoteApi) {
       if (typeof document === "undefined" || !document.body) return () => {};
       const style = createElement("style", { "data-sagitta-auto-advance": "style" });
@@ -566,6 +671,18 @@ window.__ModuleLoader__.load({
         }
         appendPendingSection(taskScroll, needs, "need");
         appendPendingSection(taskScroll, notifications, "notify");
+        const allTasks = normalizedTaskItems(tasks);
+        const inProgressTasks = tasksByStatus(tasks, "in_progress");
+        const blockedTasks = tasksByStatus(tasks, "blocked");
+        const openTasks = tasksByStatus(tasks, "open");
+        const otherTempTasks = allTasks.filter((task) => isTempTask(task) && !["in_progress", "blocked", "open"].includes(task.status));
+        const stateTitle = createElement("div", { class: "saa-task-title" });
+        stateTitle.append(createElement("span", {}, "任务状态"), createElement("span", { class: "saa-task-count" }, `${allTasks.length} 个任务`));
+        taskScroll.append(stateTitle);
+        appendTaskStatusSection(taskScroll, "进行中", inProgressTasks, "暂无进行中任务");
+        appendTaskStatusSection(taskScroll, "阻塞中", blockedTasks, "暂无阻塞任务");
+        appendTaskStatusSection(taskScroll, "可推进", openTasks, "暂无可推进任务");
+        if (otherTempTasks.length > 0) appendTaskStatusSection(taskScroll, "临时任务", otherTempTasks, "暂无临时任务");
         const taskTitle = createElement("div", { class: "saa-task-title" });
         taskTitle.append(createElement("span", {}, "项目进度"), createElement("span", { class: "saa-task-count" }, `${groups.length} 个项目`));
         taskScroll.append(taskTitle);
@@ -577,19 +694,12 @@ window.__ModuleLoader__.load({
           const list = createElement("ul", { class: "saa-project-list" });
           for (const group of groups) {
             const task = group.latest;
-            const meta = STATUS_META[task.status] ?? STATUS_META.waiting;
             const project = createElement("li", { class: "saa-project" });
             const projectHead = createElement("div", { class: "saa-project-head" });
             projectHead.append(createElement("span", { class: "saa-project-mark", "aria-hidden": "true" }), createElement("span", { class: "saa-project-name", title: group.title }, group.title));
-            const taskRow = createElement("div", { class: "saa-task" });
+            const taskRow = createElement("div", { class: "saa-task", "data-kind": isTempTask(task) ? "temp" : "task" });
             const taskMain = createElement("div", { class: "saa-task-main" });
-            taskMain.append(createElement("div", { class: "saa-task-text" }, task.text));
-            const taskMeta = createElement("div", { class: "saa-task-meta" });
-            const taskStatus = createElement("span", { class: "saa-task-status", "data-status": task.status });
-            taskStatus.append(createElement("span", { class: "saa-task-icon", "data-status": task.status, "aria-hidden": "true" }, meta.icon), document.createTextNode(meta.label));
-            taskMeta.append(taskStatus);
-            if (task.updatedAt !== null) taskMeta.append(createElement("span", { class: "saa-task-updated" }, `更新于 ${new Date(task.updatedAt).toLocaleDateString()}`));
-            taskMain.append(taskMeta);
+            appendTaskDetails(taskMain, task, false);
             taskRow.append(taskMain);
             project.append(projectHead, taskRow);
             list.append(project);
