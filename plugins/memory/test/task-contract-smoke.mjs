@@ -49,7 +49,7 @@ const server = createServer(async (req, res) => {
     const accepted = body.decision === "accept";
     return json(res, 200, { ok: true, data: {
       ...baseTask(taskId),
-      status: accepted ? "done" : "in_progress",
+      status: accepted ? "done" : "open",
       pending_status: null,
       done_at: accepted ? "2026-08-30T00:00:03.000Z" : "",
       confirmation_id: body.confirmation_id,
@@ -132,7 +132,7 @@ try {
     expected_updated_at: "2026-08-30T00:00:01.000Z",
     confirmation_id: "cnf-task-smoke-done",
   });
-  assert.equal(reopened.status, "in_progress");
+  assert.equal(reopened.status, "open");
   assert.equal(reopened.pending_status, null);
   assert.equal(reopened.done_at, "");
 
@@ -166,7 +166,7 @@ try {
     body: { status: "done" },
   });
   assert.equal(requests.find((request) => request.url === "/task/tsk-round/round-close").body.agent_id, "agent-main");
-  console.log("memory task contract smoke: PASS (projection, confirm accept/reopen, round-close, 422 validation)");
+  console.log("memory task contract smoke: PASS (projection, confirm accept/compat-reopen→open, round-close, 422 validation)");
 } finally {
   server.close();
 }

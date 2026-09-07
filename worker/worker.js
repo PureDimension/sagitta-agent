@@ -37,17 +37,21 @@
 //      owner_agent_id 永不下发（owner 对模型无感知）；claim_token 只在认领成功响应
 //      下发一次（列表/详情剥离，防泄露）；过期判定在 SQL 侧按行内租约
 //      COALESCE(lease_seconds, 86400) 用 strftime（与 toISOString 同格式）计算
-//   C. 释放 POST /task/{id}/release：校验 claim_token 匹配后清空 owner/claimed_at/
-//      claim_token/lease_seconds，in_progress 且无 pending 时 status 回 open；token 不匹配 403
+//   C. 释放 POST /task/{id}/release：校验 owner_agent_id + 有效租约后清空 owner/claimed_at/
+//      claim_token/lease_seconds，in_progress 且无 pending 时 status 回 open；非 owner 403
 //   D. 惰性回收：读取/PATCH/claim 时按行内租约（null 用全局默认 24h，
 //      TASK_DEFAULT_LEASE_SECONDS）判定过期=未认领（查询投影 claim_state=unclaimed；
 //      有效租约且请求 X-Agent-Id 匹配 owner 时投影为 mine；
 //      认领接管条件覆盖过期场景）；不做定时清理——进程退出后租约自然过期，新对话可接管
-//   E. 终态自动释放：confirm accept（done/blocked）与 PATCH 到 waiting/open 清除 owner
-//      （含 lease_seconds）；round-close 与 PATCH 终态申请（pending）不影响 owner
-//      （认领持续到终态或释放）
+//   E. 终态自动释放：confirm accept（done/blocked）、普通 PATCH 终态与 PATCH 到 waiting/open
+//      清除 owner（含 lease_seconds）；round-close pending 申请不影响 owner
 //   F. PATCH status=in_progress 防绕过认领：他人认领（租约内）时 409 TASK_ALREADY_CLAIMED；
 //      owner 本人（X-Agent-Id 匹配）或未认领任务允许直接置 in_progress
+// v1.5 → v1.6 变更（task-system-v3，涟漪 2026-09-07 拍板）：
+//   A. owner_agent_id 成为会话认领权威；同 owner claim 续租，owner 无 token 可 release/update；
+//   B. need-human resolve 自由处理并支持 target=open|in_progress|blocked|done；
+//   C. blocked 直通 open/in_progress/done；普通 PATCH 终态直落，round-close 保留 pending+confirm；
+//      旧 pending 的 confirm(reopen) 仅兼容回 open。
 // 格式说明：本文件使用 **ES Module 格式**（export default { fetch(request, env) }），
 //   这是硬要求：Cloudflare 的 D1 binding 只支持 ES Module 格式，经典 Service Worker
 //   格式（addEventListener('fetch')）会报 `Binding 'DB' of type 'd1' requires a Worker
@@ -59,7 +63,7 @@
 
 'use strict';
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 // ---- 枚举常量（服务端强制；管理字段由服务端填写，AI 无权编造） -------------
 
@@ -969,12 +973,15 @@ const TASK_SYSTEM_AGENT = 'worker';
 const TASK_PENDING_STATUSES = ['pending_done', 'pending_blocked'];
 const TASK_TERMINAL_STATUSES = ['done', 'blocked'];
 const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason', 'acceptance'];
+// reopen is retained only as a compatibility reader for pre-v3 pending rows;
+// v3 callers use PATCH/resolve target=open instead.
 const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
 const TASK_ROUND_ACTIONS = ['update', 'done', 'blocked'];
 const TASK_NEED_HUMAN_STATUSES = ['open', 'resolved'];
 const TASK_NEED_HUMAN_TYPES = ['need', 'notify'];
 const TASK_NEED_HUMAN_RESOLVED_BY = ['ripple', 'sagitta'];
 const TASK_NEED_HUMAN_RESOLVE_KINDS = ['solved', 'abandoned'];
+const TASK_NEED_HUMAN_TARGETS = ['open', 'in_progress', 'blocked', 'done'];
 const MAX_TASK_EVENT_TEXT = 1000;
 // task-ownership-p2 §3/§4：认领租约与调用方标识。
 //   · 租约默认 24h（进程退出后自然过期回收，新对话可接管）；claim body 的
@@ -1428,10 +1435,11 @@ async function createNeedHumanHandler(db, taskIdValue, body) {
   return jsonOk(serializeNeedHuman(await getNeedHumanRow(db, id)), 201);
 }
 
-// POST /task/need-human/{nhid}/resolve —— 解决或放弃一条 need-human。
-async function resolveNeedHumanHandler(db, id, body) {
+// POST /task/need-human/{nhid}/resolve —— 自由解除一条 need-human，并按 target
+// 原子流转所属任务。此路由刻意不检查 claim：涟漪或其他有写权限的调用方都可处理。
+async function resolveNeedHumanHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
-  const forbidden = Object.keys(body).filter((field) => !['resolved_by', 'resolve_kind'].includes(field));
+  const forbidden = Object.keys(body).filter((field) => !['resolved_by', 'resolve_kind', 'target'].includes(field));
   if (forbidden.length > 0) {
     return jsonError(422, 'NEED_HUMAN_FIELD_FORBIDDEN', 'resolve 字段不在白名单中：' + forbidden.join(', '), { fields: forbidden });
   }
@@ -1444,24 +1452,49 @@ async function resolveNeedHumanHandler(db, id, body) {
       !TASK_NEED_HUMAN_RESOLVE_KINDS.includes(body.resolve_kind)) {
     return jsonError(422, 'INVALID_RESOLVE_KIND', 'resolve_kind 必须是 solved 或 abandoned');
   }
+  const target = body.target === undefined || body.target === null ? 'open' : body.target;
+  if (!TASK_NEED_HUMAN_TARGETS.includes(target)) {
+    return jsonError(422, 'INVALID_NEED_HUMAN_TARGET', 'target 必须是：' + TASK_NEED_HUMAN_TARGETS.join(' / '));
+  }
 
   const current = await getNeedHumanRow(db, id);
   if (!current) return jsonError(404, 'NEED_HUMAN_NOT_FOUND', 'need-human 不存在：' + id);
   if (current.status === 'resolved') return jsonOk(serializeNeedHuman(current));
 
+  const task = await getTaskRow(db, current.task_id);
+  if (!task) return jsonError(404, 'TASK_NOT_FOUND', 'need-human 所属任务不存在：' + current.task_id);
+  // Pending 是旧数据/round-close 的确认协议，resolve 不能绕过它；保留旧 confirm
+  // 流程，避免 v3 的自由 resolve 意外把在途申请直接改写掉。
+  if (task.pending_status !== null) {
+    return taskPendingConflict('任务已有 pending 终态申请，请先按 confirm 流程处理', task, requestAgentId(request, env));
+  }
+  if (target === 'done') {
+    const otherOpenNeed = await db.prepare(
+      "SELECT id FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need' AND id <> ? LIMIT 1"
+    ).bind(current.task_id, id).first();
+    if (otherOpenNeed) return taskNeedHumanOpenError(task, requestAgentId(request, env));
+  }
+
   const now = nowIso();
   const resolve = db.prepare(
     "UPDATE task_need_human SET status = 'resolved', resolved_at = ?, resolved_by = ? WHERE id = ? AND status = 'open'"
   ).bind(now, resolvedBy, id);
-  // 涟漪清掉最后一条 need-human 后，blocked 任务回到 open，等待重新认领；
-  // in_progress 任务保持原状态。abandoned 只结清该条，done 仍由 agent 后续申请。
+  const blockedReason = target === 'blocked'
+    ? (isNonEmptyString(task.blocked_reason) ? task.blocked_reason : current.content)
+    : null;
+  const doneAt = target === 'done' ? now : '';
+  const clearOwner = target === 'done' || target === 'blocked'
+    ? ', owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL'
+    : (target === 'open' ? ', owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL' : '');
   const reopen = db.prepare(
-    "UPDATE tasks SET status = 'open', blocked_reason = NULL, owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL, updated_at = ? " +
-    "WHERE id = ? AND archived = 0 AND status = 'blocked' AND NOT EXISTS (" +
-    "SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')"
-  ).bind(now, current.task_id, current.task_id);
+    'UPDATE tasks SET status = ?, blocked_reason = ?, pending_status = NULL, done_at = ?, updated_at = ?' + clearOwner +
+    ' WHERE id = ? AND archived = 0 AND EXISTS (' +
+    "SELECT 1 FROM task_need_human WHERE id = ? AND status = 'resolved' AND resolved_at = ? )"
+  ).bind(target, blockedReason, doneAt, now, current.task_id, id, now);
   await db.batch([resolve, reopen]);
-  return jsonOk(serializeNeedHuman(await getNeedHumanRow(db, id)));
+  const resolved = serializeNeedHuman(await getNeedHumanRow(db, id));
+  const updatedTask = await getTaskRow(db, current.task_id);
+  return jsonOk({ ...resolved, target, task: serializeTask(updatedTask, {}, requestAgentId(request, env)) });
 }
 
 async function findRoundEvent(db, taskIdValue, agentId, roundId) {
@@ -1646,7 +1679,8 @@ async function createTaskHandler(db, body) {
   return jsonOk(serializeTask(row), 201);
 }
 
-// PATCH /task/{id} —— 业务字段更新；终态只能生成 pending 申请。
+// PATCH /task/{id} —— 业务字段更新；v3 普通 PATCH 的 done/blocked 直接落终态。
+// round-close 仍是自主推进专用的 pending + confirm 通道。
 async function patchTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
   const readAgentId = requestAgentId(request, env);
@@ -1673,9 +1707,10 @@ async function patchTaskHandler(db, id, body, request, env) {
     const statusError = taskStatus(body.status);
     if (statusError) return statusError;
     if (TASK_TERMINAL_STATUSES.includes(body.status)) {
-      if (row.status !== 'in_progress' || row.pending_status !== null) {
+      const blockedToDone = row.status === 'blocked' && body.status === 'done';
+      if ((row.status !== 'in_progress' && !blockedToDone) || row.pending_status !== null) {
         return jsonError(422, 'TASK_TERMINAL_REQUIRES_IN_PROGRESS',
-          '只有无 pending 的 in_progress 任务可以申请 done/blocked', { task: serializeTask(row, {}, readAgentId) });
+          '只有无 pending 的 in_progress 任务可以 PATCH done/blocked；blocked 可直接 PATCH done', { task: serializeTask(row, {}, readAgentId) });
       }
       if (body.status === 'blocked' && !isNonEmptyString(body.blocked_reason)) {
         return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', '申请 blocked 必须提供非空 blocked_reason');
@@ -1684,8 +1719,8 @@ async function patchTaskHandler(db, id, body, request, env) {
         return jsonError(422, 'INVALID_BLOCKED_REASON', 'done 申请不得设置 blocked_reason');
       }
     }
-    if (row.status === 'done' || row.status === 'blocked') {
-      return jsonError(409, 'TASK_TERMINAL_IMMUTABLE', '终态任务只能通过既有 pending 的 confirm 流程变更', { task: serializeTask(row, {}, readAgentId) });
+    if (row.status === 'done') {
+      return jsonError(409, 'TASK_TERMINAL_IMMUTABLE', 'done 终态任务不可再通过 PATCH 改变', { task: serializeTask(row, {}, readAgentId) });
     }
   }
 
@@ -1767,8 +1802,7 @@ async function patchTaskHandler(db, id, body, request, env) {
     }
   }
 
-  // task-ownership-p2 §6/§7：PATCH 到 waiting/open 释放 owner（waiting/blocked 不占用，设计 §7）。
-  // 仅非终态路径落地；终态（pending 申请）保留 owner——认领持续到 confirm accept 或显式释放。
+  // task-ownership-p2 §6/§7：PATCH 到 waiting/open 释放 owner；v3 终态直落时也释放。
   if (has('status') && !statusIsTerminal && (nextStatus === 'waiting' || nextStatus === 'open')) {
     sets.push('owner_agent_id = NULL', 'claimed_at = NULL', 'claim_token = NULL', 'lease_seconds = NULL');
   }
@@ -1788,48 +1822,37 @@ async function patchTaskHandler(db, id, body, request, env) {
     if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
       return taskNeedHumanOpenError(row, readAgentId);
     }
-    const pendingStatus = nextStatus === 'done' ? 'pending_done' : 'pending_blocked';
-    const confirmationId = 'cnf-' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
-    const eventPayload = {
-      kind: 'terminal_requested',
-      task_id: id,
-      confirmation_id: confirmationId,
-      requested_status: nextStatus,
-      blocked_reason: nextStatus === 'blocked' ? blockedReason : null,
-      expected_updated_at: expected,
-    };
+    const doneAt = nextStatus === 'done' ? now : '';
+    sets.push(
+      'status = ?',
+      'pending_status = NULL',
+      'blocked_reason = ?',
+      'done_at = ?',
+      'owner_agent_id = NULL',
+      'claimed_at = NULL',
+      'claim_token = NULL',
+      'lease_seconds = NULL',
+      'updated_at = ?'
+    );
+    params.push(nextStatus, nextStatus === 'blocked' ? blockedReason : null, doneAt, now, id);
     const update = db.prepare(
-      'UPDATE tasks SET ' +
-      (sets.length ? sets.join(', ') + ', ' : '') +
-      'status = ?, pending_status = ?, blocked_reason = ?, updated_at = ? ' +
-      'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL' +
+      'UPDATE tasks SET ' + sets.join(', ') +
+      ' WHERE id = ? AND (status = \'in_progress\' OR (status = \'blocked\' AND ? = \'done\')) AND pending_status IS NULL' +
       (expected === null ? '' : ' AND updated_at = ?') +
       (nextStatus === 'done'
         ? " AND NOT EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')"
         : '')
     ).bind(
-      ...params, 'in_progress', pendingStatus, nextStatus === 'blocked' ? blockedReason : null, now, id,
+      ...params,
+      nextStatus,
       ...(expected === null ? [] : [expected]),
       ...(nextStatus === 'done' ? [id] : [])
     );
-    const event = db.prepare(
-      'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
-      'SELECT ?, ?, ?, \'terminal_requested\', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ? WHERE changes() = 1'
-    ).bind(
-      eventId, id, TASK_SYSTEM_AGENT, nextStatus === 'blocked' ? blockedReason : null, pendingStatus,
-      confirmationId, expected, JSON.stringify(eventPayload), now
-    );
-    await db.batch([update, event]);
-    const savedEvent = await findTerminalEvent(db, id, confirmationId);
-    if (!savedEvent) {
-      const current = await getTaskRow(db, id);
-      if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
-        return taskNeedHumanOpenError(current, readAgentId);
-      }
-      return taskConflict('任务版本已变化，终态申请未提交', current, readAgentId);
+    const updateResult = await update.run();
+    if (updateResult && updateResult.meta && Number(updateResult.meta.changes) === 0) {
+      return taskConflict('任务版本已变化，终态更新未提交', await getTaskRow(db, id), readAgentId);
     }
-    return await taskResponse(db, id, { confirmation_id: confirmationId, idempotent: false }, readAgentId);
+    return await taskResponse(db, id, { idempotent: false }, readAgentId);
   }
 
   sets.push('updated_at = ?');
@@ -1846,12 +1869,13 @@ async function patchTaskHandler(db, id, body, request, env) {
   return await taskResponse(db, id, {}, readAgentId);
 }
 
-// POST /task/{id}/claim —— 原子认领（task-ownership-p2 §4.1）
+// POST /task/{id}/claim —— 原子认领（v3 会话化）
 // 条件（单条条件 UPDATE，不可先读后写——先读后写会在并发下重复认领）：
 //   status='open'，或（status='in_progress' 且 owner 过期/为空）→
 //   置 in_progress + owner_agent_id=调用方标识 + claimed_at=now + claim_token=随机 +
 //   lease_seconds（body 可选 1~604800 秒，逐认领持久化；未传存 NULL = 全局默认 24h）。
-// 响应：完整任务投影 + claim_token（唯一一次下发）；owner_agent_id 永不下发。
+// 同 owner 且租约有效时是续租恢复，不是重复占用；响应保留 claim_token 仅兼容旧客户端，
+// owner_agent_id 才是权限权威，永不下发。
 // 失败：被占用未过期 → 409 TASK_ALREADY_CLAIMED；pending 任务 → 409 TASK_PENDING_CONFLICT。
 async function claimTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
@@ -1876,9 +1900,10 @@ async function claimTaskHandler(db, id, body, request, env) {
     'WHERE id = ? AND archived = 0 AND pending_status IS NULL AND (' +
     "  status = 'open'" +
     "  OR (status = 'in_progress' AND (owner_agent_id IS NULL OR claimed_at IS NULL" +
+    "    OR owner_agent_id = ?" +
     "    OR claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(lease_seconds, ?) || ' seconds')))" +
     ')'
-  ).bind(agentId, now, token, leaseSeconds, now, id, TASK_DEFAULT_LEASE_SECONDS).run();
+  ).bind(agentId, now, token, leaseSeconds, now, id, agentId, TASK_DEFAULT_LEASE_SECONDS).run();
   if (Number(update.meta.changes) === 0) {
     const row = await getTaskRow(db, id);
     if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
@@ -1892,32 +1917,29 @@ async function claimTaskHandler(db, id, body, request, env) {
   return await taskResponse(db, id, { claim_token: token }, readAgentId);
 }
 
-// POST /task/{id}/release —— 释放认领（task-ownership-p2 §4.2）
-// 仅持有正确 claim_token 的调用方可释放：owner/claimed_at/claim_token/lease_seconds 清空；
+// POST /task/{id}/release —— 按 owner 会话释放认领（v3）
+// owner_agent_id + 有效租约是唯一权限来源；claim_token 可省略，旧 token 不再授予权限。
 // 若任务仍是 in_progress 且无 pending → status 回 open（终态/waiting 已自动释放 owner）。
-// token 不匹配 → 403 CLAIM_TOKEN_MISMATCH。
+// 非 owner 或租约已过期 → 403 TASK_CLAIM_OWNER_MISMATCH。
 async function releaseTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
   const readAgentId = requestAgentId(request, env);
-  if (!isNonEmptyString(body.claim_token)) {
-    return jsonError(422, 'CLAIM_TOKEN_REQUIRED', 'release 必须携带 claim_token（认领时的凭证）');
-  }
-  const token = body.claim_token.trim();
   const row = await getTaskRow(db, id);
   if (!row) return jsonError(404, 'TASK_NOT_FOUND', '任务不存在：' + id);
-  if (row.claim_token === null || row.claim_token !== token) {
-    return jsonError(403, 'CLAIM_TOKEN_MISMATCH',
-      'claim_token 不匹配：该任务未被认领，或凭证不属于当前调用方（认领凭证只在 claim 响应下发一次）');
+  const agentId = callerAgentId(request, env);
+  if (taskClaimState(row, Date.now(), agentId) !== 'mine') {
+    return jsonError(403, 'TASK_CLAIM_OWNER_MISMATCH',
+      '只有当前有效租约的 owner_agent_id 才能释放认领；claim_token 不再是权限凭证');
   }
   const now = nowIso();
   const reopenOpen = (row.status === 'in_progress' && row.pending_status === null) ? ", status = 'open'" : '';
-  // 条件带 claim_token 防 TOCTOU：仅当凭证仍匹配时清除（并发释放/终态确认的竞态安全）
+  // 条件带 owner + 有效租约防 TOCTOU；重启后的同一会话可无 token 释放。
   const update = await db.prepare(
     'UPDATE tasks SET owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL' + reopenOpen + ', updated_at = ? ' +
-    'WHERE id = ? AND claim_token = ?'
-  ).bind(now, id, token).run();
+    "WHERE id = ? AND owner_agent_id = ? AND claimed_at IS NOT NULL AND claimed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(lease_seconds, ?) || ' seconds')"
+  ).bind(now, id, agentId, TASK_DEFAULT_LEASE_SECONDS).run();
   if (Number(update.meta.changes) === 0) {
-    // 竞态：凭证已被清除（他方已释放/终态确认）——幂等返回当前状态（不含 claim_token）
+    // 竞态：owner 已被清除/终态确认——幂等返回当前状态（不含 claim_token）
     return await taskResponse(db, id, {}, readAgentId);
   }
   return await taskResponse(db, id, {}, readAgentId);
@@ -1928,7 +1950,7 @@ async function confirmTaskHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
   const readAgentId = requestAgentId(request, env);
   if (!TASK_CONFIRM_DECISIONS.includes(body.decision)) {
-    return jsonError(422, 'INVALID_CONFIRM_DECISION', 'decision 必须是 accept 或 reopen');
+    return jsonError(422, 'INVALID_CONFIRM_DECISION', 'decision 必须是 accept 或兼容 reopen');
   }
   if (!TASK_PENDING_STATUSES.includes(body.expected_pending)) {
     return jsonError(422, 'INVALID_EXPECTED_PENDING', 'expected_pending 必须是 pending_done 或 pending_blocked');
@@ -1975,9 +1997,10 @@ async function confirmTaskHandler(db, id, body, request, env) {
   }
 
   const now = nowIso();
+  // v3 不再引入 reopen 状态；旧 pending 的 reopen 请求兼容落到 open。
   const nextStatus = body.decision === 'accept'
     ? (body.expected_pending === 'pending_done' ? 'done' : 'blocked')
-    : 'in_progress';
+    : 'open';
   const nextReason = body.decision === 'accept' && body.expected_pending === 'pending_blocked'
     ? row.blocked_reason : null;
   const eventId = crypto.randomUUID();
@@ -1986,9 +2009,9 @@ async function confirmTaskHandler(db, id, body, request, env) {
     result: { status: nextStatus, pending_status: null, updated_at: now },
   };
   const doneAtSql = nextStatus === 'done' ? ', done_at = ?' : '';
-  // task-ownership-p2 §6：confirm accept（done/blocked）终态自动释放 owner（含租约）；
-  // reopen 回到 in_progress 保留 owner（认领者继续推进）。
-  const clearOwnerSql = (nextStatus === 'done' || nextStatus === 'blocked')
+  // task-ownership-p2 §6：confirm accept（done/blocked）与兼容 reopen(open)
+  // 都释放 owner；open 任务由后续 claim 会话重新开始。
+  const clearOwnerSql = (nextStatus === 'done' || nextStatus === 'blocked' || nextStatus === 'open')
     ? ', owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL'
     : '';
   const update = db.prepare(
@@ -2256,7 +2279,7 @@ async function handleRequest(request, env) {
         }
       } else if (segments.length === 4 && segments[1] === 'need-human') {
         if (method === 'POST' && segments[3] === 'resolve') {
-          return await resolveNeedHumanHandler(db, decodeURIComponent(segments[2]), await readJson(request));
+          return await resolveNeedHumanHandler(db, decodeURIComponent(segments[2]), await readJson(request), request, env);
         }
       }
       return jsonError(405, 'METHOD_NOT_ALLOWED', '路径 ' + path + ' 不支持 ' + method);

@@ -947,8 +947,9 @@ class AutoAdvanceService extends TypertRemoteService {
       const id = taskIdFromArgs(args) ?? taskIdFromArgs(call);
       if (id === undefined) continue;
       if (name === "task_claim" || name.endsWith(".task_claim")) {
-        // A claim token/result is the local ownership signal. A bare request
-        // is not enough: it may be a rejected claim against another lease.
+        // A successful claim projection is the local ownership hint. The
+        // cloud claim_state=mine remains authoritative after restart; a bare
+        // request is not enough because it may be a rejected claim.
         if (toolSucceeded(call)) {
           this.ownedTaskSet(state).add(id);
           ownershipChanged = true;

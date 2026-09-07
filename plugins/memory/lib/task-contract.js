@@ -1,4 +1,4 @@
-// sagitta-memory — task API v2 的纯契约辅助（不依赖 DSH runtime）。
+// sagitta-memory — task API v3 的纯契约辅助（不依赖 DSH runtime）。
 
 import { MemoryApiError } from "./client.js";
 
@@ -64,18 +64,21 @@ export function pickNeedHuman(raw) {
     suggestion: src.suggestion === undefined || src.suggestion === null ? null : String(src.suggestion),
     status: resolved ? "resolved" : "open",
     resolve_kind: src.resolve_kind === undefined || src.resolve_kind === null ? null : String(src.resolve_kind),
+    target: src.target === undefined || src.target === null ? null : String(src.target),
     created_at: String(src.created_at ?? src.created ?? ""),
     resolved_at: src.resolved_at === undefined || src.resolved_at === null ? null : String(src.resolved_at),
     updated_at: src.updated_at === undefined || src.updated_at === null ? null : String(src.updated_at),
   };
 }
 
+export const TASK_NEED_HUMAN_TARGETS = ["open", "in_progress", "blocked", "done"];
+
 export function pickTask(task) {
   if (!task) return null;
   const result = {
     id: String(task.id ?? task.task_id ?? ""),
     project: String(task.project ?? ""),
-    // P2 task-system-v2：normal 是兼容旧 Worker/旧数据的默认值；Worker
+    // task-system-v3：normal 是兼容旧 Worker/旧数据的默认值；Worker
     // 新版本会显式返回 normal|temp。
     kind: task.kind === "temp" ? "temp" : "normal",
     title: String(task.title ?? ""),

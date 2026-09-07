@@ -1,9 +1,8 @@
-// sagitta-memory — 任务执行门禁（task-system-v2 §3.1）
+// sagitta-memory — 任务执行门禁（task-system-v3 §1）
 //
 // 认领凭证只在 task_claim 的结果中出现一次，不能把它持久化到日志或输出。
-// 因此本模块只在当前 DSH 进程内保存“哪个 agent 已成功认领哪个任务”的非敏感
-// 投影，并把这份状态接到 dsh-tools 的全局单调 guard。Worker 仍是任务认领的
-// 权威方；本地状态丢失时，模型重新 task_claim 即可恢复。
+// 因此本模块保存的只是可丢弃的非敏感缓存，并把它接到 dsh-tools 的全局单调 guard。
+// Worker 的 owner_agent_id + 有效租约是权威；进程/会话重启可由云端 mine 投影重建。
 
 const EXECUTION_TOOL_NAMES = new Set([
   "write",
@@ -90,14 +89,49 @@ function sameAgent(record, agent, getAgent) {
 /**
  * Process-local task binding ledger. It intentionally exposes no claim token.
  */
-export function createTaskGate({ getAgent } = {}) {
+export function createTaskGate({ getAgent, loadCloudClaims } = {}) {
   const claims = [];
+  const cloudClaims = new Map();
 
-  const matchingClaims = (agent, taskId) => claims.filter((claim) =>
-    (taskId === undefined || claim.taskId === taskId) && sameAgent(claim, agent, getAgent)
-  );
+  const replaceCloudClaims = (tasks, agent) => {
+    const ownerAgentId = agentIdOf(agent);
+    const next = [];
+    for (const task of Array.isArray(tasks) ? tasks : []) {
+      const normalized = normalizeClaim(task);
+      if (!normalized || task?.claim_state !== "mine") continue;
+      next.push({ ...normalized, ownerAgentId });
+    }
+    cloudClaims.set(ownerAgentId, next);
+    return next.map(({ taskId, kind, status }) => ({ taskId, kind, status }));
+  };
+
+  const matchingClaims = (agent, taskId) => {
+    const records = [...claims, ...(cloudClaims.get(agentIdOf(agent)) || [])];
+    const seen = new Set();
+    return records.filter((claim) => {
+      const key = `${claim.taskId}\u0000${claim.ownerAgentId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return (taskId === undefined || claim.taskId === taskId) && sameAgent(claim, agent, getAgent);
+    });
+  };
 
   return {
+    async refreshCloud(agent) {
+      if (typeof loadCloudClaims !== "function" || !agent) return [];
+      try {
+        return replaceCloudClaims(await loadCloudClaims(agent), agent);
+      } catch {
+        // Keep a known cache on a transient cloud failure; the next refresh
+        // can still rebuild it from the Worker.
+        return [];
+      }
+    },
+
+    recordCloudClaims(tasks, agent) {
+      return replaceCloudClaims(tasks, agent);
+    },
+
     recordClaim(claim, agent) {
       const normalized = normalizeClaim(claim);
       if (!normalized) return null;
@@ -121,6 +155,10 @@ export function createTaskGate({ getAgent } = {}) {
           removed++;
         }
       }
+      const ownerAgentId = agentIdOf(agent);
+      const existing = cloudClaims.get(ownerAgentId) || [];
+      const remaining = existing.filter((claim) => claim.taskId !== id);
+      if (remaining.length !== existing.length) cloudClaims.set(ownerAgentId, remaining);
       return removed;
     },
 
@@ -133,6 +171,10 @@ export function createTaskGate({ getAgent } = {}) {
           claims.splice(index, 1);
           removed++;
         }
+      }
+      for (const [ownerAgentId, bound] of cloudClaims) {
+        const remaining = bound.filter((claim) => claim.taskId !== id);
+        if (remaining.length !== bound.length) cloudClaims.set(ownerAgentId, remaining);
       }
       return removed;
     },

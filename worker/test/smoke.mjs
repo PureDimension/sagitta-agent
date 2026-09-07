@@ -292,7 +292,7 @@ test("task migration is re-entrant and fails closed when D1 batch fails", async 
   assert.ok(result.body.request_id);
 });
 
-test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", async () => {
+test("v3 task kind, need-human lifecycle, done gate, and blocked transitions", async () => {
   const { env } = taskEnv();
   const read = { token: env.D1_READ_TOKEN };
   const write = { token: env.D1_WRITE_TOKEN };
@@ -372,7 +372,7 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
   assert.equal(result.body.data.open_notify_count, 1);
 
   result = await call(env, "POST", "/task/need-human/" + needHuman.id + "/resolve", {
-    ...write, body: { resolve_kind: "abandoned" },
+    ...write, body: { resolve_kind: "abandoned", target: "in_progress" },
   });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.type, "need");
@@ -381,51 +381,41 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
   assert.equal(result.body.data.open_need_human_count, 0);
   assert.equal(result.body.data.open_notify_count, 1);
 
-  result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done" } });
-  assert.equal(result.status, 200, "open notify 不应阻塞 done 申请");
-  const donePending = result.body.data;
-  assert.equal(donePending.pending_status, "pending_done");
+  // 普通 PATCH done 直落终态；多挂的第二条 need 仍阻止 target=done。
   result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
-    ...write, body: { type: "need", content: "确认前新增阻塞项" },
+    ...write, body: { type: "need", content: "确认全部 need 后才能收口" },
   });
   assert.equal(result.status, 201);
-  const lateNeedHuman = result.body.data;
-  result = await call(env, "POST", "/task/" + gated.id + "/confirm", {
-    ...write,
-    body: {
-      decision: "accept", expected_pending: "pending_done",
-      expected_updated_at: donePending.updated_at,
-      confirmation_id: donePending.confirmation_id,
-    },
+  const secondNeedHuman = result.body.data;
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { type: "need", content: "第三条 need" },
   });
-  assert.equal(result.status, 409, "confirm accept 仍须拦截新增的 open need");
-  assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
-  assert.equal(result.body.error.details.task.pending_status, "pending_done");
-  result = await call(env, "POST", "/task/need-human/" + lateNeedHuman.id + "/resolve", {
-    ...write, body: { resolved_by: "ripple" },
+  assert.equal(result.status, 201);
+  const thirdNeedHuman = result.body.data;
+  result = await call(env, "POST", "/task/need-human/" + secondNeedHuman.id + "/resolve", {
+    ...write,
+    body: { resolved_by: "ripple", target: "in_progress" },
   });
   assert.equal(result.status, 200);
-  result = await call(env, "POST", "/task/" + gated.id + "/confirm", {
-    ...write,
-    body: {
-      decision: "accept", expected_pending: "pending_done",
-      expected_updated_at: donePending.updated_at,
-      confirmation_id: donePending.confirmation_id,
-    },
+  result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 409, "open need must block direct PATCH done");
+  result = await call(env, "POST", "/task/need-human/" + thirdNeedHuman.id + "/resolve", {
+    ...write, body: { resolved_by: "ripple", target: "done" },
   });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.task.status, "done");
   result = await call(env, "GET", "/need-human?status=open", read);
   assert.ok(!result.body.data.items.some((item) => item.id === needHuman.id));
-  assert.ok(!result.body.data.items.some((item) => item.id === lateNeedHuman.id));
+  assert.ok(!result.body.data.items.some((item) => item.id === secondNeedHuman.id));
+  assert.ok(!result.body.data.items.some((item) => item.id === thirdNeedHuman.id));
   assert.ok(result.body.data.items.some((item) => item.id === notifyHuman.id && item.type === "notify"));
   result = await call(env, "POST", "/task/need-human/" + notifyHuman.id + "/resolve", {
-    ...write, body: { resolved_by: "ripple" },
+    ...write, body: { resolved_by: "ripple", target: "done" },
   });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.type, "notify");
 
-  // blocked 任务清掉最后一条 need-human 后自动回 open；in_progress 解除则保持原状态。
+  // blocked 任务可直接 PATCH open/in_progress/done；resolve target 负责显式流转。
   result = await call(env, "POST", "/task", {
     ...write, body: { project: "v2", title: "blocked reopen", acceptance: normalAcceptance, status: "in_progress" },
   });
@@ -433,17 +423,9 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
   result = await call(env, "PATCH", "/task/" + blocked.id, {
     ...write, body: { status: "blocked", blocked_reason: "等待涟漪决定" },
   });
-  const blockedPending = result.body.data;
-  result = await call(env, "POST", "/task/" + blocked.id + "/confirm", {
-    ...write,
-    body: {
-      decision: "accept", expected_pending: "pending_blocked",
-      expected_updated_at: blockedPending.updated_at,
-      confirmation_id: blockedPending.confirmation_id,
-    },
-  });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "blocked");
+  assert.equal(result.body.data.pending_status, null);
   const nhBodies = ["补充业务背景", "确认是否继续"];
   const nhIds = [];
   for (const content of nhBodies) {
@@ -451,11 +433,11 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
     assert.equal(result.status, 201);
     nhIds.push(result.body.data.id);
   }
-  result = await call(env, "POST", "/task/need-human/" + nhIds[0] + "/resolve", { ...write, body: {} });
+  result = await call(env, "POST", "/task/need-human/" + nhIds[0] + "/resolve", { ...write, body: { target: "blocked" } });
   assert.equal(result.status, 200);
   result = await call(env, "GET", "/task/" + blocked.id, read);
   assert.equal(result.body.data.status, "blocked");
-  result = await call(env, "POST", "/task/need-human/" + nhIds[1] + "/resolve", { ...write, body: { resolved_by: "sagitta" } });
+  result = await call(env, "POST", "/task/need-human/" + nhIds[1] + "/resolve", { ...write, body: { resolved_by: "sagitta", target: "open" } });
   assert.equal(result.status, 200);
   result = await call(env, "GET", "/task/" + blocked.id, read);
   assert.equal(result.body.data.status, "open");
@@ -466,10 +448,46 @@ test("v2 task kind, need-human lifecycle, done gate, and blocked reopening", asy
   });
   const progressing = result.body.data;
   result = await call(env, "POST", "/task/" + progressing.id + "/need-human", { ...write, body: { content: "请补充一个参数" } });
-  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, body: {} });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, body: { target: "in_progress" } });
   assert.equal(result.status, 200);
   result = await call(env, "GET", "/task/" + progressing.id, read);
   assert.equal(result.body.data.status, "in_progress");
+});
+
+test("v3 need-human resolve target supports four states and is free to another caller", async () => {
+  const { env } = taskEnv();
+  const write = { token: env.D1_WRITE_TOKEN };
+  const read = { token: env.D1_READ_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v3", title: "resolve targets", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "选择 open" } });
+  const openNeed = result.body.data;
+  result = await call(env, "POST", "/task/need-human/" + openNeed.id + "/resolve", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "resolved");
+  result = await call(env, "GET", "/task/" + task.id, read);
+  assert.equal(result.body.data.status, "open");
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "继续执行" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, ...agentB, body: { target: "in_progress" } });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + task.id, read);
+  assert.equal(result.body.data.status, "in_progress");
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "外部依赖阻塞" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, ...agentB, body: { target: "blocked" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "blocked");
+  assert.equal(result.body.data.task.blocked_reason, "外部依赖阻塞");
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "最终收口" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, ...agentB, body: { target: "done" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "done");
+  assert.match(result.body.data.task.done_at, /^20/);
 });
 
 test("pending invariants, terminal create rejection, PATCH whitelist, and confirm idempotency", async () => {
@@ -490,12 +508,25 @@ test("pending invariants, terminal create rejection, PATCH whitelist, and confir
   }
 
   let result = await call(env, "POST", "/task", {
-    ...write, body: { project: "p", title: "confirm me", acceptance: normalAcceptance, status: "in_progress" },
+    ...write, body: { project: "p", title: "direct done", acceptance: normalAcceptance, status: "in_progress" },
   });
   const task = result.body.data;
   assert.equal(result.status, 201);
 
   result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
+  assert.match(result.body.data.done_at, /^20/);
+
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "round close confirm", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const roundTask = result.body.data;
+  result = await call(env, "POST", "/task/" + roundTask.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "legacy-pending", action: "done", progress: "完成", next: "等待确认", expected_updated_at: roundTask.updated_at },
+  });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "in_progress");
   assert.equal(result.body.data.pending_status, "pending_done");
@@ -504,34 +535,34 @@ test("pending invariants, terminal create rejection, PATCH whitelist, and confir
   const pendingVersion = result.body.data.updated_at;
   assert.match(confirmationId, /^cnf-/);
 
-  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "open" } });
+  result = await call(env, "PATCH", "/task/" + roundTask.id, { ...write, body: { status: "open" } });
   assert.equal(result.status, 409);
   assert.equal(result.body.error.code, "TASK_PENDING_CONFLICT");
   result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { pending_status: null } });
   assert.equal(result.status, 422);
   assert.equal(result.body.error.code, "TASK_PATCH_FIELD_FORBIDDEN");
 
-  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { title: "still pending" } });
+  result = await call(env, "PATCH", "/task/" + roundTask.id, { ...write, body: { title: "still pending" } });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.pending_status, "pending_done");
   assert.equal(result.body.data.confirmation_id, confirmationId);
 
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
     ...write,
     body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: "stale", confirmation_id: confirmationId },
   });
   assert.equal(result.status, 409);
   assert.equal(result.body.error.code, "TASK_VERSION_CONFLICT");
 
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
     ...write,
     body: { decision: "accept", expected_pending: "pending_blocked", expected_updated_at: pendingVersion, confirmation_id: confirmationId },
   });
   assert.equal(result.status, 409);
 
-  const current = await call(env, "GET", "/task/" + task.id, read);
+  const current = await call(env, "GET", "/task/" + roundTask.id, read);
   const confirmExpected = current.body.data.updated_at;
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
     ...write,
     body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: confirmExpected, confirmation_id: confirmationId },
   });
@@ -541,20 +572,20 @@ test("pending invariants, terminal create rejection, PATCH whitelist, and confir
   assert.match(result.body.data.done_at, /^20/);
 
   const acceptedVersion = result.body.data.updated_at;
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
     ...write,
     body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: confirmExpected, confirmation_id: confirmationId },
   });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.idempotent, true);
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
     ...write,
     body: { decision: "reopen", expected_pending: "pending_done", expected_updated_at: acceptedVersion, confirmation_id: confirmationId },
   });
   assert.equal(result.status, 409, "same confirmation with different content must conflict");
 });
 
-test("blocked pending, reopen, round-close atomic audit and idempotency", async () => {
+test("blocked transitions, round-close atomic audit and idempotency", async () => {
   const { env, database } = taskEnv();
   const write = { token: env.D1_WRITE_TOKEN };
   let result = await call(env, "POST", "/task", {
@@ -569,18 +600,15 @@ test("blocked pending, reopen, round-close atomic audit and idempotency", async 
     ...write, body: { status: "blocked", blocked_reason: "等待外部系统" },
   });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.pending_status, "pending_blocked");
-  assert.equal(result.body.data.status, "in_progress");
-  const blockedConfirmation = result.body.data.confirmation_id;
-  const blockedVersion = result.body.data.updated_at;
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
-    ...write,
-    body: { decision: "reopen", expected_pending: "pending_blocked", expected_updated_at: blockedVersion, confirmation_id: blockedConfirmation },
-  });
+  assert.equal(result.body.data.pending_status, null);
+  assert.equal(result.body.data.status, "blocked");
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "open" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "open");
+  assert.equal(result.body.data.blocked_reason, null);
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "in_progress" } });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "in_progress");
-  assert.equal(result.body.data.pending_status, null);
-  assert.equal(result.body.data.blocked_reason, null);
 
   const finalBlocked = await call(env, "POST", "/task", {
     ...write, body: { project: "p", title: "accept blocked", acceptance: normalAcceptance, status: "in_progress" },
@@ -588,14 +616,31 @@ test("blocked pending, reopen, round-close atomic audit and idempotency", async 
   result = await call(env, "PATCH", "/task/" + finalBlocked.body.data.id, {
     ...write, body: { status: "blocked", blocked_reason: "等待涟漪确认" },
   });
-  const finalBlockedPending = result.body.data;
-  result = await call(env, "POST", "/task/" + finalBlocked.body.data.id + "/confirm", {
-    ...write,
-    body: { decision: "accept", expected_pending: "pending_blocked", expected_updated_at: finalBlockedPending.updated_at, confirmation_id: finalBlockedPending.confirmation_id },
-  });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "blocked");
   assert.equal(result.body.data.pending_status, null);
+  result = await call(env, "PATCH", "/task/" + finalBlocked.body.data.id, {
+    ...write, body: { status: "done" },
+  });
+  assert.equal(result.status, 200, "blocked→done must be a direct terminal transition");
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
+
+  const roundBlocked = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "round blocked", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  result = await call(env, "POST", "/task/" + roundBlocked.body.data.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-blocked", action: "blocked", progress: "遇到阻塞", next: "等待确认", blocked_reason: "等待涟漪确认", expected_updated_at: roundBlocked.body.data.updated_at },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, "pending_blocked");
+  result = await call(env, "POST", "/task/" + roundBlocked.body.data.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_blocked", expected_updated_at: result.body.data.updated_at, confirmation_id: result.body.data.confirmation_id },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "blocked");
   assert.equal(result.body.data.blocked_reason, "等待涟漪确认");
 
   result = await call(env, "POST", "/task/" + task.id + "/round-close", {
@@ -694,11 +739,11 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.ok(!("owner_agent_id" in result.body.data), "owner_agent_id must never appear in claim response");
   const tokenA = result.body.data.claim_token;
 
-  // 重复认领（B 或 A 自己）→ 409 TASK_ALREADY_CLAIMED
-  for (const who of [agentA, agentB]) {
+  // 同 owner 重启/丢失本地 token 后重复认领 → 续租恢复；B 仍受保护
+  for (const [who, expected] of [[agentA, 200], [agentB, 409]]) {
     result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...who, body: {} });
-    assert.equal(result.status, 409);
-    assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
+    assert.equal(result.status, expected);
+    if (expected === 409) assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
   }
 
   // claim_state 对调用方感知：A=mine，B/无头=claimed；owner_agent_id 永不下发
@@ -734,16 +779,13 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.equal(result.status, 200);
   assert.equal(result.body.data.claim_state, "mine");
 
-  // 错误 token 释放 → 403 CLAIM_TOKEN_MISMATCH
-  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, body: { claim_token: "clm-not-the-token" } });
+  // 非 owner 即使带旧 token 也不能释放；owner 可无 token 释放
+  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, ...agentB, body: { claim_token: "clm-not-the-token" } });
   assert.equal(result.status, 403);
-  assert.equal(result.body.error.code, "CLAIM_TOKEN_MISMATCH");
-  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, body: {} });
-  assert.equal(result.status, 422);
-  assert.equal(result.body.error.code, "CLAIM_TOKEN_REQUIRED");
+  assert.equal(result.body.error.code, "TASK_CLAIM_OWNER_MISMATCH");
 
   // 正确 token 释放 → open + unclaimed + 可被 B 重新认领（token 更换）
-  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, body: { claim_token: tokenA } });
+  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, ...agentA, body: {} });
   assert.equal(result.status, 200);
   assert.equal(result.body.data.status, "open");
   assert.equal(result.body.data.claim_state, "unclaimed");
@@ -768,26 +810,15 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   const tokenTakeover = result.body.data.claim_token;
   assert.notEqual(tokenTakeover, tokenB, "takeover must issue a fresh token");
 
-  // 终态自动释放：claim → PATCH done（pending 期间 owner 保持 claimed）→ confirm accept → unclaimed 且 done 不可认领
+  // 普通 PATCH done 直落终态并自动释放 owner；done 不可再认领
   result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentA, body: { status: "done" } });
   assert.equal(result.status, 200);
-  assert.equal(result.body.data.pending_status, "pending_done");
-  assert.equal(result.body.data.claim_state, "mine", "pending 申请不释放 owner（认领持续到终态确认）");
-  const confirmationId = result.body.data.confirmation_id;
-  const pendingVersion = result.body.data.updated_at;
-  result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentB, body: {} });
-  assert.equal(result.status, 409, "pending 任务不可认领");
-  assert.equal(result.body.error.code, "TASK_PENDING_CONFLICT");
-  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
-    ...write,
-    body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: pendingVersion, confirmation_id: confirmationId },
-  });
-  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, null);
   assert.equal(result.body.data.status, "done");
-  assert.equal(result.body.data.claim_state, "unclaimed", "confirm accept 自动释放 owner");
-  assert.ok(!("claim_token" in result.body.data));
+  assert.equal(result.body.data.claim_state, "unclaimed", "PATCH 终态自动释放 owner");
   result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentB, body: {} });
   assert.equal(result.status, 409, "done 终态任务不可认领");
+  assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
 
   // 存量 in_progress 无 owner → 视为未认领，可认领（task-ownership-p2 §7 旧数据）
   result = await call(env, "POST", "/task", {
@@ -848,7 +879,7 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.equal(row.lease_seconds, 3600, "claim 的 lease_seconds 必须持久化到行");
   // 释放后 lease_seconds 一并清空
   result = await call(env, "POST", "/task/" + persistTask.id + "/release", {
-    ...write, body: { claim_token: result.body.data.claim_token },
+    ...write, ...agentA, body: {},
   });
   assert.equal(result.status, 200);
   row = database.prepare("SELECT lease_seconds, owner_agent_id, claimed_at, claim_token FROM tasks WHERE id = ?").get(persistTask.id);
@@ -885,19 +916,11 @@ test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover a
   assert.notEqual(result.body.data.claim_token, shortToken, "接管必须发放新 token");
   row = database.prepare("SELECT lease_seconds, owner_agent_id FROM tasks WHERE id = ?").get(shortTask.id);
   assert.equal(row.lease_seconds, 3600, "接管后按新调用方租约持久化");
-  // 终态确认清空 lease_seconds：接管者提交 done → confirm accept
+  // 普通 PATCH done 清空 lease_seconds，无 confirm
   result = await call(env, "PATCH", "/task/" + shortTask.id, { ...write, ...agentB, body: { status: "done" } });
   assert.equal(result.status, 200);
-  result = await call(env, "POST", "/task/" + shortTask.id + "/confirm", {
-    ...write,
-    body: {
-      decision: "accept",
-      expected_pending: "pending_done",
-      expected_updated_at: result.body.data.updated_at,
-      confirmation_id: result.body.data.confirmation_id,
-    },
-  });
-  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
   row = database.prepare("SELECT lease_seconds, owner_agent_id, claim_token FROM tasks WHERE id = ?").get(shortTask.id);
   assert.equal(row.lease_seconds, null, "终态确认必须清空 lease_seconds");
   assert.equal(row.owner_agent_id, null);

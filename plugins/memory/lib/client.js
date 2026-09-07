@@ -405,10 +405,10 @@ export class SagittaMemoryClient {
   }
 
   /**
-   * 原子认领任务（task-ownership-p2 §4.1；POST /task/{id}/claim）。
+   * 原子认领任务（task-system-v3；POST /task/{id}/claim）。
    * 条件（服务端单条 UPDATE）：status='open'，或 in_progress 且 owner 租约过期/为空。
-   * 成功响应：完整任务投影 + claim_token（唯一一次下发，之后不再出现在任何响应）；
-   * 被占用未过期 → 409 TASK_ALREADY_CLAIMED；pending 任务 → 409 TASK_PENDING_CONFLICT。
+   * 同 owner 的有效租约会续租恢复；claim_token 仅为旧客户端兼容字段，云端 owner_agent_id
+   * 才是会话权威。
    * @param {string} id 任务 id
    * @param {{leaseSeconds?: number}} [opts] lease_seconds（1~604800 秒，缺省=全局默认 24h）
    */
@@ -419,24 +419,32 @@ export class SagittaMemoryClient {
   }
 
   /**
-   * 释放任务认领（task-ownership-p2 §4.2；POST /task/{id}/release）。
-   * 仅持有正确 claim_token 的调用方可释放：清空 owner 字段，in_progress 且无 pending 时
-   * status 回 open。token 缺失 → 422 CLAIM_TOKEN_REQUIRED；不匹配 → 403 CLAIM_TOKEN_MISMATCH。
+   * 释放任务认领（task-system-v3；POST /task/{id}/release）。
+   * 当前 X-Agent-Id 对应的有效云端 owner 可无 token 释放；in_progress 且无 pending 时
+   * status 回 open。非 owner（或已过期租约）→ 403 TASK_CLAIM_OWNER_MISMATCH。
    * 成功响应：完整任务投影（claim_state=unclaimed，不含 claim_token）。
    * @param {string} id 任务 id
-   * @param {string} claimToken 认领时下发一次的凭证（只存进程内存，不进任何输出）
+   * @param {string|{claimToken?: string, agentId?: string}} claimTokenOrOptions 兼容旧 token
+   *   调用；v3 优先传 agentId，token 不授予权限
    */
-  async releaseTask(id, claimToken, signal) {
+  async releaseTask(id, claimTokenOrOptions, signal) {
+    const options = claimTokenOrOptions && typeof claimTokenOrOptions === "object"
+      ? claimTokenOrOptions
+      : { claimToken: claimTokenOrOptions };
+    const body = options.claimToken === undefined || options.claimToken === null || options.claimToken === ""
+      ? {}
+      : { claim_token: options.claimToken };
     return await this.request(`/task/${encodeURIComponent(id)}/release`, {
       method: "POST",
       operation: "write",
-      body: { claim_token: claimToken },
+      body,
       signal,
+      agentId: options.agentId,
     });
   }
 
   /**
-   * 记录任务需要涟漪参与/决定（task-system-v2 §2.3/§10.1）。
+   * 记录任务需要涟漪参与/决定（task-system-v3 §2）。
    * type=need 阻塞 done；type=notify 仅告知涟漪，不阻塞 done。
    */
   async createNeedHuman(taskId, content, suggestion, type = "need", signal) {
@@ -458,11 +466,17 @@ export class SagittaMemoryClient {
     });
   }
 
-  /** 解决/放弃一条 need-human。 */
-  async resolveNeedHuman(needHumanId, resolveKind, signal) {
+  /** 解决/放弃一条 need-human，并按 target 原子流转所属任务（v3）。 */
+  async resolveNeedHuman(needHumanId, resolveKind, target, signal) {
+    // 兼容旧的 positional 调用 resolveNeedHuman(id, kind, signal)。
+    if (target !== undefined && target !== null && typeof target !== "string") {
+      signal = target;
+      target = undefined;
+    }
     const body = resolveKind === undefined || resolveKind === null
       ? {}
       : { resolve_kind: resolveKind };
+    if (target !== undefined && target !== null) body.target = target;
     return await this.request(`/task/need-human/${encodeURIComponent(needHumanId)}/resolve`, {
       method: "POST",
       operation: "write",

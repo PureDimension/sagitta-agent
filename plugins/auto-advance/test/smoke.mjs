@@ -639,11 +639,12 @@ function challengeHarness(autonomousMode, { pendingStatus = null, runningWork = 
   return harness;
 }
 
-// 在场/离开两态质询，且 temp 任务直接豁免。
+// v3：普通 task_update 的 done/blocked 已直落；只有自主 task_round_close 的
+// done/blocked 仍触发在场/离开两态质询，且 temp 任务直接豁免。
 const present = challengeHarness(false);
 const presentResult = await present.service.handleAssistantMessage(present.state, {
   role: "assistant",
-  content: [{ type: "tool-call", name: "task_update", arguments: { task_id: "tsk-work", status: "done" } }],
+  content: [{ type: "tool-call", name: "task_round_close", arguments: { task_id: "tsk-work", action: "done", round_id: "round-present" } }],
 });
 assert.equal(presentResult.challenged, true);
 assert.ok(present.agent.followups[0].content[0].text.includes(IN_PERSON_CHALLENGE));
@@ -651,7 +652,7 @@ assert.ok(present.agent.followups[0].content[0].text.includes(IN_PERSON_CHALLENG
 const away = challengeHarness(true);
 const awayResult = await away.service.handleAssistantMessage(away.state, {
   role: "assistant",
-  content: [{ type: "tool-call", name: "task_update", arguments: { task_id: "tsk-work", status: "blocked" } }],
+  content: [{ type: "tool-call", name: "task_round_close", arguments: { task_id: "tsk-work", action: "blocked", round_id: "round-away" } }],
 });
 assert.equal(awayResult.challenged, true);
 assert.ok(away.agent.followups[0].content[0].text.includes(AUTONOMOUS_CHALLENGE));
@@ -659,7 +660,7 @@ assert.ok(away.agent.followups[0].content[0].text.includes(AUTONOMOUS_CHALLENGE)
 const temp = challengeHarness(false);
 const tempResult = await temp.service.handleAssistantMessage(temp.state, {
   role: "assistant",
-  content: [{ type: "tool-call", name: "task_update", arguments: { task_id: "tsk-temp", status: "done" } }],
+  content: [{ type: "tool-call", name: "task_round_close", arguments: { task_id: "tsk-temp", action: "done", round_id: "round-temp" } }],
 });
 assert.equal(tempResult.ok, true);
 assert.equal(temp.agent.followups.length, 0);
