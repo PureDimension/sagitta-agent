@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS task_events (
   event_id           TEXT PRIMARY KEY,
   task_id            TEXT NOT NULL,
   agent_id           TEXT NOT NULL,
-  event_type         TEXT NOT NULL,       -- round_close | terminal_requested | confirmed | reopened
+  event_type         TEXT NOT NULL,       -- round_close | terminal_requested | confirmed | reopened | need_human_resolved
   round_id           TEXT DEFAULT NULL,
   action             TEXT DEFAULT NULL,  -- update | done | blocked | accept | reopen
   progress           TEXT DEFAULT NULL,

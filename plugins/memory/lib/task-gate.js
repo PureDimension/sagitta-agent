@@ -93,6 +93,12 @@ export function createTaskGate({ getAgent, loadCloudClaims } = {}) {
   const claims = [];
   const cloudClaims = new Map();
 
+  const clearLocalClaims = (ownerAgentId) => {
+    for (let index = claims.length - 1; index >= 0; index--) {
+      if (claims[index].ownerAgentId === ownerAgentId) claims.splice(index, 1);
+    }
+  };
+
   const replaceCloudClaims = (tasks, agent) => {
     const ownerAgentId = agentIdOf(agent);
     const next = [];
@@ -100,6 +106,15 @@ export function createTaskGate({ getAgent, loadCloudClaims } = {}) {
       const normalized = normalizeClaim(task);
       if (!normalized || task?.claim_state !== "mine") continue;
       next.push({ ...normalized, ownerAgentId });
+    }
+    // The Worker is authoritative. A successful refresh must also evict a
+    // process-local claim that disappeared from the cloud projection; keeping
+    // the two ledgers merged would make task_assert_bound report a false bind.
+    const liveTaskIds = new Set(next.map((claim) => claim.taskId));
+    for (let index = claims.length - 1; index >= 0; index--) {
+      if (claims[index].ownerAgentId === ownerAgentId && !liveTaskIds.has(claims[index].taskId)) {
+        claims.splice(index, 1);
+      }
     }
     cloudClaims.set(ownerAgentId, next);
     return next.map(({ taskId, kind, status }) => ({ taskId, kind, status }));
@@ -122,8 +137,11 @@ export function createTaskGate({ getAgent, loadCloudClaims } = {}) {
       try {
         return replaceCloudClaims(await loadCloudClaims(agent), agent);
       } catch {
-        // Keep a known cache on a transient cloud failure; the next refresh
-        // can still rebuild it from the Worker.
+        // A failed authority read must fail closed: a stale local claim must
+        // not authorize an execution tool. The next refresh can rebuild it.
+        const ownerAgentId = agentIdOf(agent);
+        clearLocalClaims(ownerAgentId);
+        cloudClaims.set(ownerAgentId, []);
         return [];
       }
     },

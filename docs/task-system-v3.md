@@ -40,12 +40,18 @@ v3 不增加列，保留现有数据结构。
 - resolve 不检查任务认领，不受执行门禁；任何有写权限的调用方都可 resolve。
 - 请求支持 `target=open|in_progress|blocked|done`，缺省 `open`。解除当前 need 与
   任务状态流转在同一 D1 batch 中完成。
+- `type=notify` 仅是信息通知；resolve notify（包括旧客户端误传 target）只关闭通知，
+  不改变所属任务的 status、done_at 或 claim。need 的 target 语义不适用于 notify。
 - `target=done` 只有在本条 resolve 后没有其他 open `type=need` 时允许，否则返回
   `TASK_NEED_HUMAN_OPEN`，need 不会被误标 resolved。
 - `target=open/in_progress` 清除 `blocked_reason`；`target=done` 写 `done_at` 并释放
   owner；`target=blocked` 保留已有 `blocked_reason`，若为空使用本条 need 的 content
   作为服务端阻塞原因，以满足既有状态不变量。
 - need 可以多挂；open need 只阻挡 done，不阻挡仍有其他可推进工作的任务继续推进。
+
+resolve 会追加 `task_events.event_type=need_human_resolved` 审计事件；claim/release、
+普通 PATCH 与外部直接状态写入仍应视为独立的状态变更审计缺口，不能仅凭现有
+`task_events` 当作完整状态历史。
 
 ### 3. 状态简化
 

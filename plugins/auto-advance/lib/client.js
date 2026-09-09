@@ -729,6 +729,7 @@ window.__ModuleLoader__.load({
       let busy = false;
       let lastState;
       let tasks;
+      let taskSessionId;
       let taskScrollTop = 0;
       let resolvingNeedHumanId;
 
@@ -1018,14 +1019,21 @@ window.__ModuleLoader__.load({
         const sessionId = currentSessionId(ctx);
         if (sessionId === undefined) {
           lastState = undefined;
+          tasks = undefined;
+          taskSessionId = undefined;
           render();
           return;
         }
+        // A floating panel survives session switches. Never render the
+        // previous session's task projection while the new one is loading.
+        const sessionChanged = taskSessionId !== undefined && taskSessionId !== sessionId;
+        if (sessionChanged) tasks = undefined;
+        if (taskSessionId !== sessionId) taskSessionId = sessionId;
         try {
           const result = await remoteApi.getState(sessionId);
           if (result?.ok === false) throw new Error(result.error?.message ?? "状态读取失败");
           lastState = result?.value ?? result;
-          if (forceTasks || tasks === undefined) {
+          if (forceTasks || sessionChanged || tasks === undefined) {
             const taskResult = await remoteApi.getTasks(sessionId);
             if (taskResult?.ok === false) throw new Error(taskResult.error?.message ?? "任务读取失败");
             tasks = taskResult?.value ?? taskResult;

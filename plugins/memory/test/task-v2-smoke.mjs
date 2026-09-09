@@ -246,6 +246,29 @@ try {
   assert.match(gate.guard({ name: "codex_dispatch", arguments: { task_id: "tsk-other" }, agent }), /必须先 task_claim/);
   gate.forgetClaim("tsk-temp-owned", agent);
   assert.equal(gate.assertBound(undefined, agent).length, 0);
+
+  // 云端 projection 是权威：外部 UI 释放/重置任务后，成功 refresh 必须淘汰
+  // 进程内旧 claim，不能让 task_assert_bound 继续返回 false positive。
+  let cloudReadFails = false;
+  let cloudTasks = [task("tsk-drift", { status: "in_progress", claim_state: "mine" })];
+  const driftGate = createTaskGate({
+    loadCloudClaims: async () => {
+      if (cloudReadFails) throw new Error("cloud unavailable");
+      return cloudTasks;
+    },
+  });
+  driftGate.recordClaim({ id: "tsk-drift", status: "in_progress" }, agent);
+  await driftGate.refreshCloud(agent);
+  assert.equal(driftGate.hasBound("tsk-drift", agent), true);
+  cloudTasks = [task("tsk-drift", { status: "open", claim_state: "unclaimed" })];
+  await driftGate.refreshCloud(agent);
+  assert.equal(driftGate.hasBound("tsk-drift", agent), false);
+
+  // 云端读取失败也 fail closed，避免旧 registry 越过执行门禁。
+  driftGate.recordClaim({ id: "tsk-drift", status: "in_progress" }, agent);
+  cloudReadFails = true;
+  await driftGate.refreshCloud(agent);
+  assert.equal(driftGate.hasBound("tsk-drift", agent), false);
   assert.equal("claim_token" in pickTask(claimed), false);
 
   console.log("memory task v2 smoke: PASS (need/notify create + resolve/list type passthrough, temp create/filter, claim recall mock, task_assert_bound gate)");

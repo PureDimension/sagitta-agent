@@ -490,6 +490,48 @@ test("v3 need-human resolve target supports four states and is free to another c
   assert.match(result.body.data.task.done_at, /^20/);
 });
 
+test("notify resolve never changes task status, done_at, or claim", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v3", title: "notify must be informational", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const progressing = result.body.data;
+  result = await call(env, "POST", "/task/" + progressing.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  result = await call(env, "POST", "/task/" + progressing.id + "/need-human", {
+    ...write, body: { type: "notify", content: "可安排验证" },
+  });
+  const progressingNotify = result.body.data;
+  result = await call(env, "POST", "/task/need-human/" + progressingNotify.id + "/resolve", {
+    ...write, ...agentB, body: {},
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.target, null);
+  assert.equal(result.body.data.task.status, "in_progress");
+  assert.equal(result.body.data.task.claim_state, "claimed");
+  result = await call(env, "GET", "/task/" + progressing.id, { ...read, ...agentA });
+  assert.equal(result.body.data.status, "in_progress");
+  assert.equal(result.body.data.claim_state, "mine");
+
+  result = await call(env, "PATCH", "/task/" + progressing.id, {
+    ...write, ...agentA, body: { status: "done" },
+  });
+  assert.equal(result.status, 200);
+  const doneAt = result.body.data.done_at;
+  result = await call(env, "POST", "/task/" + progressing.id + "/need-human", {
+    ...write, body: { type: "notify", content: "终态通知" },
+  });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", {
+    ...write, body: {},
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "done");
+  assert.equal(result.body.data.task.done_at, doneAt);
+});
+
 test("pending invariants, terminal create rejection, PATCH whitelist, and confirm idempotency", async () => {
   const { env } = taskEnv();
   const read = { token: env.D1_READ_TOKEN };

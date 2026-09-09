@@ -1437,6 +1437,7 @@ async function createNeedHumanHandler(db, taskIdValue, body) {
 
 // POST /task/need-human/{nhid}/resolve —— 自由解除一条 need-human，并按 target
 // 原子流转所属任务。此路由刻意不检查 claim：涟漪或其他有写权限的调用方都可处理。
+// type=notify 只是信息通知；resolve notify 只能关闭通知，不能改变所属任务状态或 claim。
 async function resolveNeedHumanHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
   const forbidden = Object.keys(body).filter((field) => !['resolved_by', 'resolve_kind', 'target'].includes(field));
@@ -1452,8 +1453,8 @@ async function resolveNeedHumanHandler(db, id, body, request, env) {
       !TASK_NEED_HUMAN_RESOLVE_KINDS.includes(body.resolve_kind)) {
     return jsonError(422, 'INVALID_RESOLVE_KIND', 'resolve_kind 必须是 solved 或 abandoned');
   }
-  const target = body.target === undefined || body.target === null ? 'open' : body.target;
-  if (!TASK_NEED_HUMAN_TARGETS.includes(target)) {
+  const requestedTarget = body.target === undefined || body.target === null ? 'open' : body.target;
+  if (!TASK_NEED_HUMAN_TARGETS.includes(requestedTarget)) {
     return jsonError(422, 'INVALID_NEED_HUMAN_TARGET', 'target 必须是：' + TASK_NEED_HUMAN_TARGETS.join(' / '));
   }
 
@@ -1463,12 +1464,16 @@ async function resolveNeedHumanHandler(db, id, body, request, env) {
 
   const task = await getTaskRow(db, current.task_id);
   if (!task) return jsonError(404, 'TASK_NOT_FOUND', 'need-human 所属任务不存在：' + current.task_id);
+  const isNotify = current.type === 'notify';
+  // notify 与 need 共用 resolve API，但 notify 不应继承 need 的默认 target=open；
+  // 否则 UI 的“确认通知”（不传 target）会把 done/in_progress 任务重置为 open。
+  const target = isNotify ? null : requestedTarget;
   // Pending 是旧数据/round-close 的确认协议，resolve 不能绕过它；保留旧 confirm
   // 流程，避免 v3 的自由 resolve 意外把在途申请直接改写掉。
-  if (task.pending_status !== null) {
+  if (!isNotify && task.pending_status !== null) {
     return taskPendingConflict('任务已有 pending 终态申请，请先按 confirm 流程处理', task, requestAgentId(request, env));
   }
-  if (target === 'done') {
+  if (!isNotify && target === 'done') {
     const otherOpenNeed = await db.prepare(
       "SELECT id FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need' AND id <> ? LIMIT 1"
     ).bind(current.task_id, id).first();
@@ -1479,6 +1484,36 @@ async function resolveNeedHumanHandler(db, id, body, request, env) {
   const resolve = db.prepare(
     "UPDATE task_need_human SET status = 'resolved', resolved_at = ?, resolved_by = ? WHERE id = ? AND status = 'open'"
   ).bind(now, resolvedBy, id);
+  const eventId = crypto.randomUUID();
+  const eventPayload = {
+    kind: 'need_human_resolved',
+    need_human_id: id,
+    need_human_type: current.type,
+    resolve_kind: body.resolve_kind ?? null,
+    requested_target: requestedTarget,
+    target,
+    task_status_before: task.status,
+    task_status_after: target === null ? task.status : target,
+    task_changed: target !== null,
+  };
+  const event = db.prepare(
+    'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
+    'SELECT ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ? WHERE changes() = 1'
+  ).bind(
+    eventId, current.task_id, callerAgentId(request, env), 'need_human_resolved', 'resolve',
+    JSON.stringify(eventPayload), now
+  );
+  if (isNotify) {
+    await db.batch([resolve, event]);
+    const resolved = serializeNeedHuman(await getNeedHumanRow(db, id));
+    const unchangedTask = await getTaskRow(db, current.task_id);
+    return jsonOk({
+      ...resolved,
+      target: null,
+      target_ignored: requestedTarget,
+      task: serializeTask(unchangedTask, {}, requestAgentId(request, env)),
+    });
+  }
   const blockedReason = target === 'blocked'
     ? (isNonEmptyString(task.blocked_reason) ? task.blocked_reason : current.content)
     : null;
@@ -1491,7 +1526,7 @@ async function resolveNeedHumanHandler(db, id, body, request, env) {
     ' WHERE id = ? AND archived = 0 AND EXISTS (' +
     "SELECT 1 FROM task_need_human WHERE id = ? AND status = 'resolved' AND resolved_at = ? )"
   ).bind(target, blockedReason, doneAt, now, current.task_id, id, now);
-  await db.batch([resolve, reopen]);
+  await db.batch([resolve, reopen, event]);
   const resolved = serializeNeedHuman(await getNeedHumanRow(db, id));
   const updatedTask = await getTaskRow(db, current.task_id);
   return jsonOk({ ...resolved, target, task: serializeTask(updatedTask, {}, requestAgentId(request, env)) });
