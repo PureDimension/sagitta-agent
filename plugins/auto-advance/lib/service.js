@@ -24,6 +24,11 @@ const ASYNC_WORK_SETTLED_EVENT = "async-work/settled";
 const DEFAULT_IDLE_TIMEOUT_MS = 15000;
 const DEFAULT_TASK_API_TIMEOUT_MS = 3000;
 const DEFAULT_TASK_PAGE_SIZE = 200;
+const DEFAULT_CODEX_MAX_CONCURRENT = 4;
+const DEFAULT_ADVANCE_PROMPT_COOLDOWN_MS = 30000;
+const DEFAULT_ADVANCE_PROMPT_BACKOFF_FACTOR = 2;
+const DEFAULT_ADVANCE_PROMPT_MAX_COOLDOWN_MS = 300000;
+const DEFAULT_ADVANCE_PROMPT_MAX_INJECTIONS = 3;
 const TASK_RECHECK_DELAY_MS = 30000;
 const PROCESS_SHUTDOWN_TASK_BUDGET_MS = 4500;
 const PROCESS_SHUTDOWN_BLOCKED_REASON = "sagitta 进程中断退出";
@@ -216,9 +221,25 @@ function resolveConfiguredPaths(config = {}) {
 
 function normalizeConfig(config = {}) {
   const idleTimeoutMs = Number(config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
+  const codexMaxConcurrent = Number(config.codexMaxConcurrent ?? process.env.SAGITTA_CODEX_MAX_CONCURRENT ?? DEFAULT_CODEX_MAX_CONCURRENT);
+  const advancePromptCooldownMs = Number(config.advancePromptCooldownMs ?? DEFAULT_ADVANCE_PROMPT_COOLDOWN_MS);
+  const advancePromptBackoffFactor = Number(config.advancePromptBackoffFactor ?? DEFAULT_ADVANCE_PROMPT_BACKOFF_FACTOR);
+  const advancePromptMaxCooldownMs = Number(config.advancePromptMaxCooldownMs ?? DEFAULT_ADVANCE_PROMPT_MAX_COOLDOWN_MS);
+  const normalizedAdvancePromptCooldownMs = Number.isFinite(advancePromptCooldownMs) && advancePromptCooldownMs >= 0
+    ? advancePromptCooldownMs : DEFAULT_ADVANCE_PROMPT_COOLDOWN_MS;
+  const advancePromptMaxInjections = Number(config.advancePromptMaxInjections ?? DEFAULT_ADVANCE_PROMPT_MAX_INJECTIONS);
   const paths = resolveConfiguredPaths(config);
   return {
     idleTimeoutMs: Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0 ? idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
+    codexMaxConcurrent: Number.isInteger(codexMaxConcurrent) && codexMaxConcurrent > 0
+      ? codexMaxConcurrent : DEFAULT_CODEX_MAX_CONCURRENT,
+    advancePromptCooldownMs: normalizedAdvancePromptCooldownMs,
+    advancePromptBackoffFactor: Number.isFinite(advancePromptBackoffFactor) && advancePromptBackoffFactor >= 1
+      ? advancePromptBackoffFactor : DEFAULT_ADVANCE_PROMPT_BACKOFF_FACTOR,
+    advancePromptMaxCooldownMs: Number.isFinite(advancePromptMaxCooldownMs) && advancePromptMaxCooldownMs >= 0
+      ? Math.max(normalizedAdvancePromptCooldownMs, advancePromptMaxCooldownMs) : DEFAULT_ADVANCE_PROMPT_MAX_COOLDOWN_MS,
+    advancePromptMaxInjections: Number.isInteger(advancePromptMaxInjections) && advancePromptMaxInjections > 0
+      ? advancePromptMaxInjections : DEFAULT_ADVANCE_PROMPT_MAX_INJECTIONS,
     statePath: paths.statePath,
     tasksPath: paths.tasksPath,
     taskApiTimeoutMs: Number.isFinite(Number(config.taskApiTimeoutMs)) && Number(config.taskApiTimeoutMs) > 0
@@ -315,6 +336,22 @@ function taskIdFromArgs(args) {
 function taskType(value) {
   const type = value?.type ?? value?.task_type ?? value?.taskType ?? value?.kind;
   return typeof type === "string" ? type.trim().toLowerCase() : "";
+}
+
+function taskNeedsCodex(task) {
+  if (!isRecord(task)) return true;
+  if (task.requires_codex === false || task.requiresCodex === false || task.codex_required === false || task.codexRequired === false) return false;
+  if (task.requires_codex === true || task.requiresCodex === true || task.codex_required === true || task.codexRequired === true) return true;
+  const resource = task.execution_resource ?? task.executionResource ?? task.resource;
+  if (typeof resource === "string") {
+    const normalized = resource.trim().toLowerCase();
+    if (["none", "model", "agent", "local", "human", "manual"].includes(normalized)) return false;
+    if (["codex", "codex_dispatch", "codex-dispatch"].includes(normalized)) return true;
+  }
+  // The task API has no execution-resource contract. An owned in_progress task
+  // is therefore conservatively treated as codex-capable unless it explicitly
+  // opts out; this prevents a full codex pool from triggering blind prompts.
+  return true;
 }
 
 function isTempTask(task, args = {}) {
@@ -421,6 +458,7 @@ class AutoAdvanceService extends TypertRemoteService {
       state.pendingAutoMode = undefined;
       state.settledWorkIds = new Set();
       state.lastProtocolNotice = null;
+      this.resetAdvancePromptBackoff(state);
       this.resetTimer(state, "session-start");
     });
     ctx.on("agent/status", ({ agent, status }) => {
@@ -562,6 +600,7 @@ class AutoAdvanceService extends TypertRemoteService {
     state.autonomousMode = false;
     state.pendingAutoMode = undefined;
     state.ownedTaskIds = new Set();
+    this.resetAdvancePromptBackoff(state);
     this.persistedModes.set(agent.id, state.enabled);
     this.persistModes();
     if (state.enabled) this.maybeArm(state);
@@ -705,7 +744,10 @@ class AutoAdvanceService extends TypertRemoteService {
       autonomousMode: false,
       pendingAutoMode: undefined,
       settledWorkIds: new Set(),
-      lastProtocolNotice: null
+      lastProtocolNotice: null,
+      advancePromptFingerprint: undefined,
+      advancePromptInjections: 0,
+      advancePromptNextAt: 0
     };
     this.states.set(agent, state);
     return state;
@@ -721,6 +763,103 @@ class AutoAdvanceService extends TypertRemoteService {
     } catch {
       return undefined;
     }
+  }
+
+  codexResourceStatus(state) {
+    const configuredLimit = Number(this.config.codexMaxConcurrent ?? DEFAULT_CODEX_MAX_CONCURRENT);
+    const limit = Number.isInteger(configuredLimit) && configuredLimit > 0 ? configuredLimit : DEFAULT_CODEX_MAX_CONCURRENT;
+    const asyncWork = this.getAsyncWorkService();
+    if (asyncWork === undefined || typeof asyncWork.listActive !== "function") {
+      return { known: false, active: null, limit, saturated: true };
+    }
+    try {
+      const works = asyncWork.listActive(state.agent.id, {});
+      if (!Array.isArray(works)) throw new Error("listActive did not return an array");
+      const active = works.filter((work) =>
+        (work?.status === undefined || work.status === "running") &&
+        String(work?.kind ?? "").trim().toLowerCase() === "codex"
+      ).length;
+      return { known: true, active, limit, saturated: active >= limit };
+    } catch (error) {
+      safeLog(() => this.logger(), "warn", `sagitta-auto-advance: codex resource check failed: ${renderError(error)}`);
+      return { known: false, active: null, limit, saturated: true };
+    }
+  }
+
+  resourceLimitedOwnedTasks(state, snapshot = state.cloudSnapshot, resourceStatus = this.codexResourceStatus(state)) {
+    if (resourceStatus.saturated !== true) return [];
+    return this.ownedInProgressTasks(state, snapshot).filter((task) =>
+      task?.pending_status === null && !this.hasRunningWork(state.agent, task.task_id ?? task.id) && taskNeedsCodex(task)
+    );
+  }
+
+  advancePromptFingerprint(tasks) {
+    return (Array.isArray(tasks) ? tasks : [])
+      .map((task) => ({
+        id: task?.task_id ?? task?.id ?? "",
+        status: task?.status ?? "",
+        pending: task?.pending_status ?? null,
+        updated: task?.updated_at ?? task?.updatedAt ?? null,
+        title: task?.title ?? task?.text ?? "",
+        acceptance: task?.acceptance ?? ""
+      }))
+      .sort((first, second) => String(first.id).localeCompare(String(second.id)))
+      .map((task) => JSON.stringify(task))
+      .join("|");
+  }
+
+  resetAdvancePromptBackoff(state) {
+    state.advancePromptFingerprint = undefined;
+    state.advancePromptInjections = 0;
+    state.advancePromptNextAt = 0;
+  }
+
+  advancePromptSettings() {
+    const cooldown = Number(this.config.advancePromptCooldownMs ?? DEFAULT_ADVANCE_PROMPT_COOLDOWN_MS);
+    const factor = Number(this.config.advancePromptBackoffFactor ?? DEFAULT_ADVANCE_PROMPT_BACKOFF_FACTOR);
+    const maxCooldown = Number(this.config.advancePromptMaxCooldownMs ?? DEFAULT_ADVANCE_PROMPT_MAX_COOLDOWN_MS);
+    const maxInjections = Number(this.config.advancePromptMaxInjections ?? DEFAULT_ADVANCE_PROMPT_MAX_INJECTIONS);
+    const normalizedCooldown = Number.isFinite(cooldown) && cooldown >= 0 ? cooldown : DEFAULT_ADVANCE_PROMPT_COOLDOWN_MS;
+    const normalizedFactor = Number.isFinite(factor) && factor >= 1 ? factor : DEFAULT_ADVANCE_PROMPT_BACKOFF_FACTOR;
+    const normalizedMaxCooldown = Number.isFinite(maxCooldown) && maxCooldown >= 0
+      ? Math.max(normalizedCooldown, maxCooldown) : DEFAULT_ADVANCE_PROMPT_MAX_COOLDOWN_MS;
+    const normalizedMaxInjections = Number.isInteger(maxInjections) && maxInjections > 0
+      ? maxInjections : DEFAULT_ADVANCE_PROMPT_MAX_INJECTIONS;
+    return {
+      cooldown: normalizedCooldown,
+      factor: normalizedFactor,
+      maxCooldown: normalizedMaxCooldown,
+      maxInjections: normalizedMaxInjections
+    };
+  }
+
+  canInjectAdvancePrompt(state, tasks, now = Date.now()) {
+    const fingerprint = this.advancePromptFingerprint(tasks);
+    if (state.advancePromptFingerprint !== fingerprint) {
+      state.advancePromptFingerprint = fingerprint;
+      state.advancePromptInjections = 0;
+      state.advancePromptNextAt = 0;
+    }
+    const settings = this.advancePromptSettings();
+    return state.advancePromptInjections < settings.maxInjections && now >= (state.advancePromptNextAt ?? 0);
+  }
+
+  recordAdvancePrompt(state, tasks, now = Date.now()) {
+    const fingerprint = this.advancePromptFingerprint(tasks);
+    if (state.advancePromptFingerprint !== fingerprint) {
+      state.advancePromptFingerprint = fingerprint;
+      state.advancePromptInjections = 0;
+    }
+    const settings = this.advancePromptSettings();
+    state.advancePromptInjections += 1;
+    const exponent = Math.max(0, state.advancePromptInjections - 1);
+    const delay = Math.min(settings.maxCooldown, settings.cooldown * Math.pow(settings.factor, exponent));
+    state.advancePromptNextAt = now + delay;
+  }
+
+  advancePromptRetryDelay(state, now = Date.now()) {
+    const remaining = Math.max(0, Number(state.advancePromptNextAt ?? 0) - now);
+    return remaining > 0 ? remaining : TASK_RECHECK_DELAY_MS;
   }
 
   handleAsyncWorkSettled(settled) {
@@ -829,10 +968,12 @@ class AutoAdvanceService extends TypertRemoteService {
     );
   }
 
-  actionableOwnedTasks(state, snapshot = state.cloudSnapshot) {
+  actionableOwnedTasks(state, snapshot = state.cloudSnapshot, resourceStatus = this.codexResourceStatus(state)) {
     return this.ownedInProgressTasks(state, snapshot).filter((task) =>
       // need 型 open 条目只阻塞 done 申请；need 之外仍可自主推进的工作不应被挡住。
-      task?.pending_status === null && !this.hasRunningWork(state.agent, task.task_id ?? task.id)
+      task?.pending_status === null &&
+      !this.hasRunningWork(state.agent, task.task_id ?? task.id) &&
+      !(resourceStatus.saturated === true && taskNeedsCodex(task))
     );
   }
 
@@ -1028,19 +1169,22 @@ class AutoAdvanceService extends TypertRemoteService {
     this.syncOwnedTasks(state, snapshot);
     if (hasPendingInbox(state.agent)) return { ignored: true };
 
-    const unfinished = this.ownedInProgressTasks(state, snapshot).filter((task) =>
-      !isTempTask(task) && task?.pending_status === null && !this.hasRunningWork(state.agent, task.task_id ?? task.id)
-    );
+    const unfinished = this.actionableOwnedTasks(state, snapshot).filter((task) => !isTempTask(task));
     if (unfinished.length === 0) return { ok: true };
 
+    if (!this.canInjectAdvancePrompt(state, unfinished)) {
+      return { ok: true, deferred: true, taskIds: unfinished.map((task) => task.task_id ?? task.id) };
+    }
+
     const taskLines = unfinished.map((task) => `task_id=${task.task_id ?? task.id}`);
-    this.queueNotice(
+    const queued = this.queueNotice(
       state,
       `${AUTONOMOUS_TURN_END_CHALLENGE}\n未收尾任务：${taskLines.join("，")}`,
       "autonomous in-progress task challenge",
       "injected: autonomous-in-progress-challenge",
       { autonomous: true }
     );
+    if (queued) this.recordAdvancePrompt(state, unfinished);
     return { ok: false, challenged: true, taskIds: unfinished.map((task) => task.task_id ?? task.id) };
   }
 
@@ -1064,13 +1208,14 @@ class AutoAdvanceService extends TypertRemoteService {
     this.broadcast(state, "defer: task-api-unavailable");
   }
 
-  scheduleTaskRecheck(state, generation, reason = "defer: task-driven-wait") {
+  scheduleTaskRecheck(state, generation, reason = "defer: task-driven-wait", delayMs = TASK_RECHECK_DELAY_MS) {
     if (!this.isCurrentRun(state, generation) || state.timer !== undefined) return;
     state.retrying = true;
     state.idleSince = null;
     // Keep pending/running work quiet for longer than the ordinary 15s idle
     // probe; this is a recheck, not another prompt injection cadence.
-    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, TASK_RECHECK_DELAY_MS);
+    const delay = Number.isFinite(Number(delayMs)) && Number(delayMs) >= 0 ? Number(delayMs) : TASK_RECHECK_DELAY_MS;
+    state.timer = setTimeout(() => { void this.onTimer(state, generation); }, delay);
     state.timer.unref?.();
     this.broadcast(state, reason);
   }
@@ -1128,8 +1273,18 @@ class AutoAdvanceService extends TypertRemoteService {
       state.degradedReason = null;
 
       const owned = this.ownedInProgressTasks(state, snapshot);
-      const actionable = this.actionableOwnedTasks(state, snapshot);
+      const codexResource = this.codexResourceStatus(state);
+      const actionable = this.actionableOwnedTasks(state, snapshot, codexResource);
       if (actionable.length > 0) {
+        if (!this.canInjectAdvancePrompt(state, actionable)) {
+          this.scheduleTaskRecheck(
+            state,
+            generation,
+            "defer: advance-prompt-backoff",
+            this.advancePromptRetryDelay(state)
+          );
+          return;
+        }
         const lines = actionable.map((task) => {
           const title = typeof task.title === "string" ? task.title.trim() : "";
           const project = typeof task.project === "string" && task.project.trim() ? ` project=${JSON.stringify(task.project.trim())}` : "";
@@ -1153,11 +1308,21 @@ class AutoAdvanceService extends TypertRemoteService {
         const fullPrompt = accBlocks.length > 0
           ? `${prompt}\n\n请逐项核对每个任务的期望目标：确认每一项是否还有可在人工介入之前推进的空间；有就推进，没有才按收口规则处理——需人工且【除 need-human 外已无其他可独自推进项】才 need-human+blocked；重大决策发 notify（不阻塞 done）；期望目标全达则 done。${accBlocks.join("\n")}`
           : prompt;
-        this.queuePrompt(state, generation, fullPrompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
+        const queued = this.queuePrompt(state, generation, fullPrompt, "owned in-progress tasks", "injected: owned-in-progress", { autonomous: true });
+        if (queued) this.recordAdvancePrompt(state, actionable);
         return;
       }
 
       if (owned.length > 0) {
+        const resourceLimited = this.resourceLimitedOwnedTasks(state, snapshot, codexResource);
+        if (resourceLimited.length > 0) {
+          // Resource waiting must not consume the continuation-prompt budget;
+          // after a slot is released the unchanged task may receive one normal
+          // prompt again, subject to the ordinary backoff from that point.
+          this.resetAdvancePromptBackoff(state);
+          this.scheduleTaskRecheck(state, generation, "defer: codex-resource-limit");
+          return;
+        }
         // Need 型 open 条目不阻塞推进；走到这里仅表示所有 owned 任务都在
         // 等 pending 申请确认或绑定的有界工作运行中。不要重复注入，安静轮询。
         this.scheduleTaskRecheck(state, generation, "defer: pending-or-running-work");
@@ -1759,8 +1924,14 @@ export {
   AUTONOMOUS_TURN_END_CHALLENGE,
   STOP_MARKER,
   DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_CODEX_MAX_CONCURRENT,
+  DEFAULT_ADVANCE_PROMPT_COOLDOWN_MS,
+  DEFAULT_ADVANCE_PROMPT_BACKOFF_FACTOR,
+  DEFAULT_ADVANCE_PROMPT_MAX_COOLDOWN_MS,
+  DEFAULT_ADVANCE_PROMPT_MAX_INJECTIONS,
   TASK_RECHECK_DELAY_MS,
   hasPendingInbox,
+  taskNeedsCodex,
   isExactStopMessage,
   readTasks,
   readTasksFromApi,

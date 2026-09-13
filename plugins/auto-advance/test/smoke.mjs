@@ -10,8 +10,10 @@ import {
   IN_PERSON_CHALLENGE,
   AUTONOMOUS_CHALLENGE,
   AUTONOMOUS_TURN_END_CHALLENGE,
+  DEFAULT_CODEX_MAX_CONCURRENT,
   TASK_RECHECK_DELAY_MS,
   normalizeConfig,
+  taskNeedsCodex,
   buildTaskAuthHeaders,
   isLoopbackUrl,
   hasOpenNeedHuman,
@@ -68,6 +70,23 @@ assert.equal(normalizeConfig({
   statePath: join(tmpdir(), "sagitta-auto-advance-default-state.json"),
   tasksPath: join(tmpdir(), "sagitta-auto-advance-default-TASKS.md"),
 }).idleTimeoutMs, 15000);
+assert.equal(normalizeConfig({
+  statePath: join(tmpdir(), "sagitta-auto-advance-resource-state.json"),
+  tasksPath: join(tmpdir(), "sagitta-auto-advance-resource-TASKS.md"),
+  codexMaxConcurrent: 2,
+  advancePromptCooldownMs: 250,
+  advancePromptBackoffFactor: 3,
+  advancePromptMaxCooldownMs: 1000,
+  advancePromptMaxInjections: 2,
+}).codexMaxConcurrent, 2);
+assert.equal(DEFAULT_CODEX_MAX_CONCURRENT, 4);
+assert.equal(taskNeedsCodex({ requires_codex: false }), false);
+assert.equal(taskNeedsCodex({ execution_resource: "local" }), false);
+assert.equal(taskNeedsCodex({ execution_resource: "codex" }), true);
+assert.equal(taskNeedsCodex({}), true, "missing resource metadata is conservatively codex-capable");
+const serviceSource = readFileSync(new URL("../lib/service.js", import.meta.url), "utf8");
+assert.doesNotMatch(serviceSource, /(?:from|import)\s+["'][^"']*codex-dispatch/u, "resource sensing must not import the codex plugin");
+assert.match(serviceSource, /asyncWork\.listActive\(state\.agent\.id, \{\}\)/u, "resource sensing must use the generic registry");
 assert.equal(TASK_RECHECK_DELAY_MS, 30000, "pending/running recheck remains quieter than the 15s idle probe");
 assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "notify", status: "open" }] }), false);
 assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "need", status: "open" }] }), true);
@@ -186,7 +205,7 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const workerUrl = `http://127.0.0.1:${server.address().port}`;
 
-function makeHarness({ api = true, runningWork = false, recentWorks = [], enabled = true } = {}) {
+function makeHarness({ api = true, runningWork = false, activeWorks, codexActiveCount = 0, recentWorks = [], enabled = true } = {}) {
   const agent = {
     id: "agent-smoke",
     status: "idle",
@@ -204,8 +223,7 @@ function makeHarness({ api = true, runningWork = false, recentWorks = [], enable
     },
   };
   const events = [];
-  const asyncWork = {
-    listActive: (ownerId) => ownerId === agent.id && runningWork ? [{
+  let currentActiveWorks = Array.isArray(activeWorks) ? [...activeWorks] : (runningWork ? [{
       work_id: "work-running",
       task_id: "tsk-work",
       kind: "codex",
@@ -213,7 +231,22 @@ function makeHarness({ api = true, runningWork = false, recentWorks = [], enable
       started_at: "2026-09-07T00:00:00.000Z",
       timeout_ms: 60000,
       status: "running"
-    }] : [],
+    }] : []);
+  for (let index = 0; index < codexActiveCount; index++) currentActiveWorks.push({
+    work_id: `work-slot-${index + 1}`,
+    task_id: `tsk-other-${index + 1}`,
+    kind: "codex",
+    desc: "占用 codex 槽位",
+    started_at: "2026-09-07T00:00:00.000Z",
+    timeout_ms: 60000,
+    status: "running"
+  });
+  const asyncWork = {
+    listActive: (ownerId, filter = {}) => {
+      if (ownerId !== agent.id) return [];
+      const taskId = filter?.taskId ?? filter?.task_id;
+      return taskId === undefined ? currentActiveWorks : currentActiveWorks.filter((work) => work.task_id === taskId);
+    },
     listRecent: (ownerId) => ownerId === agent.id ? recentWorks : []
   };
   const ctx = {
@@ -273,6 +306,7 @@ function makeHarness({ api = true, runningWork = false, recentWorks = [], enable
     agent,
     ctx,
     events,
+    setActiveWorks(next) { currentActiveWorks = Array.isArray(next) ? [...next] : []; },
   };
 }
 
@@ -408,6 +442,45 @@ try {
   assert.match(ownedHarness.agent.followups[0].content[0].text, /逐项核对每个任务的期望目标/u);
   assert.doesNotMatch(ownedHarness.agent.followups[0].content[0].text, /task_round_close|round-close/iu);
   assert.equal(ownedHarness.state.pendingAutoMode, "away");
+
+  // Codex slots are a real resource boundary: a full registry is silent, and
+  // the same task resumes normal prompting as soon as a slot is released.
+  responseMode = "owned";
+  const resourceHarness = makeHarness({ codexActiveCount: 2 });
+  resourceHarness.service.config.codexMaxConcurrent = 2;
+  await resourceHarness.service.onTimer(resourceHarness.state, 1);
+  assert.equal(resourceHarness.agent.followups.length, 0, "full codex pool must not inject an owned-task prompt");
+  assert.deepEqual(resourceHarness.service.actionableOwnedTasks(resourceHarness.state, resourceHarness.state.cloudSnapshot).map((item) => item.task_id), []);
+  assert.ok(resourceHarness.events.some((event) => event.reason === "defer: codex-resource-limit"));
+  resourceHarness.service.clearTimer(resourceHarness.state);
+  resourceHarness.setActiveWorks([]);
+  await resourceHarness.service.onTimer(resourceHarness.state, resourceHarness.state.timerGeneration);
+  assert.equal(resourceHarness.agent.followups.length, 1, "prompt must resume after a codex slot is released");
+  assert.match(resourceHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
+
+  // Continuation prompts use exponential cooldown and stop at the configured
+  // maximum for an unchanged task snapshot.
+  const backoffHarness = makeHarness();
+  backoffHarness.service.config.advancePromptCooldownMs = 100;
+  backoffHarness.service.config.advancePromptBackoffFactor = 2;
+  backoffHarness.service.config.advancePromptMaxCooldownMs = 1000;
+  backoffHarness.service.config.advancePromptMaxInjections = 2;
+  const backoffTask = task("tsk-backoff", "in_progress", null, { claim_state: "mine" });
+  backoffHarness.service.recordAdvancePrompt(backoffHarness.state, [backoffTask], 1000);
+  assert.equal(backoffHarness.state.advancePromptNextAt, 1100);
+  backoffHarness.service.recordAdvancePrompt(backoffHarness.state, [backoffTask], 1200);
+  assert.equal(backoffHarness.state.advancePromptNextAt, 1400, "the second identical prompt must use the exponential delay");
+
+  const cappedHarness = makeHarness();
+  cappedHarness.service.config.advancePromptCooldownMs = 0;
+  cappedHarness.service.config.advancePromptMaxInjections = 2;
+  await cappedHarness.service.onTimer(cappedHarness.state, 1);
+  cappedHarness.agent.inbox.nextTurn = [];
+  await cappedHarness.service.onTimer(cappedHarness.state, 1);
+  cappedHarness.agent.inbox.nextTurn = [];
+  await cappedHarness.service.onTimer(cappedHarness.state, 1);
+  assert.equal(cappedHarness.agent.followups.length, 2, "unchanged actionable tasks must stop after the configured injection cap");
+  assert.ok(cappedHarness.events.some((event) => event.reason === "defer: advance-prompt-backoff"));
 
   // Worker v2 的 mine 投影直接驱动所有权判断；claimed 任务不能混入自己的清单。
   const ownershipHarness = makeHarness({ api: false });
