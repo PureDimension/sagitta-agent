@@ -4,11 +4,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const source = await readFile(join(fileURLToPath(new URL(".", import.meta.url)), "../lib/index.js"), "utf8");
+const processTreeSource = await readFile(join(fileURLToPath(new URL(".", import.meta.url)), "../lib/process-tree.js"), "utf8");
 assert.match(source, /task_id:\s*\{\s*type:\s*"string",\s*required:\s*true/u);
 assert.match(source, /asyncWork\.register\(\{[\s\S]*?taskId:\s*args\.task_id/u);
-assert.match(source, /detached:\s*false/u);
+assert.match(source, /detached:\s*process\.platform\s*!==\s*"win32"/u);
 assert.doesNotMatch(source, /child\.unref\(\)/u);
 assert.match(source, /service\.cancel\(metadata\.ownerId, workId, metadata\.taskId\)/u);
+assert.match(source, /async-work\/settled/u);
+assert.match(processTreeSource, /taskkill\.exe/u);
+assert.match(processTreeSource, /process\.kill\(-rootPid/u);
 assert.match(source, /ASYNC_WORK_UNAVAILABLE/u);
 
 // The repository intentionally does not vendor DSH peer dependencies. When

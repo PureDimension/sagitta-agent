@@ -10,6 +10,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import z from "@deepseek-ai/schemastery";
+import { createCodexProcessTracker } from "./process-tree.js";
 
 const name = "sagitta-codex";
 const inject = ["tools", "agents", "sagitta-async-work"];
@@ -162,9 +163,9 @@ function toLegacyCodexWork(work, metadata = {}) {
 function runCodex({ codexPath, args, pidRef, cwd }) {
   const { command, args: prefix } = resolveCodexLaunch(codexPath);
   const child = spawn(command, [...prefix, ...args], {
-    // v1 is process-scoped: child lifetime is controlled by this adapter and
-    // must not survive DSH disposal as a detached orphan.
-    detached: false,
+    // POSIX needs a private process group so grandchildren can be signalled as
+    // one tree. Windows uses taskkill /T /F (and the tracked PID allow-list).
+    detached: process.platform !== "win32",
     stdio: "ignore",
     windowsHide: true,
     ...(cwd ? { cwd } : {}),
@@ -222,16 +223,6 @@ function legacyPidsFrom(config) {
   const raw = process.env.SAGITTA_CODEX_LEGACY_PIDS;
   if (!raw) return [];
   return raw.split(",").map((value) => Number(value.trim())).filter((value) => Number.isInteger(value));
-}
-
-function terminateChild(child) {
-  if (!child || child.exitCode !== null && child.exitCode !== undefined) return false;
-  try {
-    if (typeof child.kill === "function") return child.kill("SIGTERM") !== false;
-  } catch {
-    // The process may have exited between the state check and kill.
-  }
-  return false;
 }
 
 /**
@@ -292,7 +283,7 @@ class CodexWorkRegistry {
 }
 
 function registerCodexTools(ctx, options) {
-  const { resolved, records, disposed } = options;
+  const { resolved, records, disposed, processTracker } = options;
 
   ctx.tools.register(defineTool({
     name: "codex_dispatch",
@@ -379,6 +370,7 @@ function registerCodexTools(ctx, options) {
       }
       metadata.child = child;
       metadata.pid = pidRef.current;
+      processTracker.track(workId, metadata);
 
       const settle = (kind, code, signal) => {
         metadata.exitCode = code ?? null;
@@ -389,6 +381,13 @@ function registerCodexTools(ctx, options) {
           // Timeout, explicit cancel or dispose may win the race. The generic
           // registry's terminal guard is authoritative in that case.
           if (error?.code !== "ASYNC_WORK_TERMINAL") loggerWarn(ctx, `sagitta-codex: work ${workId} settle ignored: ${error?.message ?? error}`);
+        } finally {
+          // The settlement event normally invokes the same idempotent cleanup;
+          // this local call also covers minimal hosts where ctx.emit is absent
+          // and closes the child tree on every natural terminal path.
+          processTracker.cleanup(workId, metadata, kind).catch((error) => {
+            loggerWarn(ctx, `sagitta-codex: work ${workId} process tree cleanup failed: ${error?.message ?? error}`);
+          });
         }
       };
       child.on("error", (error) => {
@@ -478,6 +477,10 @@ function apply(ctx, config) {
   const records = new Map();
   const disposed = { value: false };
   const cleanupTimer = { value: null };
+  const processTracker = createCodexProcessTracker({
+    records,
+    logger: (message) => loggerWarn(ctx, message),
+  });
   const asyncWork = asyncWorkFrom(ctx);
   if (!asyncWork) loggerWarn(ctx, "sagitta-codex: sagitta-async-work 缺失；codex 工具将 fail closed，不会启动未登记子进程");
 
@@ -498,24 +501,48 @@ function apply(ctx, config) {
     cleanupTimer.value.unref?.();
   }
 
+  let disposePromise;
   const dispose = () => {
-    if (disposed.value) return;
+    if (disposed.value) return disposePromise;
     disposed.value = true;
     if (cleanupTimer.value !== null) clearTimeout(cleanupTimer.value);
     const service = asyncWorkFrom(ctx);
-    // Cancel in the generic registry before terminating children, then forget
-    // adapter metadata. A missing service still cannot prevent child cleanup.
-    for (const [workId, metadata] of records.entries()) {
-      try {
-        const work = service?.get?.(metadata.ownerId, workId);
-        if (work?.status === "running") service.cancel(metadata.ownerId, workId, metadata.taskId);
-      } catch (error) {
-        loggerWarn(ctx, `sagitta-codex: dispose 无法 cancel work ${workId}：${error?.message ?? error}`);
+    disposePromise = (async () => {
+      // Cancel in the generic registry before terminating children, then wait
+      // for the exact same process-tree cleanup promises. A missing service
+      // still cannot prevent child cleanup.
+      for (const [workId, metadata] of records.entries()) {
+        // Claim the dispose-specific cleanup promise before cancel emits
+        // async-work/settled; the event then reuses this promise and cannot
+        // downgrade the diagnostic reason to a generic "cancelled".
+        processTracker.cleanup(workId, metadata, "plugin-dispose");
+        try {
+          const work = service?.get?.(metadata.ownerId, workId);
+          if (work?.status === "running") service.cancel(metadata.ownerId, workId, metadata.taskId);
+        } catch (error) {
+          loggerWarn(ctx, `sagitta-codex: dispose 无法 cancel work ${workId}：${error?.message ?? error}`);
+        }
       }
-      terminateChild(metadata.child);
-    }
-    records.clear();
+      const results = await processTracker.dispose("plugin-dispose");
+      for (const result of results) {
+        if (result?.ok === false) loggerWarn(ctx, `sagitta-codex: dispose process tree cleanup failed: ${result.error?.message ?? "unknown error"}`);
+      }
+      records.clear();
+      settledDisposer?.();
+      settledDisposer = undefined;
+    })();
+    return disposePromise;
   };
+
+  // async_cancel and async-work.reap transition the generic registry directly.
+  // Observe its existing event contract so those paths terminate the matching
+  // codex tree even though the tools do not call this adapter.
+  let settledDisposer;
+  try {
+    settledDisposer = ctx?.on?.("async-work/settled", (payload) => processTracker.settled(payload));
+  } catch (error) {
+    loggerWarn(ctx, `sagitta-codex: 无法订阅 async-work/settled，仍保留本地退出/dispose清理：${error?.message ?? error}`);
+  }
 
   const facade = {
     listActiveWorks(agentId, options = {}) {
@@ -533,7 +560,7 @@ function apply(ctx, config) {
     },
   };
   try { ctx?.provide?.(name, facade); } catch { /* optional in minimal harnesses */ }
-  registerCodexTools(ctx, { resolved, records, disposed });
+  registerCodexTools(ctx, { resolved, records, disposed, processTracker });
 
   if (typeof ctx?.effect === "function") ctx.effect(() => dispose, "sagitta-codex: controlled child cleanup");
   else ctx?.on?.("dispose", dispose);

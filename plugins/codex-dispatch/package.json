@@ -39,7 +39,7 @@
     }
   },
   "scripts": {
-    "check": "node --check lib/index.js && node --check test/smoke.mjs",
-    "smoke": "node test/smoke.mjs"
+    "check": "node --check lib/index.js && node --check lib/process-tree.js && node --check test/smoke.mjs && node --check test/process-tree.mjs",
+    "smoke": "node test/smoke.mjs && node test/process-tree.mjs"
   }
 }
