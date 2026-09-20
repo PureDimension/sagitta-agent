@@ -24,9 +24,49 @@ export function validateTaskUpdate(args = {}) {
   if (args.status === "blocked" && (typeof args.blocked_reason !== "string" || args.blocked_reason.trim().length === 0)) {
     throw taskContractError("TASK_BLOCKED_REASON_REQUIRED", "申请 blocked 必须提供非空 blocked_reason");
   }
+  if (args.status === "blocked" && args.blocked_kind !== undefined &&
+      !["need-human", "ripple-stop", "external", "technical"].includes(args.blocked_kind)) {
+    throw taskContractError("INVALID_BLOCKED_KIND", "blocked_kind 必须是 need-human/ripple-stop/external/technical 之一");
+  }
   if (args.status === "done" && typeof args.blocked_reason === "string" && args.blocked_reason.trim().length > 0) {
     throw taskContractError("INVALID_BLOCKED_REASON", "done 申请不得设置 blocked_reason");
   }
+  if (args.status === "done" && typeof args.blocked_kind === "string" && args.blocked_kind.trim().length > 0) {
+    throw taskContractError("INVALID_BLOCKED_KIND", "done 申请不得设置 blocked_kind");
+  }
+}
+
+export const TASK_EVIDENCE_TYPES = ["file", "test", "command", "url", "commit", "log"];
+export const TASK_BLOCKED_KINDS = ["need-human", "ripple-stop", "external", "technical"];
+
+export function validateTaskEvidence(value, { required = false } = {}) {
+  if (value === undefined || value === null) {
+    if (required) throw taskContractError("TASK_EVIDENCE_REQUIRED", "done 必须提供至少一条 evidence_json");
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length > 100) {
+    throw taskContractError("INVALID_EVIDENCE", "evidence_json 必须是最多 100 项的 JSON 数组");
+  }
+  if (required && value.length === 0) {
+    throw taskContractError("TASK_EVIDENCE_REQUIRED", "done 必须提供至少一条 evidence_json");
+  }
+  return value.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw taskContractError("INVALID_EVIDENCE", "evidence_json 每项必须是对象");
+    }
+    if (!TASK_EVIDENCE_TYPES.includes(item.type)) {
+      throw taskContractError("INVALID_EVIDENCE_TYPE", `evidence_json.type 必须是：${TASK_EVIDENCE_TYPES.join(" / ")}`);
+    }
+    const hasPath = typeof item.path === "string" && item.path.trim().length > 0;
+    const hasRef = typeof item.ref === "string" && item.ref.trim().length > 0;
+    if (!hasPath && !hasRef) throw taskContractError("EVIDENCE_LOCATION_REQUIRED", "每项 evidence_json 必须提供 path 或 ref");
+    for (const field of ["summary", "at"]) {
+      if (typeof item[field] !== "string" || item[field].trim().length === 0) {
+        throw taskContractError(`EVIDENCE_${field.toUpperCase()}_REQUIRED`, `evidence_json 每项必须提供非空 ${field}`);
+      }
+    }
+    return { ...item, ...(hasPath ? { path: item.path.trim() } : {}), ...(hasRef ? { ref: item.ref.trim() } : {}) };
+  });
 }
 
 // task-ownership-p2 §3/§4.1：认领租约秒数（与 Worker TASK_MAX_LEASE_SECONDS 对齐）
@@ -92,7 +132,17 @@ export function pickTask(task) {
     updated_at: task.updated_at ?? null,
     done_at: task.done_at ?? null,
     blocked_reason: task.blocked_reason ?? null,
+    blocked_kind: task.blocked_kind ?? null,
     pending_status: task.pending_status ?? null,
+    evidence_json: Array.isArray(task.evidence_json)
+      ? task.evidence_json
+      : typeof task.evidence_json === "string"
+        ? (() => { try { const parsed = JSON.parse(task.evidence_json); return Array.isArray(parsed) ? parsed : []; } catch { return []; } })()
+        : [],
+    next_action: task.next_action ?? null,
+    open_need_human: task.open_need_human === true,
+    open_need_human_count: Number(task.open_need_human_count ?? 0),
+    open_notify_count: Number(task.open_notify_count ?? 0),
     archived: Number(task.archived ?? 0),
   };
   // task-ownership-p2 §6：claim_state 派生（unclaimed | claimed | mine）投影进列表/详情；
@@ -102,5 +152,14 @@ export function pickTask(task) {
   if (task.task_id !== undefined && task.task_id !== null) result.task_id = String(task.task_id);
   if (task.confirmation_id !== undefined && task.confirmation_id !== null) result.confirmation_id = String(task.confirmation_id);
   if (task.idempotent !== undefined) result.idempotent = task.idempotent === true;
+  result.actionability = taskActionability(result);
   return result;
+}
+
+export function taskActionability(task = {}) {
+  if (task.status === "done" || task.status === "blocked") return task.status === "done" ? "✅终态" : "⛔阻塞";
+  if (task.status === "waiting") return "⏸waiting";
+  if (task.pending_status) return "⏳待确认";
+  if (task.open_need_human === true || Number(task.open_need_human_count ?? 0) > 0) return "⏳等人(open need)";
+  return "▸可推进";
 }

@@ -21,7 +21,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at    TEXT NOT NULL,                   -- ISO8601 UTC
   updated_at    TEXT NOT NULL DEFAULT '',        -- ISO8601 UTC
   done_at       TEXT DEFAULT '',
-  archived      INTEGER NOT NULL DEFAULT 0       -- 1=归档（软删，recall 默认排除同 memory 契约）
+  archived      INTEGER NOT NULL DEFAULT 0,      -- 1=归档（软删，recall 默认排除同 memory 契约）
+  evidence_json TEXT DEFAULT '[]',                -- 结构化证据数组；接口投影为 JSON 数组
+  next_action   TEXT DEFAULT NULL,                -- 下一步；round-close.next 会同步到这里
+  blocked_reason TEXT DEFAULT NULL,
+  blocked_kind  TEXT DEFAULT NULL                 -- need-human | ripple-stop | external | technical
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
 CREATE INDEX IF NOT EXISTS idx_tasks_stream   ON tasks(stream);
@@ -29,6 +33,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
 ```
 
 对齐记忆库 v1.3 契约：`id`/`status`/`archived`/`stream` 四语义与 memory 的 `entries` 一致（召回默认排除 archived）；`checkbox` 对应悬浮窗"待处理需求"区块。
+
+### 结构化收口字段
+
+`evidence_json` 在 API 响应和工具投影中是数组，不是原始 TEXT：每项形如
+`{type, path|ref, digest?, summary, at}`。`type` 固定为 `file`、`test`、`command`、`url`、
+`commit`、`log`；`path` 或 `ref` 至少一个，`summary` 和 `at` 必填。PATCH done、round-close
+done 及其 `pending_done` 申请至少需要一项；缺失返回 `TASK_EVIDENCE_REQUIRED`，结构/枚举错误返回
+`INVALID_EVIDENCE`、`INVALID_EVIDENCE_TYPE` 等明确 422 错误码。
+
+`next_action` 可选，PATCH 可设置或传 `null` 清除；round-close 的必填 `next` 会同步写入任务行。
+`blocked_kind` 可选于普通任务字段，但新进入 `blocked`/`pending_blocked` 时与非空
+`blocked_reason` 一起必填，枚举为 `need-human`、`ripple-stop`、`external`、`technical`，缺失返回
+`BLOCKED_KIND_REQUIRED`，非法值返回 `INVALID_BLOCKED_KIND`。旧任务该列为空仍可读，不触发历史数据错误。
 
 ### acceptance（验收清单）
 
@@ -49,13 +66,25 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
 | 方法 | 路径 | 用途 | 需要的 D1 token |
 |---|---|---|---|
 | GET  | `/task?project=&stream=&status=` | 列表（默认排除 archived；status 过滤可选） | read |
-| POST | `/task` | 新建（body: project/title/acceptance/status/priority/checkbox/stream/body） | write |
+| POST | `/task` | 新建（body: project/title/acceptance/status/priority/checkbox/stream/body/evidence_json/next_action） | write |
 | GET  | `/task/{id}` | 单条 | read |
-| PATCH| `/task/{id}` | 更新 status/priority/body/title/checkbox/acceptance（部分更新） | write |
+| PATCH| `/task/{id}` | 更新 status/priority/body/title/checkbox/acceptance/evidence_json/next_action/blocked_reason/blocked_kind（部分更新） | write |
 | DELETE| `/task/{id}` | 软删 → archived=1（不真删，保审计） | write |
 | POST | `/task/search` | 关键词 LIKE（与 /mem/search 同风格） | read |
 
 响应与 memory 同构：`{ok:true, data:{...}}` / `{ok:false, error:{code,message}}`（中文指引风格一致）。
+
+### round-close 与渲染约定
+
+`POST /task/{id}/round-close` 的 `progress`、`next`、`round_id`、`action` 仍是必填；`next` 会写入
+`next_action`。`evidence_json` 与 `blocked_kind` 可选于协议字段，但 `action=done` 至少要有一条
+证据，`action=blocked` 必须有 `blocked_reason + blocked_kind`。`expected_updated_at` 对 done/blocked
+可以省略：Worker 会把本次读取到的当前 `updated_at` 用作条件；调用方显式提供旧值时仍返回
+`TASK_VERSION_CONFLICT`。memory 插件为兼容旧 Worker，在省略时先 GET 当前任务再发送版本号。
+
+任务投影含 `updated_at/evidence_json/next_action/blocked_kind`。memory 的 `task_list` 与 `task_search`
+文本还显示证据数量/类型，并派生 `▸可推进`、`⏳等人(open need)`、`⛔阻塞`、`✅终态`、`⏸waiting`
+（pending 另标 `⏳待确认`）；这些标注不新增数据库状态列。
 
 ## 3. 鉴权与 manager 契约（无新配置）
 

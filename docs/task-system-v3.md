@@ -3,9 +3,9 @@
 ## 现状基线与实施落点
 
 本仓库当前 Worker 已有 `owner_agent_id/claimed_at/claim_token/lease_seconds`、
-`pending_status`、`task_events` 和 `task_need_human`。任务路由通过
+`pending_status`、`evidence_json`、`next_action`、`blocked_kind`、`task_events` 和 `task_need_human`。任务路由通过
 `ensureTasksSchema()` 对存量 D1 做 `PRAGMA table_info` + 缺列 `ALTER TABLE` 的可重入迁移；
-v3 不增加列，保留现有数据结构。
+本次扩展仍只通过该惰性迁移补列，不需要一次性 migration 或手改 D1。
 
 主要落点：
 
@@ -15,6 +15,8 @@ v3 不增加列，保留现有数据结构。
   `plugins/memory/lib/tools.js` / `task-contract.js` / `client.js` 同步 v3 工具契约。
 - `plugins/auto-advance/lib/service.js`：继续以 `pending_status === null` 判断可推进；
   普通 PATCH 终态直落后自然不再进入 pending 队列，round-close 的 pending 仍进入确认流程。
+- `plugins/auto-advance/lib/round-close.js`：接受可选 `evidence_json/blocked_kind`，终态版本号可省略，
+  由 memory 工具先 GET 当前 `updated_at` 以兼容旧 Worker。
 - `worker/test/smoke.mjs`：覆盖重启恢复、resolve target、他人 resolve、blocked 快速转移、
   PATCH/round-close confirm 分层和多 need 全清约束。
 
@@ -44,9 +46,10 @@ v3 不增加列，保留现有数据结构。
   不改变所属任务的 status、done_at 或 claim。need 的 target 语义不适用于 notify。
 - `target=done` 只有在本条 resolve 后没有其他 open `type=need` 时允许，否则返回
   `TASK_NEED_HUMAN_OPEN`，need 不会被误标 resolved。
-- `target=open/in_progress` 清除 `blocked_reason`；`target=done` 写 `done_at` 并释放
+- `target=open/in_progress` 清除 `blocked_reason`/`blocked_kind`；`target=done` 写 `done_at` 并释放
   owner；`target=blocked` 保留已有 `blocked_reason`，若为空使用本条 need 的 content
-  作为服务端阻塞原因，以满足既有状态不变量。
+  作为服务端阻塞原因，以满足既有状态不变量，并要求 `blocked_kind`（need-human 工具可由
+  该权威来源派生 `need-human`，新客户端应显式传入）。
 - need 可以多挂；open need 只阻挡 done，不阻挡仍有其他可推进工作的任务继续推进。
 
 resolve 会追加 `task_events.event_type=need_human_resolved` 审计事件；claim/release、
@@ -73,6 +76,22 @@ resolve 会追加 `task_events.event_type=need_human_resolved` 审计事件；cl
 - auto-advance 的 `actionableOwnedTasks`、turn-close 和 pending/recheck 逻辑继续按
   `pending_status === null` 工作：PATCH 直落后任务已经是 done/blocked，不会再次注入；
   round-close pending 保持原确认闭环。
+
+### 4. Evidence、下一步与阻塞分类
+
+- `evidence_json` 是 JSON 数组；每项固定为 `{type, path|ref, digest?, summary, at}`。
+  `type` 固定枚举为 `file | test | command | url | commit | log`，`path` 或 `ref` 至少一个，
+  `summary` 与 `at` 非空。普通 PATCH `status=done`、round-close `action=done`（以及产生
+  `pending_done` 的申请）必须有至少一项证据；confirm accept 也不会绕过该门禁。
+  旧行缺列/空数组只按空证据读取，不伪造历史证据。
+- `next_action` 是可空文本。PATCH 可直接设置；每次 round-close 都把请求的 `next` 同步到任务行，
+  同时保留 task event 审计。它是上下文字段，不是人工维护的状态。
+- `blocked_kind` 固定枚举为 `need-human | ripple-stop | external | technical`。新进入
+  `blocked` 或 `pending_blocked` 的 PATCH/round-close 必填，并与非空 `blocked_reason` 一起校验；
+  存量 blocked 行该列为空时仍可读取和原地修订 `blocked_reason`，不会因迁移被拒绝。
+- memory 的 `task_list`/`task_search` 文本显示 `updated_at`、证据条数/类型、`next_action` 相关上下文，
+  并派生可推进标注：`▸可推进`、`⏳等人(open need)`、`⛔阻塞`、`✅终态`、`⏸waiting`（pending 另标
+  `⏳待确认`）。标注不落库。
 
 ## 验证与交付顺序
 

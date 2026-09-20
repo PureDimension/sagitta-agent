@@ -24,7 +24,19 @@ import {
   ORIGINS,
   CONSOLIDATE_ACTIONS,
 } from "./config.js";
-import { pickNeedHuman, pickTask, taskContractError, validateRoundText, validateTaskUpdate, validateClaimLease, TASK_NEED_HUMAN_TARGETS } from "./task-contract.js";
+import {
+  pickNeedHuman,
+  pickTask,
+  taskActionability,
+  taskContractError,
+  validateRoundText,
+  validateTaskEvidence,
+  validateTaskUpdate,
+  validateClaimLease,
+  TASK_BLOCKED_KINDS,
+  TASK_EVIDENCE_TYPES,
+  TASK_NEED_HUMAN_TARGETS,
+} from "./task-contract.js";
 import { createTaskGate, installTaskGate } from "./task-gate.js";
 import { recallProjectMemory } from "./task-project-memory.js";
 
@@ -822,7 +834,28 @@ export function registerMemoryTools(ctx, client) {
     updated_at: nullableString(),
     done_at: nullableString(),
     blocked_reason: nullableString(),
+    blocked_kind: { oneOf: [{ type: "string", enum: TASK_BLOCKED_KINDS }, { type: "null" }] },
     pending_status: nullablePendingStatus(),
+    evidence_json: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          type: { type: "string", required: true, enum: TASK_EVIDENCE_TYPES },
+          path: { type: "string" },
+          ref: { type: "string" },
+          digest: { type: "string" },
+          summary: { type: "string", required: true },
+          at: { type: "string", required: true },
+        },
+      },
+    },
+    next_action: nullableString(),
+    open_need_human: { type: "boolean" },
+    open_need_human_count: { type: "integer" },
+    open_notify_count: { type: "integer" },
+    actionability: { type: "string", description: "由 status/pending/open need 派生的可推进性标注。" },
     confirmation_id: nullableString(),
     idempotent: { type: "boolean" },
     archived: { type: "integer", required: true },
@@ -830,6 +863,36 @@ export function registerMemoryTools(ctx, client) {
     // mine=本调用方认领（X-Agent-Id 匹配 owner），worker 2026-09-03 W4 起下发，仅认领者本人可见）。
     // owner_agent_id / claim_token 刻意不进投影（owner 对模型无感知；token 只在 claim 响应下发一次）。
     claim_state: { type: "string", enum: ["unclaimed", "claimed", "mine"] },
+  };
+  const renderEvidence = (task) => {
+    const evidence = Array.isArray(task.evidence_json) ? task.evidence_json : [];
+    if (evidence.length === 0) return "evidence=0";
+    const types = [...new Set(evidence.map((item) => item?.type).filter(Boolean))];
+    return `evidence=${evidence.length}（${types.join("/")}）`;
+  };
+  const renderTaskLine = (task, { includeAcceptance = true } = {}) => {
+    const cb = task.checkbox === 1 ? "☐" : "·";
+    const actionability = task.actionability || taskActionability(task);
+    const pending = task.pending_status ? ` · ${task.pending_status}待确认` : "";
+    const claim = task.claim_state === "claimed" ? " · 🔒他人认领中" : "";
+    const blocked = task.blocked_reason ? ` · ${task.blocked_kind || "blocked"}：${task.blocked_reason}` : "";
+    const acceptance = includeAcceptance && task.acceptance ? `\n  acceptance：${task.acceptance}` : "";
+    const nextAction = task.next_action ? ` · next=${task.next_action}` : "";
+    return `${cb} ${actionability} **${task.title}**（${task.project} · ${task.id}${task.priority > 0 ? ` · P${task.priority}` : ""}${pending}${claim} · updated_at=${task.updated_at || "缺失"} · ${renderEvidence(task)}${nextAction}${blocked}）${acceptance}`;
+  };
+  const patchTaskCompat = async (taskId, body, exec) => {
+    try {
+      return await client.patchTask(taskId, body, exec.signal, String(exec?.agent?.id ?? "unknown"));
+    } catch (error) {
+      const extensionKeys = ["evidence_json", "next_action", "blocked_kind"];
+      const hasExtension = extensionKeys.some((key) => Object.prototype.hasOwnProperty.call(body, key));
+      if (error?.code !== "TASK_PATCH_FIELD_FORBIDDEN" || !hasExtension) throw error;
+      const legacyBody = Object.fromEntries(Object.entries(body).filter(([key]) => !extensionKeys.includes(key)));
+      if (Object.keys(legacyBody).length === 0) throw error;
+      // 旧线上 Worker 不认识扩展字段；降级只保留 v3 以前的 PATCH 字段，
+      // 让新插件仍能执行兼容业务更新，扩展字段由新 Worker 才持久化。
+      return await client.patchTask(taskId, legacyBody, exec.signal, String(exec?.agent?.id ?? "unknown"));
+    }
   };
   const TASK_STATUSES = ["open", "in_progress", "blocked", "waiting", "done"];
   const TASK_CREATE_STATUSES = ["open", "in_progress", "waiting"];
@@ -857,7 +920,7 @@ export function registerMemoryTools(ctx, client) {
     description:
       "任务列表（云端 D1 tasks 表，docs/task-api-p1.md）：按 project/stream/status/checkbox 过滤；" +
       "支持 kind=normal|temp；默认只列 normal，并额外带回当前 agent 自己认领的 temp；显式 kind=temp 才列 temp 任务；" +
-      "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/acceptance/updated_at/done_at；" +
+      "默认排除 archived（软删）。返回 status/pending_status/blocked_reason/blocked_kind/evidence_json/next_action/acceptance/updated_at/done_at；" +
       "普通 PATCH status=done/blocked 直接进入终态；只有自主 task_round_close 的 done/blocked 才有 pending_status 并需 task_confirm，" +
       "checkbox=1&status=open 等价 auto-advance 悬浮窗的\"待处理需求\"视图。\n" +
       "每条任务带 claim_state（v3）：unclaimed=未认领；claimed=他人有效租约中；mine=当前 X-Agent-Id 对应的云端会话 owner。" +
@@ -883,14 +946,7 @@ export function registerMemoryTools(ctx, client) {
       render: (_args, value) => {
         const head = `## 任务列表（${value.total} 项）\n`;
         if (!value.items || value.items.length === 0) return [{ type: "text", text: head + "（无任务）" }];
-        const lines = value.items.map((t) => {
-          const cb = t.checkbox === 1 ? "☐" : "·";
-          const st = t.status === "done" ? "✅" : t.status === "blocked" ? "🚩" : t.status === "in_progress" ? "🔄" : t.status === "waiting" ? "⏳" : "□";
-          const pending = t.pending_status ? ` · ${t.pending_status}待确认` : "";
-          const claim = t.claim_state === "claimed" ? " · 🔒他人认领中" : "";
-          const acceptance = t.acceptance ? `\n  acceptance：${t.acceptance}` : "";
-          return `${cb} ${st} **${t.title}**（${t.project} · ${t.id}${t.priority > 0 ? ` · P${t.priority}` : ""}${pending}${claim}）${acceptance}`;
-        });
+        const lines = value.items.map((t) => renderTaskLine(t));
         return [{ type: "text", text: head + lines.join("\n") }];
       },
       presentationMeta: (_args, value) => ({ total: value.total }),
@@ -970,6 +1026,8 @@ export function registerMemoryTools(ctx, client) {
       nh_id: { type: "string", required: true, description: "need-human id。" },
       resolve_kind: { type: "string", enum: NEED_HUMAN_RESOLVE_KINDS, description: "solved（解决）或 abandoned（放弃）。" },
       target: { type: "string", enum: TASK_NEED_HUMAN_TARGETS, description: "解除后任务目标状态，默认 open。" },
+      blocked_kind: { type: "string", enum: TASK_BLOCKED_KINDS, description: "target=blocked 时必填的阻塞分类。" },
+      evidence_json: { type: "array", items: { type: "object" }, description: "target=done 时可提供结构化证据。" },
     },
     output: {
       schema: { type: "object", additionalProperties: false, properties: { ...NEED_HUMAN_FIELDS, message: { type: "string", required: true } } },
@@ -982,7 +1040,11 @@ export function registerMemoryTools(ctx, client) {
     timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const resolved = await client.resolveNeedHuman(args.nh_id, args.resolve_kind, args.target, exec.signal);
+      const evidence = args.evidence_json === undefined ? undefined : validateTaskEvidence(args.evidence_json);
+      const resolved = await client.resolveNeedHuman(args.nh_id, args.resolve_kind, args.target, exec.signal, {
+        blockedKind: args.blocked_kind,
+        evidenceJson: evidence,
+      });
       const item = pickNeedHuman(resolved);
       // Current Worker responses do not echo resolve_kind; preserve the
       // caller's explicit choice in the tool projection when that happens.
@@ -1111,7 +1173,8 @@ export function registerMemoryTools(ctx, client) {
     name: "task_create",
     description:
       "创建任务（云端 D1 tasks 表）：kind=normal|temp（默认 normal）；normal 任务需 project 和 acceptance checklist，temp 可不传 project/acceptance；title 必填；status 默认 open；priority 默认 0；" +
-      "checkbox=1 表示涟漪待处理项（会出现在悬浮窗\"待处理需求\"区）；stream 默认 company。管理字段由服务端生成。",
+      "checkbox=1 表示涟漪待处理项（会出现在悬浮窗\"待处理需求\"区）；stream 默认 company；" +
+      "可选填写 evidence_json/next_action，管理字段由服务端生成。",
     parameters: {
       kind: { type: "string", enum: TASK_KINDS, description: "normal（默认，正式任务）或 temp（临时小事；可无 project）。" },
       project: { type: "string", description: "所属项目；normal 必填，temp 可省略。" },
@@ -1122,6 +1185,8 @@ export function registerMemoryTools(ctx, client) {
       stream: { type: "string", enum: TASK_STREAMS, description: "默认 company。" },
       body: { type: "string", description: "内嵌描述/notes。" },
       acceptance: { type: "string", description: "markdown checklist；normal 必填且至少包含一行 - [ ] 描述 或 - [x] 描述，temp 可省略或为空。" },
+      evidence_json: { type: "array", items: { type: "object" }, description: `可选结构化证据数组；type=${TASK_EVIDENCE_TYPES.join("/")}，每项需 summary/at 与 path 或 ref。` },
+      next_action: { type: "string", description: "可选的下一步可推进动作。" },
     },
     output: {
       schema: {
@@ -1148,6 +1213,8 @@ export function registerMemoryTools(ctx, client) {
         ...(args.stream ? { stream: args.stream } : {}),
         ...(args.body !== undefined ? { body: args.body } : {}),
         ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}),
+        ...(args.evidence_json !== undefined ? { evidence_json: validateTaskEvidence(args.evidence_json) } : {}),
+        ...(args.next_action !== undefined ? { next_action: args.next_action } : {}),
       };
       const created = await client.createTask(body, exec.signal);
       return { ...pickTask(created), message: `已创建任务 ${created.id}` };
@@ -1158,12 +1225,13 @@ export function registerMemoryTools(ctx, client) {
   ctx.tools.register(defineTool({
     name: "task_update",
     description:
-      "更新任务（PATCH /task/{id}）：参数白名单仅为 status/priority/body/title/checkbox/blocked_reason/acceptance，" +
+      "更新任务（PATCH /task/{id}）：参数白名单包含 status/priority/body/title/checkbox/blocked_reason/blocked_kind/acceptance/evidence_json/next_action，" +
       "可带 expected_updated_at；不得传 done_at、pending_status 或 confirm。" +
       "普通 PATCH 的 status=done/blocked 直接进入终态并返回 done_at/blocked_reason；只有 task_round_close 的 done/blocked " +
       "才返回 pending_status 并需要 task_confirm。status=blocked 时 blocked_reason 必填。task_id 可从 task_list 获取。\n" +
       "认领制（task-ownership-p2）：任务被他人认领（claim_state=claimed，租约内）时，PATCH status=in_progress " +
-      "会被服务端 409 TASK_ALREADY_CLAIMED 拒绝——需先 task_claim 认领（或等待租约过期后再更新）。",
+      "会被服务端 409 TASK_ALREADY_CLAIMED 拒绝——需先 task_claim 认领（或等待租约过期后再更新）。" +
+      "done 至少需要一条结构化 evidence_json；blocked 需要 blocked_reason + blocked_kind。",
     parameters: {
       task_id: { type: "string", required: true, description: "任务 id（tsk-YYYYMMDD-xxxxxx）。" },
       title: { type: "string" },
@@ -1172,7 +1240,10 @@ export function registerMemoryTools(ctx, client) {
       body: { type: "string" },
       checkbox: { type: "boolean" },
       blocked_reason: { type: "string", description: "PATCH blocked 时必填的非空阻塞原因；done 不得设置。" },
+      blocked_kind: { type: "string", enum: TASK_BLOCKED_KINDS, description: "blocked 的原因分类：need-human/ripple-stop/external/technical。" },
       acceptance: { type: "string", description: "整体替换 markdown checklist；normal 不能清空且至少包含一行 - [ ] 描述 或 - [x] 描述，temp 可清空。" },
+      evidence_json: { type: "array", items: { type: "object" }, description: "结构化证据数组；done 时至少一条。" },
+      next_action: { type: "string", description: "下一步可推进动作；传 null 可清除。" },
       expected_updated_at: { type: "string", description: "可选版本条件；必须等于当前 updated_at。" },
     },
     output: {
@@ -1190,7 +1261,7 @@ export function registerMemoryTools(ctx, client) {
               `请使用 task_confirm accept（confirmation_id=${value.confirmation_id || "缺失"}，updated_at=${value.updated_at || "缺失"}）。`,
           }];
         }
-        return [{ type: "text", text: `## 任务已更新\n\n**${value.title}**（${value.id} · ${value.status}）` }];
+        return [{ type: "text", text: `## 任务已更新\n\n${renderTaskLine(value, { includeAcceptance: false })}` }];
       },
       presentationMeta: (_args, value) => ({ id: value.id, status: value.status }),
     },
@@ -1205,11 +1276,14 @@ export function registerMemoryTools(ctx, client) {
         ...(args.body !== undefined ? { body: args.body } : {}),
         ...(args.checkbox !== undefined ? { checkbox: args.checkbox === true ? 1 : 0 } : {}),
         ...(args.blocked_reason !== undefined ? { blocked_reason: args.blocked_reason } : {}),
+        ...(args.blocked_kind !== undefined ? { blocked_kind: args.blocked_kind } : {}),
         ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}),
+        ...(args.evidence_json !== undefined ? { evidence_json: validateTaskEvidence(args.evidence_json) } : {}),
+        ...(args.next_action !== undefined ? { next_action: args.next_action } : {}),
         ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
       };
       if (Object.keys(body).length === 0) throw new Error("task_update 至少需要更新一个字段。");
-      const updated = await client.patchTask(args.task_id, body, exec.signal, String(exec?.agent?.id ?? "unknown"));
+      const updated = await patchTaskCompat(args.task_id, body, exec);
       const task = pickTask(updated);
       // Worker 将非终态任务切到 waiting/open 时会同时释放租约；同步本地
       // 非敏感绑定，避免后续执行型工具误把旧认领当作仍然有效。
@@ -1358,6 +1432,9 @@ export function registerMemoryTools(ctx, client) {
           status: { type: "string", required: true },
           pending_status: nullablePendingStatus(),
           blocked_reason: nullableString(),
+          blocked_kind: { oneOf: [{ type: "string", enum: TASK_BLOCKED_KINDS }, { type: "null" }] },
+          evidence_json: { type: "array", items: { type: "object" } },
+          next_action: nullableString(),
           done_at: nullableString(),
           updated_at: nullableString(),
           confirmation_id: { type: "string", required: true },
@@ -1367,8 +1444,8 @@ export function registerMemoryTools(ctx, client) {
       render: (_args, value) => [{
         type: "text",
         text: value.idempotent
-          ? `## 任务确认幂等重试\n\n${value.task_id} 当前状态：${value.status}（confirmation_id=${value.confirmation_id}）`
-          : `## 任务确认结果\n\n${value.task_id} → ${value.status}${value.pending_status ? `（${value.pending_status}，仍待确认）` : "（已确认）"}`,
+          ? `## 任务确认幂等重试\n\n${value.task_id} 当前状态：${value.status}（updated_at=${value.updated_at || "缺失"} · confirmation_id=${value.confirmation_id}）`
+          : `## 任务确认结果\n\n${value.task_id} → ${value.status}${value.pending_status ? `（${value.pending_status}，仍待确认）` : "（已确认）"} · updated_at=${value.updated_at || "缺失"}`,
       }],
       presentationMeta: (_args, value) => ({ task_id: value.task_id, status: value.status, idempotent: value.idempotent }),
     },
@@ -1388,6 +1465,9 @@ export function registerMemoryTools(ctx, client) {
         status: task.status,
         pending_status: task.pending_status,
         blocked_reason: task.blocked_reason,
+        blocked_kind: task.blocked_kind,
+        evidence_json: task.evidence_json,
+        next_action: task.next_action,
         done_at: task.done_at,
         updated_at: task.updated_at,
         confirmation_id: String(result.confirmation_id ?? args.confirmation_id),
@@ -1402,7 +1482,8 @@ export function registerMemoryTools(ctx, client) {
     description:
       "关闭一个自主推进 round（POST /task/{id}/round-close）：progress 与 next 必填，" +
       "trim 后各 1–1000 个 Unicode 字符且不得含 NUL/控制字符/CR/LF；action 仅 update/done/blocked。" +
-      "done/blocked 只申请 pending_done/pending_blocked，必须再 task_confirm；blocked_reason 仅 action=blocked 时必填。" +
+      "done/blocked 只申请 pending_done/pending_blocked，必须再 task_confirm；blocked_reason + blocked_kind 仅 action=blocked 时必填。" +
+      "done 可提交至少一条 evidence_json；next 会同步为任务 next_action。缺 expected_updated_at 时插件先 GET 当前版本，兼容旧 Worker。" +
       "同 task_id + 执行 agent + round_id 的相同内容重试幂等，不同内容返回冲突。",
     parameters: {
       task_id: { type: "string", required: true, description: "任务 id。" },
@@ -1411,7 +1492,9 @@ export function registerMemoryTools(ctx, client) {
       progress: { type: "string", required: true, description: "本轮进展摘要，trim 后 1–1000 字符，无控制字符或换行。" },
       next: { type: "string", required: true, description: "下一步摘要，trim 后 1–1000 字符，无控制字符或换行。" },
       blocked_reason: { type: "string", description: "action=blocked 时必填；其他 action 禁止设置。" },
-      expected_updated_at: { type: "string", description: "done/blocked 必填；update 可选的版本条件。" },
+      blocked_kind: { type: "string", enum: TASK_BLOCKED_KINDS, description: "action=blocked 时必填的分类。" },
+      evidence_json: { type: "array", items: { type: "object" }, description: "结构化证据；done 至少一条。" },
+      expected_updated_at: { type: "string", description: "可选版本条件；缺省时插件先 GET 当前 updated_at 后提交。" },
     },
     output: {
       schema: {
@@ -1440,11 +1523,25 @@ export function registerMemoryTools(ctx, client) {
       if (args.action === "blocked" && (typeof args.blocked_reason !== "string" || args.blocked_reason.trim().length === 0)) {
         throw taskContractError("BLOCKED_REASON_REQUIRED", "blocked_reason 必须是非空字符串");
       }
+      if (args.action === "blocked" && args.blocked_kind !== undefined && !TASK_BLOCKED_KINDS.includes(args.blocked_kind)) {
+        throw taskContractError("INVALID_BLOCKED_KIND", "blocked_kind 必须是 need-human/ripple-stop/external/technical 之一");
+      }
       if (args.action !== "blocked" && args.blocked_reason !== undefined) {
         throw taskContractError("INVALID_BLOCKED_REASON", "blocked_reason 只允许用于 action=blocked");
       }
-      if (args.action !== "update" && (typeof args.expected_updated_at !== "string" || args.expected_updated_at.trim().length === 0)) {
-        throw taskContractError("INVALID_EXPECTED_UPDATED_AT", "done/blocked 的 expected_updated_at 必填且必须是非空字符串");
+      if (args.action !== "blocked" && args.blocked_kind !== undefined) {
+        throw taskContractError("INVALID_BLOCKED_KIND", "blocked_kind 只允许用于 action=blocked");
+      }
+      const evidence = args.evidence_json === undefined ? undefined : validateTaskEvidence(args.evidence_json);
+      let expectedUpdatedAt = args.expected_updated_at;
+      if (args.action !== "update" && expectedUpdatedAt === undefined) {
+        // 旧线上 Worker 要求 expected_updated_at；先读再写也使插件在新旧
+        // Worker 上都保持同一条“读到最新再提交”的乐观锁语义。
+        const current = await client.getTask(args.task_id, exec.signal);
+        if (typeof current?.updated_at !== "string" || current.updated_at.trim().length === 0) {
+          throw taskContractError("INVALID_EXPECTED_UPDATED_AT", "无法从任务读取当前 updated_at");
+        }
+        expectedUpdatedAt = current.updated_at;
       }
       const body = {
         agent_id: String(exec?.agent?.id ?? "unknown"),
@@ -1453,7 +1550,9 @@ export function registerMemoryTools(ctx, client) {
         progress,
         next,
         ...(args.blocked_reason !== undefined ? { blocked_reason: args.blocked_reason.trim() } : {}),
-        ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
+        ...(args.blocked_kind !== undefined ? { blocked_kind: args.blocked_kind } : {}),
+        ...(evidence !== undefined ? { evidence_json: evidence } : {}),
+        ...(expectedUpdatedAt !== undefined ? { expected_updated_at: expectedUpdatedAt } : {}),
       };
       const result = await client.roundCloseTask(args.task_id, body, exec.signal);
       return {
@@ -1497,7 +1596,7 @@ export function registerMemoryTools(ctx, client) {
     name: "task_search",
     description:
       "关键词检索任务（POST /task/search，LIKE 匹配 title/body/project）：默认排除 archived。" +
-      "可选 project/stream/status 过滤；返回 pending_status/blocked_reason/acceptance/updated_at/done_at，" +
+      "可选 project/stream/status 过滤；返回 pending_status/blocked_reason/blocked_kind/evidence_json/next_action/acceptance/updated_at/done_at，" +
       "round-close 产生的 done/blocked pending 申请须经 task_confirm 才是终态；普通 PATCH 已是终态。",
     parameters: {
       query: { type: "string", required: true, description: "关键词（匹配 title/body/project）。" },
@@ -1517,7 +1616,7 @@ export function registerMemoryTools(ctx, client) {
         },
       },
       render: (_args, value) => [
-        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => `- ${t.checkbox === 1 ? "☐" : "·"} **${t.title}**（${t.project} · ${t.status}${t.pending_status ? ` · ${t.pending_status}待确认` : ""}${t.claim_state === "claimed" ? " · 🔒他人认领中" : ""}）${t.acceptance ? `\n  acceptance：${t.acceptance}` : ""}`).join("\n") },
+        { type: "text", text: `## 任务检索「${_args.query}」命中 ${value.total} 条\n` + (value.items || []).map((t) => renderTaskLine(t)).join("\n") },
       ],
       presentationMeta: (_args, value) => ({ total: value.total }),
     },
@@ -1549,7 +1648,7 @@ export const MEMORY_PROMPT_GUIDANCE = `记忆工具（sagitta-memory）——设
 
 
 
-任务工具（task API v3）：task_create 的 kind=normal|temp；normal 必须 project，temp 可无根。task_list 不传 kind 时只列 normal 并补当前 agent 已认领 temp；显式 kind=temp 才查 temp。task_need_human/task_need_human_resolve/need_human_list 负责 need（只阻塞 done）与 notify（不阻塞 done）事项的记账、解除、target 流转和跨任务汇聚。task_update 的参数仅限 status/priority/body/title/checkbox/blocked_reason/acceptance（可带 expected_updated_at），不得传 done_at/pending_status/confirm。普通 PATCH done/blocked 直接落终态；只有 task_round_close 的 done/blocked 使用 pending + task_confirm；blocked 必须有 blocked_reason。每轮用 task_round_close 写 progress/next，二者 trim 后各 1–1000 字符且不得有控制字符或换行；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。
+任务工具（task API v3）：task_create 的 kind=normal|temp；normal 必须 project，temp 可无根。task_list 不传 kind 时只列 normal 并补当前 agent 已认领 temp；显式 kind=temp 才查 temp。task_need_human/task_need_human_resolve/need_human_list 负责 need（只阻塞 done）与 notify（不阻塞 done）事项的记账、解除、target 流转和跨任务汇聚。task_update 的参数包括 status/priority/body/title/checkbox/blocked_reason/blocked_kind/acceptance/evidence_json/next_action（可带 expected_updated_at），不得传 done_at/pending_status/confirm。普通 PATCH done/blocked 直接落终态；done 至少一条 evidence_json，blocked 必须有 blocked_reason + blocked_kind；只有 task_round_close 的 done/blocked 使用 pending + task_confirm。每轮用 task_round_close 写 progress/next，next 同步为 next_action，二者 trim 后各 1–1000 字符且不得有控制字符或换行；终态 expected_updated_at 可省略，插件会先 GET 当前版本兼容旧 Worker；同 task/agent/round_id 相同内容重试幂等，不同内容冲突。
 认领制与工具门禁（task-system-v3）：任务带 claim_state——unclaimed=未认领；claimed=他人有效租约中；mine=当前 X-Agent-Id 对应的云端 owner。owner_agent_id 等于 DSH agent.id，重启同一对话仍可恢复 mine；task_claim 重复调用会续租，task_release 无需本地 claim_token。DSH 全局 guard 仍要求执行型工具已有当前 agent 的 in_progress normal/temp 云端认领；读/搜索/讨论类工具自由。执行重活前可调用 task_assert_bound 自查；无绑定会拒绝。
 
 task_claim 成功且任务有 project 时，会自动召回 domain=projects/{project} 的最新项目记忆并注入返回；无根 temp/无 project 不召回。`;

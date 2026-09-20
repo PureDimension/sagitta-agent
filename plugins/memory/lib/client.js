@@ -467,7 +467,7 @@ export class SagittaMemoryClient {
   }
 
   /** 解决/放弃一条 need-human，并按 target 原子流转所属任务（v3）。 */
-  async resolveNeedHuman(needHumanId, resolveKind, target, signal) {
+  async resolveNeedHuman(needHumanId, resolveKind, target, signal, options = {}) {
     // 兼容旧的 positional 调用 resolveNeedHuman(id, kind, signal)。
     if (target !== undefined && target !== null && typeof target !== "string") {
       signal = target;
@@ -477,6 +477,8 @@ export class SagittaMemoryClient {
       ? {}
       : { resolve_kind: resolveKind };
     if (target !== undefined && target !== null) body.target = target;
+    if (options.blockedKind !== undefined && options.blockedKind !== null) body.blocked_kind = options.blockedKind;
+    if (options.evidenceJson !== undefined && options.evidenceJson !== null) body.evidence_json = options.evidenceJson;
     return await this.request(`/task/need-human/${encodeURIComponent(needHumanId)}/resolve`, {
       method: "POST",
       operation: "write",

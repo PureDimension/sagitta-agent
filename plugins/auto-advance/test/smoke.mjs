@@ -20,8 +20,29 @@ import {
   mapApiTaskSnapshot,
   splitCloudTaskSnapshotStrict,
 } from "../lib/service.js";
+import { validateRoundClosePayload } from "../lib/round-close.js";
 
 const iso = (minute) => `2026-08-30T00:${String(minute).padStart(2, "0")}:00.000Z`;
+
+const implicitClose = validateRoundClosePayload({
+  task_id: "tsk-round",
+  round_id: "round-implicit",
+  action: "done",
+  progress: "完成",
+  next: "等待确认",
+  evidence_json: [{ type: "test", path: "test/smoke.mjs", summary: "smoke", at: "2026-09-20T00:00:00.000Z" }],
+});
+assert.equal(Object.hasOwn(implicitClose, "expected_updated_at"), false);
+const blockedClose = validateRoundClosePayload({
+  task_id: "tsk-round",
+  round_id: "round-blocked",
+  action: "blocked",
+  progress: "阻塞",
+  next: "等待外部",
+  blocked_reason: "外部依赖",
+  blocked_kind: "external",
+});
+assert.equal(blockedClose.blocked_kind, "external");
 function task(id, status, pending_status = null, extra = {}, minute = 20) {
   return {
     id,

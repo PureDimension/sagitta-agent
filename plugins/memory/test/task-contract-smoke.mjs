@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { MemoryApiError, SagittaMemoryClient } from "../lib/client.js";
-import { pickTask, validateRoundText, validateTaskUpdate } from "../lib/task-contract.js";
+import { pickTask, taskActionability, validateRoundText, validateTaskEvidence, validateTaskUpdate } from "../lib/task-contract.js";
 
 const requests = [];
 const baseTask = (id) => ({
@@ -18,8 +18,11 @@ const baseTask = (id) => ({
   created_at: "2026-08-30T00:00:00.000Z",
   updated_at: "2026-08-30T00:00:01.000Z",
   done_at: "",
-  blocked_reason: null,
-  pending_status: null,
+    blocked_reason: null,
+    blocked_kind: null,
+    pending_status: null,
+    evidence_json: [],
+    next_action: null,
   archived: 0,
 });
 
@@ -95,6 +98,21 @@ try {
   assert.equal(projected.done_at, "");
   assert.equal(projected.updated_at, "2026-08-30T00:00:01.000Z");
   assert.equal(projected.confirmation_id, "cnf-projection");
+  assert.deepEqual(projected.evidence_json, []);
+  assert.equal(projected.next_action, null);
+  assert.equal(projected.actionability, "⏳待确认");
+  assert.equal(taskActionability({ status: "open", open_need_human: true }), "⏳等人(open need)");
+  assert.equal(taskActionability({ status: "in_progress" }), "▸可推进");
+  assert.deepEqual(validateTaskEvidence([{
+    type: "test",
+    path: "worker/test/smoke.mjs",
+    summary: "smoke",
+    at: "2026-09-20T00:00:00.000Z",
+  }])[0].type, "test");
+  assert.throws(
+    () => validateTaskEvidence([] , { required: true }),
+    (error) => error instanceof MemoryApiError && error.code === "TASK_EVIDENCE_REQUIRED"
+  );
   assert.equal(validateRoundText("  一轮进展  ", "progress"), "一轮进展");
   for (const [value, code] of [["", "PROGRESS_REQUIRED"], ["x\ny", "INVALID_PROGRESS"], ["\0", "INVALID_PROGRESS"], ["x".repeat(1001), "PROGRESS_TOO_LONG"]]) {
     assert.throws(

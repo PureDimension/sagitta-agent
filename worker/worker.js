@@ -120,6 +120,8 @@ const TASK_KINDS = ['normal', 'temp'];
 const TASK_STREAMS = [...STREAMS, 'company'];
 const TASK_DEFAULT_STREAM = 'company';
 const TASK_PRIORITIES = [0, 1, 2];
+const TASK_EVIDENCE_TYPES = ['file', 'test', 'command', 'url', 'commit', 'log'];
+const TASK_BLOCKED_KINDS = ['need-human', 'ripple-stop', 'external', 'technical'];
 
 // ---- 基础工具 ---------------------------------------------------------------
 
@@ -955,6 +957,7 @@ const TASK_SCHEMA_COLUMNS = [
   ['created_at', 'TEXT'], ['updated_at', 'TEXT'], ['done_at', 'TEXT'], ['archived', 'INTEGER'],
   ['blocked_reason', 'TEXT'], ['pending_status', 'TEXT'],
   ['kind', "TEXT DEFAULT 'normal'"],
+  ['evidence_json', "TEXT DEFAULT '[]'"], ['next_action', 'TEXT'], ['blocked_kind', 'TEXT'],
   // task-ownership-p2 §3：认领制四列（可空；惰性回收，无需定时清理）
   ['owner_agent_id', 'TEXT'], ['claimed_at', 'TEXT'], ['claim_token', 'TEXT'], ['lease_seconds', 'INTEGER'],
 ];
@@ -972,7 +975,10 @@ const TASK_NEED_HUMAN_SCHEMA_COLUMNS = [
 const TASK_SYSTEM_AGENT = 'worker';
 const TASK_PENDING_STATUSES = ['pending_done', 'pending_blocked'];
 const TASK_TERMINAL_STATUSES = ['done', 'blocked'];
-const TASK_PATCH_FIELDS = ['status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason', 'acceptance'];
+const TASK_PATCH_FIELDS = [
+  'status', 'priority', 'body', 'title', 'checkbox', 'blocked_reason', 'acceptance',
+  'evidence_json', 'next_action', 'blocked_kind',
+];
 // reopen is retained only as a compatibility reader for pre-v3 pending rows;
 // v3 callers use PATCH/resolve target=open instead.
 const TASK_CONFIRM_DECISIONS = ['accept', 'reopen'];
@@ -1011,6 +1017,9 @@ const TASKS_CREATE_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   archived      INTEGER NOT NULL DEFAULT 0,
   blocked_reason TEXT DEFAULT NULL,
   pending_status TEXT DEFAULT NULL,
+  evidence_json TEXT DEFAULT '[]',
+  next_action TEXT DEFAULT NULL,
+  blocked_kind TEXT DEFAULT NULL,
   owner_agent_id TEXT DEFAULT NULL,
   claimed_at     TEXT DEFAULT NULL,
   claim_token    TEXT DEFAULT NULL,
@@ -1126,6 +1135,9 @@ function serializeTask(row, extra = {}, callerAgentIdValue) {
     archived: Number(row.archived),
     blocked_reason: row.blocked_reason === undefined ? null : row.blocked_reason,
     pending_status: row.pending_status === undefined ? null : row.pending_status,
+    evidence_json: parseTaskEvidence(row.evidence_json),
+    next_action: row.next_action === undefined ? null : row.next_action,
+    blocked_kind: row.blocked_kind === undefined ? null : row.blocked_kind,
     // legacy 兼容：旧 schema 的 done_at 默认是空字符串 ''，新不变量要求 null。
     done_at: isNonEmptyString(row.done_at) ? row.done_at : null,
     open_need_human: openNeedHumanCount > 0,
@@ -1247,6 +1259,77 @@ function taskBlockedReason(value) {
     return jsonError(422, 'BLOCKED_REASON_REQUIRED', 'blocked_reason 必须是非空字符串');
   }
   return value.trim();
+}
+
+function parseTaskEvidence(text) {
+  if (Array.isArray(text)) return text;
+  if (!isNonEmptyString(text)) return [];
+  try {
+    const value = JSON.parse(text);
+    return Array.isArray(value) ? value : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function taskEvidence(value, required = false) {
+  if (value === undefined || value === null) {
+    if (required) return jsonError(422, 'TASK_EVIDENCE_REQUIRED', 'done 必须提供至少一条 evidence_json');
+    return { value: null, json: null };
+  }
+  if (!Array.isArray(value)) {
+    return jsonError(422, 'INVALID_EVIDENCE', 'evidence_json 必须是 JSON 数组');
+  }
+  if (value.length > 100) {
+    return jsonError(422, 'INVALID_EVIDENCE', 'evidence_json 最多包含 100 条证据');
+  }
+  const allowed = new Set(['type', 'path', 'ref', 'digest', 'summary', 'at']);
+  const normalized = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return jsonError(422, 'INVALID_EVIDENCE', 'evidence_json 每项必须是对象');
+    }
+    const unknown = Object.keys(item).filter((key) => !allowed.has(key));
+    if (unknown.length > 0) {
+      return jsonError(422, 'INVALID_EVIDENCE', 'evidence_json 包含未知字段：' + unknown.join(', '));
+    }
+    if (!TASK_EVIDENCE_TYPES.includes(item.type)) {
+      return jsonError(422, 'INVALID_EVIDENCE_TYPE', 'evidence_json.type 必须是：' + TASK_EVIDENCE_TYPES.join(' / '));
+    }
+    const hasPath = isNonEmptyString(item.path);
+    const hasRef = isNonEmptyString(item.ref);
+    if (!hasPath && !hasRef) {
+      return jsonError(422, 'EVIDENCE_LOCATION_REQUIRED', 'evidence_json 每项必须提供非空 path 或 ref');
+    }
+    if (!isNonEmptyString(item.summary)) {
+      return jsonError(422, 'EVIDENCE_SUMMARY_REQUIRED', 'evidence_json 每项必须提供非空 summary');
+    }
+    if (!isNonEmptyString(item.at)) {
+      return jsonError(422, 'EVIDENCE_AT_REQUIRED', 'evidence_json 每项必须提供非空 at');
+    }
+    for (const field of ['path', 'ref', 'digest', 'summary', 'at']) {
+      if (item[field] !== undefined && item[field] !== null &&
+          (typeof item[field] !== 'string' || item[field].trim().length === 0 || /[\u0000-\u001f\u007f]/u.test(item[field]))) {
+        return jsonError(422, 'INVALID_EVIDENCE', 'evidence_json.' + field + ' 必须是非空且不含控制字符的字符串');
+      }
+    }
+    const entry = { type: item.type, summary: item.summary.trim(), at: item.at.trim() };
+    if (hasPath) entry.path = item.path.trim();
+    if (hasRef) entry.ref = item.ref.trim();
+    if (item.digest !== undefined && item.digest !== null) entry.digest = item.digest.trim();
+    normalized.push(entry);
+  }
+  if (required && normalized.length === 0) {
+    return jsonError(422, 'TASK_EVIDENCE_REQUIRED', 'done 必须提供至少一条 evidence_json');
+  }
+  return { value: normalized, json: JSON.stringify(normalized) };
+}
+
+function taskBlockedKind(value) {
+  if (!TASK_BLOCKED_KINDS.includes(value)) {
+    return jsonError(422, 'INVALID_BLOCKED_KIND', 'blocked_kind 必须是：' + TASK_BLOCKED_KINDS.join(' / '));
+  }
+  return value;
 }
 
 function taskStateError(row, callerAgentIdValue) {
@@ -1440,7 +1523,7 @@ async function createNeedHumanHandler(db, taskIdValue, body) {
 // type=notify 只是信息通知；resolve notify 只能关闭通知，不能改变所属任务状态或 claim。
 async function resolveNeedHumanHandler(db, id, body, request, env) {
   if (!isTaskBody(body)) return jsonError(400, 'INVALID_BODY', '请求体必须是 JSON 对象');
-  const forbidden = Object.keys(body).filter((field) => !['resolved_by', 'resolve_kind', 'target'].includes(field));
+  const forbidden = Object.keys(body).filter((field) => !['resolved_by', 'resolve_kind', 'target', 'evidence_json', 'blocked_kind'].includes(field));
   if (forbidden.length > 0) {
     return jsonError(422, 'NEED_HUMAN_FIELD_FORBIDDEN', 'resolve 字段不在白名单中：' + forbidden.join(', '), { fields: forbidden });
   }
@@ -1456,6 +1539,13 @@ async function resolveNeedHumanHandler(db, id, body, request, env) {
   const requestedTarget = body.target === undefined || body.target === null ? 'open' : body.target;
   if (!TASK_NEED_HUMAN_TARGETS.includes(requestedTarget)) {
     return jsonError(422, 'INVALID_NEED_HUMAN_TARGET', 'target 必须是：' + TASK_NEED_HUMAN_TARGETS.join(' / '));
+  }
+  const requestedEvidence = taskEvidence(body.evidence_json, false);
+  if (requestedEvidence instanceof Response) return requestedEvidence;
+  let requestedBlockedKind = null;
+  if (body.blocked_kind !== undefined && body.blocked_kind !== null) {
+    requestedBlockedKind = taskBlockedKind(body.blocked_kind);
+    if (requestedBlockedKind instanceof Response) return requestedBlockedKind;
   }
 
   const current = await getNeedHumanRow(db, id);
@@ -1517,15 +1607,26 @@ async function resolveNeedHumanHandler(db, id, body, request, env) {
   const blockedReason = target === 'blocked'
     ? (isNonEmptyString(task.blocked_reason) ? task.blocked_reason : current.content)
     : null;
+  // need-human 本身就是权威阻塞来源；为旧插件未带新字段的 resolve 请求
+  // 派生分类，确保落行后仍满足 blocked_kind 不变量。新客户端仍应显式传入。
+  if (!isNotify && target === 'blocked' && !requestedBlockedKind) requestedBlockedKind = 'need-human';
+  const currentEvidence = parseTaskEvidence(task.evidence_json);
+  const nextEvidence = requestedEvidence.json === null ? currentEvidence : requestedEvidence.value;
+  if (!isNotify && target === 'done' && nextEvidence.length === 0) {
+    return jsonError(422, 'TASK_EVIDENCE_REQUIRED', 'done 必须提供至少一条 evidence_json', { task: serializeTask(task, {}, requestAgentId(request, env)) });
+  }
+  if (target !== 'blocked' && requestedBlockedKind !== null) {
+    return jsonError(422, 'INVALID_BLOCKED_KIND', 'blocked_kind 只允许用于 target=blocked');
+  }
   const doneAt = target === 'done' ? now : '';
   const clearOwner = target === 'done' || target === 'blocked'
     ? ', owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL'
     : (target === 'open' ? ', owner_agent_id = NULL, claimed_at = NULL, claim_token = NULL, lease_seconds = NULL' : '');
   const reopen = db.prepare(
-    'UPDATE tasks SET status = ?, blocked_reason = ?, pending_status = NULL, done_at = ?, updated_at = ?' + clearOwner +
+    'UPDATE tasks SET status = ?, blocked_reason = ?, blocked_kind = ?, evidence_json = ?, pending_status = NULL, done_at = ?, updated_at = ?' + clearOwner +
     ' WHERE id = ? AND archived = 0 AND EXISTS (' +
     "SELECT 1 FROM task_need_human WHERE id = ? AND status = 'resolved' AND resolved_at = ? )"
-  ).bind(target, blockedReason, doneAt, now, current.task_id, id, now);
+  ).bind(target, blockedReason, target === 'blocked' ? requestedBlockedKind : null, JSON.stringify(nextEvidence), doneAt, now, current.task_id, id, now);
   await db.batch([resolve, reopen, event]);
   const resolved = serializeNeedHuman(await getNeedHumanRow(db, id));
   const updatedTask = await getTaskRow(db, current.task_id);
@@ -1694,20 +1795,31 @@ async function createTaskHandler(db, body) {
   if (streamError) return streamError;
   const taskBody = body.body === undefined ? '' : body.body;
   if (typeof taskBody !== 'string') return jsonError(400, 'INVALID_BODY_TEXT', 'body 必须是字符串');
+  const evidence = taskEvidence(body.evidence_json, false);
+  if (evidence instanceof Response) return evidence;
+  let nextAction = null;
+  if (body.next_action !== undefined && body.next_action !== null) {
+    nextAction = taskEventText(body.next_action, 'next_action', false);
+    if (nextAction instanceof Response) return nextAction;
+  }
   if (has('blocked_reason') && body.blocked_reason !== null && body.blocked_reason !== undefined) {
     if (!isNonEmptyString(body.blocked_reason)) {
       return jsonError(422, 'INVALID_BLOCKED_REASON', 'blocked_reason 必须是非空字符串或 null');
     }
     return jsonError(422, 'TASK_CREATE_BLOCKED_REASON_FORBIDDEN', 'create 的非终态任务不得设置 blocked_reason');
   }
+  if (has('blocked_kind') && body.blocked_kind !== null && body.blocked_kind !== undefined) {
+    return jsonError(422, 'TASK_CREATE_BLOCKED_KIND_FORBIDDEN', 'create 的非终态任务不得设置 blocked_kind');
+  }
 
   const id = taskId();
   const now = nowIso();
   await db.prepare(
-    'INSERT INTO tasks (id, project, title, acceptance, kind, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) ' +
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO tasks (id, project, title, acceptance, kind, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived, evidence_json, next_action) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(
-    id, project.value, title.value, acceptance.value, kind, status, priority, checkbox, stream, taskBody, now, now, '', 0
+    id, project.value, title.value, acceptance.value, kind, status, priority, checkbox, stream, taskBody, now, now, '', 0,
+    evidence.json ?? '[]', nextAction
   ).run();
 
   const row = await getTaskRow(db, id);
@@ -1737,7 +1849,10 @@ async function patchTaskHandler(db, id, body, request, env) {
   }
 
   const nextStatus = has('status') ? body.status : row.status;
-  const statusIsTerminal = TASK_TERMINAL_STATUSES.includes(nextStatus);
+  // 只有本次请求明确把 status 改为 done/blocked 才进入终态分支；
+  // 仅 PATCH blocked_reason/evidence 等业务字段时，不能把存量 blocked 行
+  // 误判为终态迁移（否则终态 WHERE 永远匹配不到并误报版本冲突）。
+  const statusIsTerminal = has('status') && TASK_TERMINAL_STATUSES.includes(nextStatus);
   if (has('status')) {
     const statusError = taskStatus(body.status);
     if (statusError) return statusError;
@@ -1750,8 +1865,14 @@ async function patchTaskHandler(db, id, body, request, env) {
       if (body.status === 'blocked' && !isNonEmptyString(body.blocked_reason)) {
         return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', '申请 blocked 必须提供非空 blocked_reason');
       }
+      if (body.status === 'blocked' && !isNonEmptyString(body.blocked_kind)) {
+        return jsonError(422, 'BLOCKED_KIND_REQUIRED', '申请 blocked 必须提供 blocked_kind');
+      }
       if (body.status === 'done' && has('blocked_reason') && isNonEmptyString(body.blocked_reason)) {
         return jsonError(422, 'INVALID_BLOCKED_REASON', 'done 申请不得设置 blocked_reason');
+      }
+      if (body.status === 'done' && has('blocked_kind') && isNonEmptyString(body.blocked_kind)) {
+        return jsonError(422, 'INVALID_BLOCKED_KIND', 'done 申请不得设置 blocked_kind');
       }
     }
     if (row.status === 'done') {
@@ -1796,6 +1917,46 @@ async function patchTaskHandler(db, id, body, request, env) {
     return jsonError(422, 'TASK_BLOCKED_REASON_REQUIRED', 'pending_blocked 必须保留非空 blocked_reason');
   }
 
+  let blockedKind = row.blocked_kind === undefined ? null : row.blocked_kind;
+  if (has('blocked_kind')) {
+    if (body.blocked_kind !== null && body.blocked_kind !== undefined) {
+      const validKind = taskBlockedKind(body.blocked_kind);
+      if (validKind instanceof Response) return validKind;
+      blockedKind = validKind;
+    } else {
+      blockedKind = null;
+    }
+  }
+  if (statusIsTerminal && nextStatus === 'blocked' && !blockedKind) {
+    return jsonError(422, 'BLOCKED_KIND_REQUIRED', '申请 blocked 必须提供 blocked_kind');
+  }
+  if (!statusIsTerminal && isNonEmptyString(blockedKind) &&
+      row.pending_status !== 'pending_blocked' && row.status !== 'blocked') {
+    return jsonError(422, 'INVALID_BLOCKED_KIND', '只有 blocked 或 pending_blocked 任务可以设置 blocked_kind');
+  }
+  if (row.pending_status === 'pending_blocked' && has('blocked_kind') && !blockedKind) {
+    return jsonError(422, 'BLOCKED_KIND_REQUIRED', 'pending_blocked 必须保留非空 blocked_kind');
+  }
+  if (has('status') && !statusIsTerminal && (nextStatus === 'waiting' || nextStatus === 'open' || nextStatus === 'in_progress') && row.status === 'blocked') {
+    blockedKind = null;
+  }
+
+  let evidence = parseTaskEvidence(row.evidence_json);
+  if (has('evidence_json')) {
+    const value = taskEvidence(body.evidence_json, false);
+    if (value instanceof Response) return value;
+    evidence = value.value;
+  }
+  let nextAction = row.next_action === undefined ? null : row.next_action;
+  if (has('next_action')) {
+    if (body.next_action !== null && body.next_action !== undefined) {
+      nextAction = taskEventText(body.next_action, 'next_action', false);
+      if (nextAction instanceof Response) return nextAction;
+    } else {
+      nextAction = null;
+    }
+  }
+
   let acceptance = row.acceptance === undefined || row.acceptance === null ? '' : row.acceptance;
   if (has('acceptance')) {
     const value = taskAcceptance(body.acceptance, row.kind === 'temp' ? 'temp' : 'normal');
@@ -1834,6 +1995,12 @@ async function patchTaskHandler(db, id, body, request, env) {
     } else if (field === 'acceptance') {
       sets.push('acceptance = ?');
       params.push(acceptance);
+    } else if (field === 'evidence_json' && !statusIsTerminal) {
+      sets.push('evidence_json = ?');
+      params.push(JSON.stringify(evidence));
+    } else if (field === 'next_action') {
+      sets.push('next_action = ?');
+      params.push(nextAction);
     }
   }
 
@@ -1845,10 +2012,15 @@ async function patchTaskHandler(db, id, body, request, env) {
   const now = nowIso();
   if (has('status') && !statusIsTerminal && row.status === 'blocked') {
     blockedReason = null;
+    blockedKind = null;
   }
   if (!statusIsTerminal && (has('blocked_reason') || (has('status') && row.status === 'blocked'))) {
     sets.push('blocked_reason = ?');
     params.push(blockedReason);
+  }
+  if (!statusIsTerminal && (has('blocked_kind') || (has('status') && row.status === 'blocked'))) {
+    sets.push('blocked_kind = ?');
+    params.push(blockedKind);
   }
 
   if (statusIsTerminal) {
@@ -1857,11 +2029,16 @@ async function patchTaskHandler(db, id, body, request, env) {
     if (nextStatus === 'done' && await hasOpenNeedHuman(db, id)) {
       return taskNeedHumanOpenError(row, readAgentId);
     }
+    if (nextStatus === 'done' && evidence.length === 0) {
+      return jsonError(422, 'TASK_EVIDENCE_REQUIRED', 'done 必须提供至少一条 evidence_json', { task: serializeTask(row, {}, readAgentId) });
+    }
     const doneAt = nextStatus === 'done' ? now : '';
     sets.push(
       'status = ?',
       'pending_status = NULL',
       'blocked_reason = ?',
+      'blocked_kind = ?',
+      'evidence_json = ?',
       'done_at = ?',
       'owner_agent_id = NULL',
       'claimed_at = NULL',
@@ -1869,7 +2046,8 @@ async function patchTaskHandler(db, id, body, request, env) {
       'lease_seconds = NULL',
       'updated_at = ?'
     );
-    params.push(nextStatus, nextStatus === 'blocked' ? blockedReason : null, doneAt, now, id);
+    params.push(nextStatus, nextStatus === 'blocked' ? blockedReason : null,
+      nextStatus === 'blocked' ? blockedKind : null, JSON.stringify(evidence), doneAt, now, id);
     const update = db.prepare(
       'UPDATE tasks SET ' + sets.join(', ') +
       ' WHERE id = ? AND (status = \'in_progress\' OR (status = \'blocked\' AND ? = \'done\')) AND pending_status IS NULL' +
@@ -2030,6 +2208,10 @@ async function confirmTaskHandler(db, id, body, request, env) {
       await hasOpenNeedHuman(db, id)) {
     return taskNeedHumanOpenError(row, readAgentId);
   }
+  if (body.decision === 'accept' && body.expected_pending === 'pending_done' &&
+      parseTaskEvidence(row.evidence_json).length === 0) {
+    return jsonError(422, 'TASK_EVIDENCE_REQUIRED', 'done 必须提供至少一条 evidence_json', { task: serializeTask(row, {}, readAgentId) });
+  }
 
   const now = nowIso();
   // v3 不再引入 reopen 状态；旧 pending 的 reopen 请求兼容落到 open。
@@ -2108,11 +2290,23 @@ async function roundCloseTaskHandler(db, id, body, request, env) {
   if (body.action === 'blocked') {
     blockedReason = taskBlockedReason(body.blocked_reason);
     if (blockedReason instanceof Response) return blockedReason;
+    if (!isNonEmptyString(body.blocked_kind)) {
+      return jsonError(422, 'BLOCKED_KIND_REQUIRED', 'action=blocked 必须提供 blocked_kind');
+    }
   } else if (body.blocked_reason !== undefined && body.blocked_reason !== null) {
     return jsonError(422, 'INVALID_BLOCKED_REASON', 'blocked_reason 只允许用于 action=blocked');
   }
-  const expected = taskExpectedUpdatedAt(body.expected_updated_at, body.action !== 'update');
-  if (expected instanceof Response) return expected;
+  if (body.action !== 'blocked' && body.blocked_kind !== undefined && body.blocked_kind !== null) {
+    return jsonError(422, 'INVALID_BLOCKED_KIND', 'blocked_kind 只允许用于 action=blocked');
+  }
+  let blockedKind = null;
+  if (body.action === 'blocked') {
+    blockedKind = taskBlockedKind(body.blocked_kind);
+    if (blockedKind instanceof Response) return blockedKind;
+  }
+  const submittedEvidence = taskEvidence(body.evidence_json, false);
+  if (submittedEvidence instanceof Response) return submittedEvidence;
+  const expected = taskExpectedUpdatedAt(body.expected_updated_at, false);
   const payload = {
     agent_id: agentId,
     round_id: roundId,
@@ -2120,6 +2314,8 @@ async function roundCloseTaskHandler(db, id, body, request, env) {
     progress,
     next,
     blocked_reason: blockedReason,
+    blocked_kind: blockedKind,
+    evidence_json: submittedEvidence.value,
     expected_updated_at: expected,
   };
 
@@ -2144,28 +2340,39 @@ async function roundCloseTaskHandler(db, id, body, request, env) {
     return taskNeedHumanOpenError(row, readAgentId);
   }
 
+  const currentEvidence = parseTaskEvidence(row.evidence_json);
+  const evidence = submittedEvidence.value === null ? currentEvidence : submittedEvidence.value;
+  if (body.action === 'done' && evidence.length === 0) {
+    return jsonError(422, 'TASK_EVIDENCE_REQUIRED', 'done 必须提供至少一条 evidence_json', { task: serializeTask(row, {}, readAgentId) });
+  }
+  // A2：done/blocked 的 expected_updated_at 可省略；省略时将本次刚读到的
+  // updated_at 作为条件，仍然是乐观锁，显式传入的旧版本照常 409。
+  const effectiveExpected = expected === null ? row.updated_at : expected;
+
   const now = nowIso();
   const eventId = crypto.randomUUID();
   const pendingStatus = body.action === 'done' ? 'pending_done' : body.action === 'blocked' ? 'pending_blocked' : null;
   const confirmationId = pendingStatus ? 'cnf-' + crypto.randomUUID() : null;
   const update = body.action === 'update'
     ? db.prepare(
-      'UPDATE tasks SET updated_at = ? WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL' +
+      'UPDATE tasks SET next_action = ?, ' + (submittedEvidence.value === null ? '' : 'evidence_json = ?, ') +
+      'updated_at = ? WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL' +
       (expected === null ? '' : ' AND updated_at = ?')
-    ).bind(now, id, ...(expected === null ? [] : [expected]))
+    ).bind(...(submittedEvidence.value === null ? [next] : [next, JSON.stringify(evidence)]), now, id, ...(expected === null ? [] : [expected]))
     : db.prepare(
-      'UPDATE tasks SET status = \'in_progress\', pending_status = ?, blocked_reason = ?, updated_at = ? ' +
+      'UPDATE tasks SET status = \'in_progress\', pending_status = ?, blocked_reason = ?, blocked_kind = ?, ' +
+      'evidence_json = ?, next_action = ?, updated_at = ? ' +
       'WHERE id = ? AND status = \'in_progress\' AND pending_status IS NULL AND updated_at = ?' +
       (body.action === 'done'
         ? " AND NOT EXISTS (SELECT 1 FROM task_need_human WHERE task_id = ? AND status = 'open' AND type = 'need')"
         : '')
-    ).bind(pendingStatus, blockedReason, now, id, expected, ...(body.action === 'done' ? [id] : []));
+    ).bind(pendingStatus, blockedReason, blockedKind, JSON.stringify(evidence), next, now, id, effectiveExpected, ...(body.action === 'done' ? [id] : []));
   const event = db.prepare(
     'INSERT INTO task_events (event_id, task_id, agent_id, event_type, round_id, action, progress, next, blocked_reason, pending_status, confirmation_id, expected_updated_at, payload_json, created_at) ' +
     'SELECT ?, ?, ?, \'round_close\', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1'
   ).bind(
     eventId, id, agentId, roundId, body.action, progress, next, blockedReason, pendingStatus,
-    confirmationId, expected, JSON.stringify(payload), now
+    confirmationId, effectiveExpected, JSON.stringify(payload), now
   );
   try {
     await db.batch([update, event]);

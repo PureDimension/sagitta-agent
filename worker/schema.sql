@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   archived      INTEGER NOT NULL DEFAULT 0,      -- 1=归档（软删，recall 默认排除同 memory 契约）
   blocked_reason TEXT DEFAULT NULL,               -- blocked/pending_blocked 的外部阻塞原因
   pending_status TEXT DEFAULT NULL,              -- pending_done | pending_blocked；终态申请载体
+  evidence_json TEXT DEFAULT '[]',               -- 结构化证据数组（API 投影为数组）
+  next_action TEXT DEFAULT NULL,                 -- 下一步可推进动作；由 round-close.next 同步
+  blocked_kind TEXT DEFAULT NULL,                -- need-human | ripple-stop | external | technical
   -- task-ownership-p2 §3：任务认领制四列（可空；owner 对模型无感知，永不下发明文）
   owner_agent_id TEXT DEFAULT NULL,              -- 认领者 agent id（仅服务端使用；调用方标识如 X-Agent-Id，缺省 'unknown'）
   claimed_at     TEXT DEFAULT NULL,              -- 认领时间（ISO8601 UTC；租约起点 = claimed_at + lease_seconds）

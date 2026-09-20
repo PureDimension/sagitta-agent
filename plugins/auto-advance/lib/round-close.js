@@ -6,6 +6,8 @@ const ROUND_CLOSE_FIELDS = new Set([
   "next",
   "round_id",
   "blocked_reason",
+  "blocked_kind",
+  "evidence_json",
   "expected_updated_at",
 ]);
 const ROUND_TEXT_MAX_LENGTH = 1000;
@@ -57,14 +59,18 @@ export function validateRoundClosePayload(value) {
     if (typeof value.blocked_reason !== "string" || value.blocked_reason.trim().length === 0) {
       throw protocolError("action=blocked 必须提供 blocked_reason");
     }
+    if (value.blocked_kind !== undefined && !["need-human", "ripple-stop", "external", "technical"].includes(value.blocked_kind)) {
+      throw protocolError("action=blocked 必须提供合法 blocked_kind");
+    }
   } else if (Object.prototype.hasOwnProperty.call(value, "blocked_reason")) {
     throw protocolError("blocked_reason 只允许用于 action=blocked");
+  }
+  if (action !== "blocked" && Object.prototype.hasOwnProperty.call(value, "blocked_kind")) {
+    throw protocolError("blocked_kind 只允许用于 action=blocked");
   }
 
   if (Object.prototype.hasOwnProperty.call(value, "expected_updated_at")) {
     protocolText(value.expected_updated_at, "expected_updated_at", { maxLength: 128 });
-  } else if (action === "done" || action === "blocked") {
-    throw protocolError(`action=${action} 必须提供 expected_updated_at`);
   }
 
   return {
@@ -74,6 +80,8 @@ export function validateRoundClosePayload(value) {
     next,
     round_id: roundId,
     ...(action === "blocked" ? { blocked_reason: protocolText(value.blocked_reason, "blocked_reason") } : {}),
+    ...(action === "blocked" ? { blocked_kind: value.blocked_kind } : {}),
+    ...(Object.prototype.hasOwnProperty.call(value, "evidence_json") ? { evidence_json: value.evidence_json } : {}),
     ...(Object.prototype.hasOwnProperty.call(value, "expected_updated_at")
       ? { expected_updated_at: value.expected_updated_at.trim() }
       : {}),
