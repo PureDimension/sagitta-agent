@@ -7,7 +7,7 @@ import z from "@deepseek-ai/schemastery";
 import { CodexAppServer } from "./app-server.js";
 
 const name = "sagitta-codex";
-const inject = ["tools", "agents", "sagitta-async-work", "sagitta-manager"];
+const inject = ["tools", "agents", "systemPrompt", "sagitta-async-work", "sagitta-manager"];
 const DEFAULT_WORK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MAX_CONCURRENT = 4;
 
@@ -65,7 +65,7 @@ function requireAsyncWork(ctx) {
 
 function requireManager(ctx) {
   const service = managerFrom(ctx);
-  if (!service || typeof service.apiConfig !== "function") {
+  if (!service || typeof service.apiConfig !== "function" || typeof service.configSnapshot !== "function") {
     throw new Error("sagitta-manager 服务未加载或接口不完整；无法读取 codexModel");
   }
   return service;
@@ -336,6 +336,17 @@ function apply(ctx, config) {
     })();
     return disposePromise;
   };
+
+  // The preset persona is static; this section is its dynamic tail. `text` is a
+  // function because DSH re-evaluates function sections on every prompt assembly
+  // (dsh-system-prompt/lib/index.js:271), so changing the manager's settings
+  // changes what the model reads on the next turn — no restart, no re-install.
+  const manager = requireManager(ctx);
+  ctx.systemPrompt.section({
+    name: "sagitta:runtime",
+    order: 130,
+    text: () => `codex 默认模型（来自 Sagitta Manager 设置）：${manager.configSnapshot().codexModel}`,
+  });
 
   registerCodexTools(ctx, { resolved, records, disposed, appServer });
   ctx.effect(() => dispose, "sagitta-codex: app-server cleanup");

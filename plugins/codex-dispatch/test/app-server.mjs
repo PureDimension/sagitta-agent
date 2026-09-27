@@ -81,6 +81,7 @@ async function toolCase() {
 
   const asyncWork = new AsyncWorkRegistry();
   const tools = new Map();
+  const sections = new Map();
   const listeners = new Map();
   const requestLog = [];
   const turnEvents = [];
@@ -101,7 +102,11 @@ async function toolCase() {
     ctx = {
       tools: { register(tool) { tools.set(tool.name, tool); } },
       "sagitta-async-work": asyncWork,
-      "sagitta-manager": { apiConfig: async () => ({ codexModel: MODEL }) },
+      "sagitta-manager": {
+        apiConfig: async () => ({ codexModel: MODEL }),
+        configSnapshot: () => ({ codexModel: MODEL }),
+      },
+      systemPrompt: { section(section) { sections.set(section.name, section); } },
       logger: { warn(message) { console.log(`PLUGIN_WARN ${message}`); } },
       on(event, listener) {
         const set = listeners.get(event) ?? new Set();
@@ -116,6 +121,7 @@ async function toolCase() {
     const status = tools.get("codex_status");
     const append = tools.get("codex_append");
     assert.ok(dispatch && status && append, "all codex tools must be registered");
+    assert.match(sections.get("sagitta:runtime")?.text() ?? "", new RegExp(MODEL), "the runtime prompt section must render the manager's model");
     const exec = { agent: { id: "integration-owner" } };
 
     const first = await withDefaultHealthUnavailable(() => dispatch.execute({
