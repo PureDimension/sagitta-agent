@@ -6,6 +6,7 @@ import { requestWorker } from "./request.js";
 
 const name = "sagitta-manager";
 const namespace = "sagitta-manager";
+const inject = ["settings", "credentials"];
 
 class SagittaManagerService extends Service {
   constructor(ctx) {
@@ -67,4 +68,4 @@ function apply(ctx, config) {
   });
 }
 
-export { Config, apply, name };
+export { Config, apply, inject, name };
