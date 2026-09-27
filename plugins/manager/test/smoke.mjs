@@ -110,6 +110,16 @@ assert.deepEqual(await requestService.apiConfig(), {
 });
 console.log("apiConfig returns 9 fields and configurable credential refs: PASS");
 
+const failedDeployContext = makeContext({ ...requestConfig, repoPath: "missing-manager-smoke-repository" }, credentialValues);
+const deploymentWarnings = [];
+failedDeployContext.ctx.logger.warn = (...args) => deploymentWarnings.push(args);
+await apply(failedDeployContext.ctx, requestConfig);
+assert.equal(deploymentWarnings.length, 1);
+assert.match(deploymentWarnings[0][0], /automatic deployment failed; settings remain available/);
+assert.equal((await failedDeployContext.getService().apiConfig()).workerApiUrl, requestConfig.workerApiUrl);
+await assert.rejects(() => failedDeployContext.getService().deployWorker(), /ENOENT/);
+console.log("startup deployment failure preserves settings; explicit deployment still rejects: PASS");
+
 const proxyConnections = [];
 const proxy = net.createServer((socket) => {
   let request = "";

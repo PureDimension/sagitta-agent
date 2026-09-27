@@ -61,7 +61,9 @@ function apply(ctx, config) {
     }, "sagitta-manager: settings scope cleanup");
 
     if (scope.get().repoPath === "") return;
-    return service.deployWorker();
+    return service.deployWorker().catch((error) => {
+      ctx.logger.warn("sagitta-manager automatic deployment failed; settings remain available: %s", error.message);
+    });
   });
 }
 
