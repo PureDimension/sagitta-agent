@@ -4,12 +4,16 @@
 
 ## Sagitta 预设安装
 
-预设源位于本包的 `presets/sagitta`。在源码仓库运行
-`pwsh -File scripts/sync-preset.ps1 -RepoPath <仓库路径> -DshHome <DSH_HOME>`，
-将展开路径变量后的预设安装到 `<DSH_HOME>/.agent-presets/sagitta`。
-Profile 的 `agent-presets.config.includeUserRoot` 必须为 `true`（默认值）。
-DSH 0.1.1-rc.2 启动器会覆盖自定义 `roots`，不能只指向本包目录并关闭用户目录扫描。
-同步脚本会保留用户修改；包更新后应再次同步预设。
+预设随本包分发，位于 `presets/sagitta`：不复制到用户目录，也不做模板变量展开。
+
+Profile 的 `cordis.patch.yml` 需要一条 `agent-presets` 配置，把 DSH 的预设扫描根指向
+`<DSH_HOME>/profiles/web/node_modules/@sagitta/manager/presets`，并设 `includeUserRoot: false`。
+`scripts/install-profile-deps.ps1` 会幂等写入这一条（profile 的其它配置归用户所有，脚本不碰）。
+
+预设改动只需提交到仓库并让 profile 重新从 GitHub 安装
+（`pnpm update @sagitta/manager @sagitta/auto-advance @sagitta/async-work @sagitta/memory @sagitta/codex-dispatch`），
+不再有额外的同步步骤。因为不展开模板变量，`agent.cordis.yml` 里不要使用 `<VAR>` 形式的占位符
+（DSH 自身的 `{{cwd}}` 一类变量不受影响）。
 
 ## 配置字段
 

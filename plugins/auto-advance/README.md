@@ -17,7 +17,7 @@ Sagitta 的 Cordis 自主推进插件，包含：
 
 ## 间隔配置
 
-代码默认值是 `idleTimeoutMs: 15000`（15 秒，09-07 涟漪拍板），表示任务驱动轮询/续推的延迟。**注意**：install-profile-deps.ps1 会在 profile 的 `cordis.patch.yml` 写入显式 `idleTimeoutMs`（现值优先、覆盖代码默认），该写入值须与代码默认一致（当前 15000）；如临时调短测试，改 patch 后记得同步改 install 脚本源头的硬编码值，避免下次安装把旧值写回。settle 事件（异步任务完成）在 chat 模式也触发轻量"异步任务已完成"通知，不依赖该轮询；轮询仅用于自主推进模式下的任务驱动注入。
+代码默认值是 `idleTimeoutMs: 15000`（15 秒，09-07 涟漪拍板），表示任务驱动轮询/续推的延迟。该值只由代码默认提供：安装脚本不再向 `cordis.patch.yml` 写入插件配置（profile 配置归用户所有），需要调整时在 Settings 里改，不要在两处维护同一个数字。settle 事件（异步任务完成）在 chat 模式也触发轻量"异步任务已完成"通知，不依赖该轮询；轮询仅用于自主推进模式下的任务驱动注入。
 
 资源/退避配置默认值：`codexMaxConcurrent: 4`、`advancePromptCooldownMs: 30000`、`advancePromptBackoffFactor: 2`、`advancePromptMaxCooldownMs: 300000`、`advancePromptMaxInjections: 3`。`SAGITTA_CODEX_MAX_CONCURRENT` 可作为 `codexMaxConcurrent` 的环境变量回退；实际 codex-dispatch 配置与 auto-advance 配置应保持一致。
 

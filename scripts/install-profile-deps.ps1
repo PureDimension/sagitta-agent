@@ -1,307 +1,123 @@
 <#
-  tasksPath contract (UI-only stale display):
-  - An explicit -TasksPath wins.
-  - Otherwise, a non-empty tasksPath already present in the profile patch is
-    preserved semantically, so reinstalling the profile is idempotent.
-  - A new profile uses the temporary D:\workspace\sagitta-experience\TASKS.md
-    display path. This is intentionally not derived from RepoPath; it never
-    participates in autonomous task qualification.
+  Installs the Sagitta profile dependencies from GitHub and wires preset discovery.
 
-  statePath is runtime state, not repository content. New installs keep it in
-  the profile directory so source synchronization cannot collide with it; this
-  follows the existing auto-advance contract that an explicit statePath wins.
+  Every @sagitta/* dependency is declared as a git-hosted spec
+  (github:<Repo>#path:plugins/<name>), so the installed code is exactly the
+  repository commit that GitHub serves — never a local working copy. To move the
+  profile onto a newer commit: push it, then run
+  `pnpm install` after `pnpm update @sagitta/manager @sagitta/auto-advance
+  @sagitta/async-work @sagitta/memory @sagitta/codex-dispatch`.
+
+  This script owns exactly two bootstrap facts:
+  - dsh.profile.bundles: the three host-plane plugins. memory and codex-dispatch
+    are preset-plane rows; listing them as bundles would mount them twice.
+  - cordis.patch.yml: the agent-presets entry, so DSH discovers the sagitta
+    preset that ships inside @sagitta/manager/presets.
+
+  Everything else — the manager's own settings, auto-advance tuning, credentials
+  — is user-owned (Settings GUI / .credentials.yaml) and is never rewritten here.
 #>
 [CmdletBinding()]
 param(
     [string]$ProfilePath = '',
-    [string]$RepoPath = '',
-    [string]$TasksPath = '',
+    [string]$ProfileName = 'web',
+    [string]$Repo = 'PureDimension/sagitta-agent',
     [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'git-proxy.ps1')
 
-function Ensure-Map {
-    param([System.Collections.IDictionary]$Parent, [string]$Key)
-    if (-not $Parent.Contains($Key) -or $null -eq $Parent[$Key]) { $Parent[$Key] = [ordered]@{} }
-    if ($Parent[$Key] -isnot [System.Collections.IDictionary]) { throw "Profile package.json field '$Key' must be an object." }
-    return $Parent[$Key]
+$plugins = [ordered]@{
+    '@sagitta/manager'        = 'manager'
+    '@sagitta/memory'         = 'memory'
+    '@sagitta/auto-advance'   = 'auto-advance'
+    '@sagitta/async-work'     = 'async-work'
+    '@sagitta/codex-dispatch' = 'codex-dispatch'
 }
-
-function Quote-Yaml {
-    param([string]$Value)
-    return "'$(($Value -replace "'", "''"))'"
-}
+$bundles = @('@sagitta/manager', '@sagitta/auto-advance', '@sagitta/async-work')
 
 function Backup-File {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    $timestamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
-    $backupPath = "$Path.bak.$timestamp"
-    $index = 1
-    while (Test-Path -LiteralPath $backupPath) {
-        $backupPath = "$Path.bak.$timestamp.$index"
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $stamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
+    Copy-Item -LiteralPath $Path -Destination "$Path.bak.$stamp"
+    Write-Host "[install-profile-deps] backup: $Path.bak.$stamp"
+}
+
+function Set-AgentPresetsEntry {
+    param([string[]]$Lines, [string]$ProfileName)
+    $block = @(
+        '- id: agent-presets'
+        '  config:'
+        '    default: sagitta'
+        '    includeUserRoot: false'
+        '    roots:'
+        "      - path: !!js dshHomePath('profiles', '$ProfileName', 'node_modules', '@sagitta', 'manager', 'presets')"
+        '        trust: user'
+    )
+    $preamble = [System.Collections.Generic.List[string]]::new()
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+    while ($index -lt $Lines.Count -and $Lines[$index] -notmatch '^-\s+id:') {
+        $preamble.Add($Lines[$index])
         $index++
     }
-    Copy-Item -LiteralPath $Path -Destination $backupPath
-    Write-Host "[install-profile-deps] backup: $backupPath"
-    return $backupPath
-}
-
-function Get-PatchId {
-    param([string]$Line)
-    $match = [regex]::Match($Line, '^-\s+id:\s*(?:''([^'']+)''|"([^"]+)"|([^\s#]+))\s*(?:#.*)?$')
-    if (-not $match.Success) { return $null }
-    foreach ($index in 1..3) { if ($match.Groups[$index].Success) { return $match.Groups[$index].Value } }
-    return $null
-}
-
-function Get-PatchConfigValue {
-    param(
-        [AllowNull()][string]$Text,
-        [string]$PatchId,
-        [string]$Key
-    )
-    if ([string]::IsNullOrEmpty($Text)) { return $null }
-
-    $lines = @($Text -split "`r?`n")
-    $keyPattern = [regex]::Escape($Key)
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ((Get-PatchId $lines[$index]) -ne $PatchId) { continue }
-        $end = $index + 1
-        while ($end -lt $lines.Count -and $null -eq (Get-PatchId $lines[$end])) { $end++ }
-        for ($entryIndex = $index + 1; $entryIndex -lt $end; $entryIndex++) {
-            $line = $lines[$entryIndex]
-            $singleQuoted = [regex]::Match($line, "^\s*$keyPattern\s*:\s*'((?:''|[^'])*)'(?:\s+#.*)?$")
-            if ($singleQuoted.Success) { return $singleQuoted.Groups[1].Value -replace "''", "'" }
-
-            $doubleQuoted = [regex]::Match($line, ('^\s*' + $keyPattern + '\s*:\s*"((?:\\.|[^"])*)"(?:\s+#.*)?$'))
-            if ($doubleQuoted.Success) { return $doubleQuoted.Groups[1].Value }
-
-            $plain = [regex]::Match($line, "^\s*$keyPattern\s*:\s*(?<value>[^#]*?)\s*(?:#.*)?$")
-            if ($plain.Success) {
-                $value = $plain.Groups['value'].Value.Trim()
-                if ($value -and $value -notin @('null', '~')) { return $value }
-                return $null
+    while ($index -lt $Lines.Count) {
+        $start = $index
+        $index++
+        while ($index -lt $Lines.Count -and $Lines[$index] -notmatch '^-\s+id:') { $index++ }
+        $entryLines = @($Lines[$start..($index - 1)])
+        # Blank and comment lines trailing an entry belong to the file, not to the
+        # entry: holding them separately lets this function replace one entry's
+        # configuration without deleting a reader's annotations.
+        $trailing = [System.Collections.Generic.List[string]]::new()
+        while ($entryLines.Count -gt 1) {
+            $last = $entryLines[$entryLines.Count - 1]
+            if ($last.Trim() -eq '' -or $last.TrimStart().StartsWith('#')) {
+                $trailing.Insert(0, $last)
+                $entryLines = @($entryLines[0..($entryLines.Count - 2)])
+                continue
             }
+            break
         }
-        return $null
+        $id = ($entryLines[0] -replace '^-\s+id:\s*', '').Trim().Trim("'").Trim('"')
+        $entries.Add([pscustomobject]@{ Id = $id; Lines = $entryLines; Trailing = @($trailing) })
     }
-    return $null
-}
-
-function Get-PatchBlockConfig {
-    param(
-        [AllowNull()][string]$Text,
-        [string]$PatchId
-    )
-    # 返回指定 id 块的 config 字段（仅单行 key: value，保留原行文本）：id → 行
-    $result = [ordered]@{}
-    if ([string]::IsNullOrEmpty($Text)) { return $result }
-    $lines = @($Text -split "`r?`n")
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ((Get-PatchId $lines[$index]) -ne $PatchId) { continue }
-        $end = $index + 1
-        while ($end -lt $lines.Count -and $null -eq (Get-PatchId $lines[$end])) { $end++ }
-        for ($entryIndex = $index + 1; $entryIndex -lt $end; $entryIndex++) {
-            $line = $lines[$entryIndex]
-            $match = [regex]::Match($line, '^\s{2,}([A-Za-z0-9_-]+)\s*:\s*')
-            if ($match.Success -and $match.Groups[1].Value -notin @('config')) {
-                $result[$match.Groups[1].Value] = $line
-            }
-        }
-        break
-    }
-    return $result
-}
-
-function Merge-BlockLines {
-    param(
-        [string[]]$NewLines,
-        [AllowNull()][string[]]$ExistingLines
-    )
-    # 新块优先；现有块中未在新块提及的 config 字段追加保留（防抹掉手工配置）
-    $newKeys = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($line in $NewLines) {
-        $match = [regex]::Match($line, '^\s{2,}([A-Za-z0-9_-]+)\s*:\s*')
-        if ($match.Success -and $match.Groups[1].Value -notin @('config')) {
-            $null = $newKeys.Add($match.Groups[1].Value)
-        }
-    }
-    $merged = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in $NewLines) { $merged.Add($line) }
-    if ($null -ne $ExistingLines) {
-        foreach ($line in $ExistingLines) {
-            $match = [regex]::Match($line, '^\s{2,}([A-Za-z0-9_-]+)\s*:\s*')
-            if ($match.Success -and $match.Groups[1].Value -notin @('config') -and -not $newKeys.Contains($match.Groups[1].Value)) {
-                $merged.Add($line)
-            }
-        }
-    }
-    return $merged.ToArray()
-}
-
-function Upsert-PatchEntries {
-    param([string]$Text, [System.Collections.IDictionary]$Entries)
-    $eol = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $lines = @($Text -split "`r?`n")
-    if ($lines.Count -gt 0 -and $lines[-1] -eq '') {
-        $lines = if ($lines.Count -eq 1) { @() } else { @($lines[0..($lines.Count - 2)]) }
-    }
-    $output = New-Object System.Collections.Generic.List[string]
-    $seen = @{}
-    $index = 0
-    while ($index -lt $lines.Count) {
-        $id = Get-PatchId $lines[$index]
-        if ($null -eq $id -or -not $Entries.Contains($id)) {
-            $null = $output.Add($lines[$index])
-            $index++
-            continue
-        }
-        $end = $index + 1
-        while ($end -lt $lines.Count -and $null -eq (Get-PatchId $lines[$end])) { $end++ }
-        if (-not $seen.ContainsKey($id)) {
-            $existingBlock = @($lines[$index..($end - 1)])
-            foreach ($entryLine in (Merge-BlockLines -NewLines @($Entries[$id]) -ExistingLines $existingBlock)) {
-                $null = $output.Add($entryLine)
-            }
-            $seen[$id] = $true
-            if ($end -lt $lines.Count) { $null = $output.Add('') }
-        }
-        $index = $end
-    }
-    foreach ($entry in $Entries.GetEnumerator()) {
-        if (-not $seen.ContainsKey($entry.Key)) {
-            if ($output.Count -gt 0 -and $output[$output.Count - 1].Trim() -ne '') { $null = $output.Add('') }
-            foreach ($entryLine in $entry.Value) { $null = $output.Add($entryLine) }
-        }
-    }
-    if ($output.Count -eq 0) { $null = $output.Add('# Sagitta profile patch; generated id-targeted entries.') }
-    return ($output -join $eol) + $eol
-}
-
-function Select-PackageManager {
-    param([string]$ProfilePath)
-    $pnpmLock = Test-Path -LiteralPath (Join-Path $ProfilePath 'pnpm-lock.yaml') -PathType Leaf
-    $npmLock = Test-Path -LiteralPath (Join-Path $ProfilePath 'package-lock.json') -PathType Leaf
-    if ($pnpmLock -and $npmLock) { throw "Profile contains both pnpm-lock.yaml and package-lock.json; refusing to guess." }
-    if ($pnpmLock) {
-        if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) { throw 'pnpm is required because the profile has pnpm-lock.yaml.' }
-        return [pscustomobject]@{ Command = 'pnpm'; Arguments = @('install', '--lockfile=false') }
-    }
-    if ($npmLock) {
-        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw 'npm is required because the profile has package-lock.json.' }
-        return [pscustomobject]@{ Command = 'npm'; Arguments = @('install', '--no-audit', '--no-fund') }
-    }
-    if (Get-Command pnpm -ErrorAction SilentlyContinue) { return [pscustomobject]@{ Command = 'pnpm'; Arguments = @('install', '--lockfile=false') } }
-    if (Get-Command npm -ErrorAction SilentlyContinue) { return [pscustomobject]@{ Command = 'npm'; Arguments = @('install', '--no-audit', '--no-fund') } }
-    throw 'Neither pnpm nor npm is available for profile dependency installation.'
-}
-
-function Invoke-PackageInstall {
-    param($PackageManager, [string]$WorkingDirectory)
-    Push-Location -LiteralPath $WorkingDirectory
-    try {
-        $arguments = [string[]]@($PackageManager.Arguments)
-        & $PackageManager.Command @arguments
-        if ($LASTEXITCODE -ne 0) { throw "Profile package installation failed with exit code ${LASTEXITCODE}." }
-    } finally {
-        Pop-Location
-    }
-}
-
-function Copy-PluginTree {
-    param(
-        [string]$SourcePath,
-        [string]$TargetPath
-    )
-    foreach ($item in (Get-ChildItem -LiteralPath $SourcePath -Force)) {
-        if ($item.Name -in @('node_modules', '.git')) { continue }
-        $destination = Join-Path $TargetPath $item.Name
-        if ($item.PSIsContainer) {
-            if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
-                New-Item -ItemType Directory -Force -Path $destination | Out-Null
-            }
-            Copy-PluginTree -SourcePath $item.FullName -TargetPath $destination
+    $output = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $preamble) { $output.Add($line) }
+    $written = $false
+    foreach ($entry in $entries) {
+        if ($entry.Id -eq 'agent-presets') {
+            if ($written) { continue }
+            foreach ($line in $block) { $output.Add($line) }
+            $written = $true
         } else {
-            Copy-Item -LiteralPath $item.FullName -Destination $destination -Force
+            foreach ($line in $entry.Lines) { $output.Add($line) }
         }
+        foreach ($line in $entry.Trailing) { $output.Add($line) }
     }
+    if (-not $written) {
+        if ($output.Count -gt 0 -and $output[$output.Count - 1].Trim() -ne '') { $output.Add('') }
+        foreach ($line in $block) { $output.Add($line) }
+    }
+    return $output
 }
 
-function Sync-LocalPluginFiles {
-    param(
-        [string]$SourcePath,
-        [string]$TargetPath
-    )
-    $sourceFull = [IO.Path]::GetFullPath($SourcePath).TrimEnd('\')
-    $targetFull = [IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
-    if ($sourceFull -ieq $targetFull) { return }
-    if (-not (Test-Path -LiteralPath $TargetPath -PathType Container)) {
-        throw "Local plugin dependency was not materialized: $TargetPath"
-    }
-    # pnpm may retain a copied file: dependency when only source contents
-    # changed. Copy the checked-out package after install so restart loads the
-    # current repository code instead of a stale hoisted copy.
-    Copy-PluginTree -SourcePath $SourcePath -TargetPath $TargetPath
-}
-
-if ([string]::IsNullOrWhiteSpace($RepoPath)) {
-    $RepoPath = if (-not [string]::IsNullOrWhiteSpace($env:SAGITTA_AGENT_DIR)) { $env:SAGITTA_AGENT_DIR } else { Join-Path $PSScriptRoot '..' }
-}
 if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
     $dshHome = if (-not [string]::IsNullOrWhiteSpace($env:DSH_HOME)) {
         $env:DSH_HOME
     } else {
         Join-Path (if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }) '.dsh'
     }
-    $ProfilePath = Join-Path $dshHome 'profiles\web'
+    $ProfilePath = Join-Path $dshHome "profiles\$ProfileName"
 }
-
-$RepoPath = [IO.Path]::GetFullPath($RepoPath)
 $ProfilePath = [IO.Path]::GetFullPath($ProfilePath)
 $packageJsonPath = Join-Path $ProfilePath 'package.json'
 $patchPath = Join-Path $ProfilePath 'cordis.patch.yml'
 
-$plugins = [ordered]@{
-    '@sagitta/manager'       = 'plugins\manager'
-    '@sagitta/memory'        = 'plugins\memory'
-    '@sagitta/auto-advance'  = 'plugins\auto-advance'
-    '@sagitta/async-work'    = 'plugins\async-work'
-    '@sagitta/codex-dispatch' = 'plugins\codex-dispatch'
-}
-$bundleNames = @(
-    '@sagitta/manager'
-    '@sagitta/memory'
-    '@sagitta/auto-advance'
-    '@sagitta/async-work'
-    '@sagitta/codex-dispatch'
-)
-
 Write-Host "[install-profile-deps] profile: $ProfilePath"
-Write-Host "[install-profile-deps] repository: $RepoPath"
-Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/async-work, @sagitta/codex-dispatch'
-
-if (-not $DryRun) {
-    foreach ($relativePluginPath in $plugins.Values) {
-        $pluginPath = Join-Path $RepoPath $relativePluginPath
-        $manifestPath = Join-Path $pluginPath 'package.json'
-        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-            throw "Missing plugin package.json: $pluginPath"
-        }
-        # 校验 dsh.bundle manifest（DSH 启动前置要求，缺失会直接 dump-config 失败）
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $bundlePatch = $manifest.dsh.bundle.patch
-        if ([string]::IsNullOrWhiteSpace($bundlePatch)) {
-            throw "Plugin $($manifest.name) declares no dsh.bundle.patch in package.json — DSH 启动会失败（codex 审查 08-30 实证）。"
-        }
-        if (-not (Test-Path -LiteralPath (Join-Path $pluginPath $bundlePatch) -PathType Leaf)) {
-            throw "Plugin $($manifest.name) dsh.bundle.patch 指向的文件不存在：$bundlePatch"
-        }
-    }
-} else {
-    Write-Host '[install-profile-deps] dry-run: source package checks and package-manager execution are skipped.'
-}
+Write-Host "[install-profile-deps] source: github:$Repo#path:plugins/<name>"
 
 if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) {
     if ($DryRun) {
@@ -312,11 +128,7 @@ if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) {
 }
 
 $packageData = if (Test-Path -LiteralPath $packageJsonPath -PathType Leaf) {
-    try {
-        Get-Content -LiteralPath $packageJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
-    } catch {
-        throw "Invalid profile package.json: $packageJsonPath"
-    }
+    Get-Content -LiteralPath $packageJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
 } else {
     [ordered]@{
         name         = 'dsh-profile-web'
@@ -327,36 +139,28 @@ $packageData = if (Test-Path -LiteralPath $packageJsonPath -PathType Leaf) {
     }
 }
 if ($packageData -isnot [System.Collections.IDictionary]) { throw "Profile package.json must contain a JSON object: $packageJsonPath" }
+if (-not $packageData.Contains('dependencies')) { $packageData['dependencies'] = [ordered]@{} }
+if (-not $packageData.Contains('dsh')) { $packageData['dsh'] = [ordered]@{} }
+if ($packageData['dsh'] -isnot [System.Collections.IDictionary]) { throw "Profile package.json 'dsh' must be an object: $packageJsonPath" }
+if (-not $packageData['dsh'].Contains('profile')) { $packageData['dsh']['profile'] = [ordered]@{} }
+if ($packageData['dsh']['profile'] -isnot [System.Collections.IDictionary]) { throw "Profile package.json 'dsh.profile' must be an object: $packageJsonPath" }
 
-$dependencies = Ensure-Map -Parent $packageData -Key 'dependencies'
-foreach ($entry in $plugins.GetEnumerator()) {
-    $pluginPath = Join-Path $RepoPath $entry.Value
-    $relativePath = [IO.Path]::GetRelativePath($ProfilePath, $pluginPath).Replace('\', '/')
-    if ([IO.Path]::IsPathRooted($relativePath)) {
-        # A relative path cannot cross Windows drive volumes; use an absolute
-        # file spec in that case instead of producing the invalid ./D:/... form.
-        $dependencies[$entry.Key] = "file:$($pluginPath.Replace('\', '/'))"
-    } else {
-        if (-not $relativePath.StartsWith('.')) { $relativePath = "./$relativePath" }
-        $dependencies[$entry.Key] = "file:$relativePath"
-    }
+foreach ($name in $plugins.Keys) {
+    $packageData['dependencies'][$name] = "github:$Repo#path:plugins/$($plugins[$name])"
 }
+$existingBundles = @($packageData['dsh']['profile']['bundles'])
+$preservedBundles = @($existingBundles | Where-Object { $_ -notin @($plugins.Keys) })
+$packageData['dsh']['profile']['bundles'] = @($preservedBundles + $bundles)
 
-$dsh = Ensure-Map -Parent $packageData -Key 'dsh'
-$profile = Ensure-Map -Parent $dsh -Key 'profile'
-$existingBundles = if ($profile.Contains('bundles') -and $null -ne $profile['bundles']) { @($profile['bundles']) } else { @() }
-$preservedBundles = @($existingBundles | Where-Object { $_ -notin $bundleNames })
-$profile['bundles'] = @($preservedBundles + $bundleNames)
-
-$packageBefore = if (Test-Path -LiteralPath $packageJsonPath -PathType Leaf) {
+$before = if (Test-Path -LiteralPath $packageJsonPath -PathType Leaf) {
     Get-Content -LiteralPath $packageJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable | ConvertTo-Json -Depth 100 -Compress
 } else { '' }
-$packageAfter = $packageData | ConvertTo-Json -Depth 100 -Compress
-if ($packageBefore -ne $packageAfter) {
+$after = $packageData | ConvertTo-Json -Depth 100 -Compress
+if ($before -ne $after) {
     if ($DryRun) {
-        Write-Host "[install-profile-deps] dry-run: would update $packageJsonPath (backup required before write)."
+        Write-Host "[install-profile-deps] dry-run: would rewrite $packageJsonPath with github: dependencies and host bundles."
     } else {
-        $null = Backup-File -Path $packageJsonPath
+        Backup-File -Path $packageJsonPath
         ($packageData | ConvertTo-Json -Depth 100) + "`n" | Set-Content -LiteralPath $packageJsonPath -Encoding UTF8
         Write-Host "[install-profile-deps] updated $packageJsonPath"
     }
@@ -364,99 +168,58 @@ if ($packageBefore -ne $packageAfter) {
     Write-Host "[install-profile-deps] unchanged $packageJsonPath"
 }
 
-$existingPatch = if (Test-Path -LiteralPath $patchPath -PathType Leaf) { Get-Content -LiteralPath $patchPath -Raw -Encoding UTF8 } else { '' }
-$existingTasksPath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-auto-advance' -Key 'tasksPath'
-$effectiveTasksPath = if (-not [string]::IsNullOrWhiteSpace($TasksPath)) {
-    $TasksPath
-} elseif (-not [string]::IsNullOrWhiteSpace($existingTasksPath)) {
-    $existingTasksPath
-} else {
-    # Retained only as the read-only UI stale-display path. Autonomous
-    # qualification always uses the manager-backed cloud task API.
-    'D:\workspace\sagitta-experience\TASKS.md'
+$patchText = if (Test-Path -LiteralPath $patchPath -PathType Leaf) { Get-Content -LiteralPath $patchPath -Raw -Encoding UTF8 } else { '' }
+$eol = if ($patchText.Contains("`r`n")) { "`r`n" } else { "`n" }
+$patchLines = if ([string]::IsNullOrEmpty($patchText)) { @() } else {
+    # Drop the final empty element a trailing newline produces, so re-running this
+    # script does not grow the file by one blank line per run.
+    $split = @($patchText -split "`r?`n")
+    if ($split.Count -gt 0 -and $split[$split.Count - 1] -eq '') { $split = @($split[0..($split.Count - 2)]) }
+    $split
 }
-
-# statePath：现值优先（幂等，不改变已有运行语义）；新装才放 profile 内（防源码同步冲突）。
-$existingStatePath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-auto-advance' -Key 'statePath'
-$statePath = if (-not [string]::IsNullOrWhiteSpace($existingStatePath)) { $existingStatePath } else { Join-Path $ProfilePath '.sagitta-auto-advance.json' }
-$statePathYaml = Quote-Yaml $statePath
-$tasksPathYaml = Quote-Yaml $effectiveTasksPath
-# memory.proxy：现值优先（幂等）；缺失时默认本机 clash 混合端口 7897——
-# 本机 Node 直连 workers.dev 被墙，必须走代理，空串会解析成 direct 导致 20s 超时（08-30 实证）。
-$existingMemoryProxy = Get-PatchConfigValue -Text $existingPatch -PatchId 'memory' -Key 'proxy'
-$memoryProxy = if (-not [string]::IsNullOrWhiteSpace($existingMemoryProxy)) { $existingMemoryProxy } else { 'http://127.0.0.1:7897' }
-$memoryProxyYaml = Quote-Yaml $memoryProxy
-# sagitta-manager.workerApiUrl：现值优先，缺失给空（由用户在 Settings 里配置）。
-$existingWorkerApiUrl = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-manager' -Key 'workerApiUrl'
-$workerApiUrl = if (-not [string]::IsNullOrWhiteSpace($existingWorkerApiUrl)) { $existingWorkerApiUrl } else { '' }
-$workerApiUrlYaml = Quote-Yaml $workerApiUrl
-
-# 行为默认值以下只作 profile bootstrap，必须与各插件代码默认保持一致：
-# memory.timeoutMs=20000、auto-advance.idleTimeoutMs=15000、
-# async-work.defaultTimeoutMs=2h、codex.defaultModel=gpt-5.6-luna。
-$patchEntries = [ordered]@{
-    'agent-presets' = @(
-        '- id: agent-presets'
-        '  config:'
-        '    default: sagitta'
-        '    includeUserRoot: true'
-    )
-    'sagitta-manager' = @(
-        '- id: sagitta-manager'
-        '  config:'
-        "    workerApiUrl: $workerApiUrlYaml"
-    )
-    'memory' = @(
-        '- id: memory'
-        '  config:'
-        "    proxy: $memoryProxyYaml   # clash 混合端口；'direct' 或空串 = 直连"
-        '    timeoutMs: 20000   # 与 plugins/memory/lib/index.js 默认一致'
-    )
-    'sagitta-auto-advance' = @(
-        '- id: sagitta-auto-advance'
-        '  config:'
-        '    idleTimeoutMs: 15000   # 15s 快速注入（09-07 涟漪拍板；与 service.js DEFAULT_IDLE_TIMEOUT_MS 一致）'
-        "    statePath: $statePathYaml"
-        "    tasksPath: $tasksPathYaml"
-    )
-    'sagitta-async-work' = @(
-        '- id: sagitta-async-work'
-        '  config:'
-        '    defaultTimeoutMs: 7200000   # 2h；与 plugins/async-work/lib/registry.js 默认一致'
-    )
-    'sagitta-codex' = @(
-        '- id: sagitta-codex'
-        '  config:'
-        "    defaultModel: 'gpt-5.6-luna'   # 与 codex-dispatch DEFAULT_MODEL / preset 档位一致"
-    )
-}
-
-$updatedPatch = Upsert-PatchEntries -Text $existingPatch -Entries $patchEntries
-if ($updatedPatch -ne $existingPatch) {
+$updatedLines = Set-AgentPresetsEntry -Lines $patchLines -ProfileName $ProfileName
+$updatedPatch = ($updatedLines -join $eol) + $eol
+if ($updatedPatch -ne $patchText) {
     if ($DryRun) {
-        Write-Host "[install-profile-deps] dry-run: would update $patchPath with id-targeted entries (backup required before write)."
+        Write-Host "[install-profile-deps] dry-run: would write the agent-presets entry in $patchPath."
     } else {
-        $null = Backup-File -Path $patchPath
-        $updatedPatch | Set-Content -LiteralPath $patchPath -Encoding UTF8 -NoNewline
+        Backup-File -Path $patchPath
+        [IO.File]::WriteAllText($patchPath, $updatedPatch, [Text.UTF8Encoding]::new($false))
         Write-Host "[install-profile-deps] updated $patchPath"
     }
 } else {
     Write-Host "[install-profile-deps] unchanged $patchPath"
 }
 
-$packageManager = Select-PackageManager -ProfilePath $ProfilePath
 if ($DryRun) {
-    Write-Host "[install-profile-deps] dry-run: would run $($packageManager.Command) $($packageManager.Arguments -join ' ')"
-    return [pscustomobject]@{ Status = 'planned'; Profile = $ProfilePath; PackageManager = $packageManager.Command }
+    Write-Host "[install-profile-deps] dry-run: would run pnpm install --config.auto-install-peers=false."
+    return [pscustomobject]@{ Status = 'planned'; Profile = $ProfilePath }
 }
 
-Invoke-PackageInstall -PackageManager $packageManager -WorkingDirectory $ProfilePath
-foreach ($packageName in $plugins.Keys) {
-    $installedPath = Join-Path $ProfilePath (Join-Path 'node_modules' $packageName)
-    if (-not (Test-Path -LiteralPath $installedPath)) {
-        throw "Package manager completed but the local plugin is not resolvable: $packageName"
-    }
-    Sync-LocalPluginFiles -SourcePath (Join-Path $RepoPath $plugins[$packageName]) -TargetPath $installedPath
+if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) { throw 'pnpm is required because the profile is a pnpm project.' }
+
+Use-SagittaGitProxy -Proxy (Get-SagittaGitProxy)
+Push-Location -LiteralPath $ProfilePath
+try {
+    # No --lockfile=false: the lockfile records the exact resolved commit, and it
+    # is part of what makes an install reproducible.
+    & pnpm install --config.auto-install-peers=false
+    if ($LASTEXITCODE -ne 0) { throw "Profile package installation failed with exit code $LASTEXITCODE." }
+} finally {
+    Pop-Location
 }
-Write-Host '[install-profile-deps] local plugin dependencies are installed and synchronized.'
-return [pscustomobject]@{ Status = 'installed'; Profile = $ProfilePath; PackageManager = $packageManager.Command }
+
+foreach ($name in $plugins.Keys) {
+    $installedManifest = Join-Path $ProfilePath (Join-Path 'node_modules' (Join-Path $name 'package.json'))
+    if (-not (Test-Path -LiteralPath $installedManifest -PathType Leaf)) {
+        throw "Package manager completed but the dependency is not resolvable: $name"
+    }
+}
+$presetPath = Join-Path $ProfilePath 'node_modules\@sagitta\manager\presets\sagitta'
+foreach ($fileName in @('agent.cordis.yml', 'preset.yml')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $presetPath $fileName) -PathType Leaf)) {
+        throw "Packaged preset is incomplete: $presetPath\$fileName"
+    }
+}
+Write-Host '[install-profile-deps] dependencies installed from GitHub; preset discovery wired.'
+return [pscustomobject]@{ Status = 'installed'; Profile = $ProfilePath; Repo = $Repo }
