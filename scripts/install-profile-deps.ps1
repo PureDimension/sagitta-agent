@@ -11,8 +11,11 @@
   This script owns exactly two bootstrap facts:
   - dsh.profile.bundles: the three host-plane plugins. memory and codex-dispatch
     are preset-plane rows; listing them as bundles would mount them twice.
-  - cordis.patch.yml: the agent-presets entry, so DSH discovers the sagitta
-    preset that ships inside @sagitta/manager/presets.
+  - the sagitta preset's discoverability: patch `agent-presets` back to
+    `default: sagitta` + `includeUserRoot: true`, and materialize the packaged
+    preset into <DSH_HOME>/.agent-presets/sagitta. DSH overwrites `roots` with
+    its own shipped root, so a preset referenced only from the package is never
+    discovered (see the block comment in Set-AgentPresetsEntry).
 
   Everything else — the manager's own settings, auto-advance tuning, credentials
   — is user-owned (Settings GUI / .credentials.yaml) and is never rewritten here.
@@ -47,14 +50,16 @@ function Backup-File {
 
 function Set-AgentPresetsEntry {
     param([string[]]$Lines, [string]$ProfileName)
+    # DSH 会在 profile 组装阶段用它自己的 shipped root 覆盖 `roots`
+    # （dsh/lib/profile-boot-*.js：config: { ...userConfig, roots: [{path: SHIPPED_PRESET_ROOT}] }），
+    # 所以这里写 roots 没有任何作用：唯一能被发现的用户级预设位置就是
+    # <DSH_HOME>/.agent-presets/<id>。安装脚本因此负责把包里的预设物化到那里，
+    # 并打开 includeUserRoot；下面不再写 roots。
     $block = @(
         '- id: agent-presets'
         '  config:'
         '    default: sagitta'
-        '    includeUserRoot: false'
-        '    roots:'
-        "      - path: !!js dshHomePath('profiles', '$ProfileName', 'node_modules', '@sagitta', 'manager', 'presets')"
-        '        trust: user'
+        '    includeUserRoot: true'
     )
     $preamble = [System.Collections.Generic.List[string]]::new()
     $entries = [System.Collections.Generic.List[object]]::new()
@@ -215,11 +220,45 @@ foreach ($name in $plugins.Keys) {
         throw "Package manager completed but the dependency is not resolvable: $name"
     }
 }
-$presetPath = Join-Path $ProfilePath 'node_modules\@sagitta\manager\presets\sagitta'
-foreach ($fileName in @('agent.cordis.yml', 'preset.yml')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $presetPath $fileName) -PathType Leaf)) {
-        throw "Packaged preset is incomplete: $presetPath\$fileName"
+
+$presetSourcePath = Join-Path $ProfilePath 'node_modules\@sagitta\manager\presets\sagitta'
+$presetFiles = @('agent.cordis.yml', 'preset.yml')
+foreach ($fileName in $presetFiles) {
+    if (-not (Test-Path -LiteralPath (Join-Path $presetSourcePath $fileName) -PathType Leaf)) {
+        throw "Packaged preset is incomplete: $presetSourcePath\$fileName"
     }
 }
-Write-Host '[install-profile-deps] dependencies installed from GitHub; preset discovery wired.'
+
+# DSH 在 profile 组装阶段用它自带的 shipped root 覆盖 `roots`，因此 profile 里写
+# roots 不生效——用户级预设唯一能被发现的位置是 <DSH_HOME>/.agent-presets/<id>。
+# 包内那份是唯一源，这里把它物化过去；加载时不展开任何模板，所以遇到 <VAR> 形式的
+# 占位符直接报错，而不是把一个字面量塞进模型上下文。
+$dshHomePath = Split-Path -Parent (Split-Path -Parent $ProfilePath)
+$userPresetPath = Join-Path $dshHomePath '.agent-presets\sagitta'
+if ($DryRun) {
+    Write-Host "[install-profile-deps] dry-run: would materialize the packaged preset into $userPresetPath."
+    return [pscustomobject]@{ Status = 'planned'; Profile = $ProfilePath }
+}
+foreach ($fileName in $presetFiles) {
+    $source = Join-Path $presetSourcePath $fileName
+    $text = Get-Content -LiteralPath $source -Raw -Encoding UTF8
+    if ($text -match '<[A-Z_]{3,}>') { throw "Packaged preset contains a template marker that nothing expands at load time: $source" }
+    $target = Join-Path $userPresetPath $fileName
+    if ((Test-Path -LiteralPath $target -PathType Leaf) -and
+        ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash)) {
+        continue
+    }
+    New-Item -ItemType Directory -Force -Path $userPresetPath | Out-Null
+    if (Test-Path -LiteralPath $target -PathType Leaf) { Backup-File -Path $target }
+    [IO.File]::WriteAllText($target, $text, [Text.UTF8Encoding]::new($false))
+    Write-Host "[install-profile-deps] materialized $target"
+}
+foreach ($fileName in $presetFiles) {
+    $source = Join-Path $presetSourcePath $fileName
+    $target = Join-Path $userPresetPath $fileName
+    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+        throw "Materialized preset does not match the packaged source: $target"
+    }
+}
+Write-Host '[install-profile-deps] dependencies installed from GitHub; preset materialized into the user preset root.'
 return [pscustomobject]@{ Status = 'installed'; Profile = $ProfilePath; Repo = $Repo }

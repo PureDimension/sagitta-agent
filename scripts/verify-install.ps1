@@ -56,12 +56,23 @@ $packageText = if (Test-Path -LiteralPath $packageJsonPath -PathType Leaf) {
 } else { '' }
 $checks['dependencies are git-hosted'] = ($packageText -match 'github:' -and $packageText -notmatch '"@sagitta/[^"]+"\s*:\s*"file:')
 
-# The sagitta preset ships inside @sagitta/manager and is discovered through the
-# profile patch, so the packaged files must exist on disk.
+# The packaged preset must be materialized into the user preset root: DSH
+# overwrites `roots` with its own shipped root, so <DSH_HOME>/.agent-presets is
+# the only discoverable location, and the two copies must stay identical.
 $presetPath = Join-Path $profilePath 'node_modules\@sagitta\manager\presets\sagitta'
-$checks['packaged preset files'] = (
-    (Test-Path -LiteralPath (Join-Path $presetPath 'agent.cordis.yml') -PathType Leaf) -and
-    (Test-Path -LiteralPath (Join-Path $presetPath 'preset.yml') -PathType Leaf))
+$userPresetPath = Join-Path (Split-Path -Parent (Split-Path -Parent $profilePath)) '.agent-presets\sagitta'
+$presetFiles = @('agent.cordis.yml', 'preset.yml')
+$presetChecks = foreach ($fileName in $presetFiles) {
+    $source = Join-Path $presetPath $fileName
+    $target = Join-Path $userPresetPath $fileName
+    (Test-Path -LiteralPath $source -PathType Leaf) -and (Test-Path -LiteralPath $target -PathType Leaf) -and
+        ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash)
+}
+$checks['packaged preset materialized'] = (@($presetChecks) -notcontains $false)
+
+$patchPath = Join-Path $profilePath 'cordis.patch.yml'
+$patchText = if (Test-Path -LiteralPath $patchPath -PathType Leaf) { Get-Content -LiteralPath $patchPath -Raw -Encoding UTF8 } else { '' }
+$checks['agent-presets opens the user root'] = ($patchText -match '(?m)^\s+includeUserRoot:\s*true\s*$' -and $patchText -notmatch '(?m)^\s+roots:\s*$')
 
 # memory and codex-dispatch are preset-plane rows rather than bundles; they must
 # still be installed dependencies.

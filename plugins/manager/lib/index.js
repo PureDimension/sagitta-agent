@@ -17,6 +17,14 @@ class SagittaManagerService extends Service {
     this.scope = scope;
   }
 
+  // Synchronous view of the live settings, for callers that cannot await —
+  // prompt assembly registrations read it on every render, so a Settings change
+  // reaches the next turn without a restart. Credentials stay out of it: they
+  // resolve per operation through apiConfig()/request().
+  configSnapshot() {
+    return this.scope.get();
+  }
+
   async apiConfig() {
     const config = this.scope.get();
     const credentials = await resolveCredentials(this.ctx, config);

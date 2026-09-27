@@ -4,16 +4,18 @@
 
 ## Sagitta 预设安装
 
-预设随本包分发，位于 `presets/sagitta`：不复制到用户目录，也不做模板变量展开。
+预设源是本包的 `presets/sagitta`，由 `scripts/install-profile-deps.ps1` **物化**到
+`<DSH_HOME>/.agent-presets/sagitta`。包内那份是唯一源，用户目录那份是它的拷贝（安装脚本会校验两者哈希一致）。
 
-Profile 的 `cordis.patch.yml` 需要一条 `agent-presets` 配置，把 DSH 的预设扫描根指向
-`<DSH_HOME>/profiles/web/node_modules/@sagitta/manager/presets`，并设 `includeUserRoot: false`。
-`scripts/install-profile-deps.ps1` 会幂等写入这一条（profile 的其它配置归用户所有，脚本不碰）。
+为什么必须物化而不是直接指向包目录：**DSH 在 profile 组装阶段会把 `agent-presets.roots` 整体覆盖**
+成它自带的 shipped root（`dsh/lib/profile-boot-*.js`：
+`config: { ...rows.get("agent-presets")?.config, roots: [{ path: SHIPPED_PRESET_ROOT, trust: "system" }] }`），
+所以在 profile 里写 `roots` 不会生效。用户级预设唯一能被发现的位置是
+`<DSH_HOME>/.agent-presets/<id>`，并且 patch 里必须保持 `includeUserRoot: true`。
 
-预设改动只需提交到仓库并让 profile 重新从 GitHub 安装
-（`pnpm update @sagitta/manager @sagitta/auto-advance @sagitta/async-work @sagitta/memory @sagitta/codex-dispatch`），
-不再有额外的同步步骤。因为不展开模板变量，`agent.cordis.yml` 里不要使用 `<VAR>` 形式的占位符
-（DSH 自身的 `{{cwd}}` 一类变量不受影响）。
+预设里不要使用 `<VAR>` 形式的模板占位符：加载时没有任何环节会展开它，安装脚本遇到会直接报错。
+
+改动流程：改仓库 → commit/push → `pnpm update @sagitta/...` → 重跑安装脚本物化 → 新会话生效。
 
 ## 配置字段
 
