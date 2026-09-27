@@ -195,7 +195,7 @@ function taskListData(data, expectedKind) {
 // ---- 工具定义 ---------------------------------------------------------------
 
 export function registerMemoryTools(ctx, client) {
-  const timeoutMs = client.config.timeoutMs;
+  const timeoutMs = 20_000;
   const toolOpts = { ctx, client, timeoutMs };
   const taskGate = createTaskGate({
     getAgent: (id) => {

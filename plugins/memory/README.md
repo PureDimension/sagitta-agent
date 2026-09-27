@@ -8,10 +8,9 @@
 
 - 插件格式：cordis 插件（对照 `@deepseek-ai/dsh-tool-web` / `dsh-tool-ask-user`）
 - 工具名：`memory_remember` / `memory_recall` / `memory_consolidate` / `memory_verify`
-- 零运行时依赖：HTTP 走 `node:` 核心模块（https 走 CONNECT 隧道；http 直连用于
-  本地 wrangler dev / 本地冒烟桩），不需要 undici/fetch 代理支持
-- 单一来源：从同一 DSH 进程的 `ctx["sagitta-manager"].getApiConfig()` 读取
-  Worker API 地址与 D1 读/写 token；诊断只输出“是否配置 + 掩码尾巴”
+- 单一网络通道：所有请求都调用同一 DSH 进程的
+  `ctx["sagitta-manager"].request(path, init)`；地址、凭据、CONNECT 隧道和超时
+  均由 manager 统一负责
 
 ---
 
@@ -21,13 +20,12 @@
 memory/
   package.json      # 包声明（type:module；main 指向 lib/index.js）
   lib/
-    index.js        # cordis 插件壳：Config/apply + 启动诊断（掩码） + 系统提示词段
-    config.js       # transport 配置与迁移期显式 fallback + 枚举白名单
-    http.js         # 极简 HTTP(S) 客户端：https 直连/CONNECT 隧道 + http 直连（本地）
+    index.js        # cordis 插件壳：空 Config/apply + 系统提示词段
+    config.js       # 服务端枚举白名单
     client.js       # Worker API 客户端：端点映射 + 错误归一化（401/302/409/422…→中文指引）
     tools.js        # 四个工具定义 + 输出渲染 + §4 v1.3 信任轨道系统提示词引导
   test/
-    smoke.mjs       # 验收冒烟：本地桩（真实 worker + node:sqlite D1 适配器）或线上真链路
+    smoke.mjs       # 验收冒烟：本地桩（真实 worker + node:sqlite D1 适配器）+ mock manager
   README.md
 ```
 
@@ -46,50 +44,30 @@ DSH 自带工具插件完全一致。两条路径任选：
    pnpm add "@sagitta/memory@file:$HOME/.dsh/sagitta-agent/plugins/memory"
    ```
 
-3. 在 `cordis.patch.yml`（profile 的补丁层）追加：
+   3. 在 `cordis.patch.yml`（profile 的补丁层）追加：
 
    ```yaml
-   - id: memory
-     name: sagitta-memory
-     config:
-       proxy: direct                       # 或显式填写本机 HTTP 代理
-       timeoutMs: 20000
+    - id: memory
+      name: sagitta-memory
    ```
 
-4. 在 `Settings > Plugins > Sagitta Manager` 配置 Worker API URL、D1 read token、
-   D1 write token 后重启/重载 DSH Web。启动日志会出现
-   `sagitta-memory 加载完成` + 凭据诊断（仅掩码）。
+   4. 在 `Settings > Plugins > Sagitta Manager` 配置 Worker API URL、代理和凭据后
+      重启/重载 DSH Web。
 
 ### 路径 B：不装包，直接以相对入口挂载
 
 ```yaml
 - id: memory
   name: ./node_modules/sagitta-memory/lib/index.js
-  config:
-    proxy: direct
 ```
 
 > 任一路径都用同一份代码；区别只在 `name` 的解析方式。
 
-## 配置项
+## 配置
 
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `proxy` | `direct`（部署包默认） | HTTP 代理（https 走 CONNECT 隧道）；`direct`/空串 = 直连 |
-| `timeoutMs` | `20000` | 单请求超时 |
-
-Windows 本机安装器为访问 `workers.dev` 的网络环境在新 profile 中 bootstrap
-`http://127.0.0.1:7897`；已有 profile patch 的 `proxy` 现值优先，`direct` 仍是插件自身默认，
-因此这不是 memory 代码默认被改写。若本机没有该代理，请在 profile patch 或 `DSH_MEMORY_PROXY`
-中显式使用 `direct` 或其他可用代理。
-
-Worker API URL、D1 read token 与 D1 write token 不属于 memory 的 Config，统一在
-Sagitta Manager 中配置。每次请求都会读取 manager 当前快照：recall/list/search 与
-delegation read 使用 D1 read token；remember/consolidate/verify 与 delegation write
-使用 D1 write token。manager 缺失或未配置时，memory 只使用调用方显式传入的迁移期
-fallback；没有 fallback 就返回包含“未配置”和配置入口的可见错误。
-
-环境变量覆盖仅适用于 transport：`DSH_MEMORY_PROXY` / `DSH_MEMORY_TIMEOUT_MS`。
+memory 位于 preset 层，`Config` 没有字段，也不注册 settings namespace。所有网络
+配置和凭据都在 Sagitta Manager 中维护；manager 服务缺失时 memory 直接报错，不启用
+本地 transport、凭据或网络 fallback。
 
 ## 工具与设计 §10 的映射（v1.3）
 
@@ -128,38 +106,25 @@ fallback；没有 fallback 就返回包含“未配置”和配置入口的可�
 ## 安全纪律
 
 1. **凭据只存在于 manager 进程内存与 settings provider**：memory 不读取
-   `settings.yaml`、`.env` 或第二份配置；插件输出只出现“是否配置”与掩码尾巴（前 2 后 2），
-   **任何路径都不打印明文 token**。
-2. **D1 token 使用 Bearer**：manager 的 D1 read/write token 分别映射到现有 client
-   的 `Authorization: Bearer ...` 认证头；memory 不把单个 D1 token 猜测为
-   `CF-Access-Client-Id/Secret`。
-4. **TLS 全程校验**：隧道模式 `rejectUnauthorized: true`；`--ssl-no-revoke` 是
-   Windows curl/schannel 特有坑，Node/OpenSSL 无此问题。
-5. **L1 硬规则**：密钥/明文永不写入任何 stream（设计 §7）；公司流条目不含个人
+   `settings.yaml`、`.env` 或第二份配置，也不自行组装认证头。
+2. **统一传输**：Worker 地址、CF-Access 认证、代理、CONNECT 隧道和超时都由
+   `sagitta-manager.request` 处理；memory 不保留第二套网络实现。
+3. **L1 硬规则**：密钥/明文永不写入任何 stream（设计 §7）；公司流条目不含个人
    标识符；recall 默认不跨流混注入。
-6. **代理**：部署包默认直连；如目标机必须走本地 HTTP 代理，在 profile patch 或进程环境
-   中设置 `DSH_MEMORY_PROXY`（https 目标）；本地 http 目标
-   （wrangler dev / 冒烟桩）走直连，不走代理。
 
 ## 验收命令
 
 ```powershell
 # 1) 语法检查（package.json 已声明 type:module，按 ESM 解析）
 cd path/to/sagitta-agent/plugins/memory
-node --check lib/index.js lib/config.js lib/http.js lib/client.js lib/tools.js
+node --check lib/index.js lib/config.js lib/client.js lib/tools.js
 node --check test/smoke.mjs
 node --check test/manager-smoke.mjs
 
-# 2) manager 接入冒烟（本地 HTTP 桩，无真实 Worker/token）
+# 2) manager 接入冒烟（mock manager + 本地 Worker 桩，无真实凭据）
 node test/manager-smoke.mjs
 
-# 3a) 可选历史 Worker 全链路冒烟：需要另外提供与原插件并列的 cloudflare-worker/，
-#     目标仓库本次只迁移插件源码，因此不作为本次 manager 接入验收项
-node test/smoke.mjs
-
-# 3b) 可选线上真链路冒烟（需已部署 v1.3）：
-#     线上部署后由涟漪在 Dashboard 重新粘贴部署 v1.3，再跑：
-$env:DSH_MEMORY_SMOKE_TARGET = "online"
+# 3) 本地 Worker 全链路冒烟（memory 全程调用 mock manager.request）
 node test/smoke.mjs
 ```
 

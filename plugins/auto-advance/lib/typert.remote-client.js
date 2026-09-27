@@ -43,9 +43,7 @@ const needHumanResolutionSchema = z.object({
   status: z.string().readonly()
 }).readonly();
 const tasksSchema = z.object({
-  path: z.string().readonly(),
   updatedAt: z.union([z.number(), z.null()]).readonly(),
-  source: z.union([z.literal("cloud"), z.literal("file"), z.literal("file-stale")]).readonly().optional(),
   sections: z.array(z.object({
     title: z.string().readonly(),
     items: z.array(taskSchema).readonly()

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
@@ -14,8 +14,6 @@ import {
   TASK_RECHECK_DELAY_MS,
   normalizeConfig,
   taskNeedsCodex,
-  buildTaskAuthHeaders,
-  isLoopbackUrl,
   hasOpenNeedHuman,
   mapApiTaskSnapshot,
   splitCloudTaskSnapshotStrict,
@@ -82,24 +80,22 @@ assert.throws(
   () => splitCloudTaskSnapshotStrict({ pages: [{ total: 1, page: 1, size: 200, has_more: false, source: "cloud", items: [] }] }),
   (error) => error.code === "task-api-unavailable"
 );
-assert.equal(buildTaskAuthHeaders({ d1ReadToken: "read", accessClientId: "id", accessClientSecret: "secret" }).Authorization, "Bearer read");
-assert.equal(buildTaskAuthHeaders({ accessClientId: "id", accessClientSecret: "secret" }).Authorization, undefined);
-assert.equal(isLoopbackUrl("http://127.0.0.1:8787"), true);
-assert.equal(isLoopbackUrl("https://worker.example.test"), false);
 assert.doesNotMatch(AUTONOMOUS_PROMPT, /round[_-]?close/iu);
 assert.equal(normalizeConfig({
   statePath: join(tmpdir(), "sagitta-auto-advance-default-state.json"),
-  tasksPath: join(tmpdir(), "sagitta-auto-advance-default-TASKS.md"),
 }).idleTimeoutMs, 15000);
 assert.equal(normalizeConfig({
   statePath: join(tmpdir(), "sagitta-auto-advance-resource-state.json"),
-  tasksPath: join(tmpdir(), "sagitta-auto-advance-resource-TASKS.md"),
   codexMaxConcurrent: 2,
   advancePromptCooldownMs: 250,
   advancePromptBackoffFactor: 3,
   advancePromptMaxCooldownMs: 1000,
   advancePromptMaxInjections: 2,
 }).codexMaxConcurrent, 2);
+const profileHome = join(tmpdir(), "sagitta-auto-advance-profile-home");
+assert.equal(normalizeConfig({}, { dshHomePath: (...segments) => join(profileHome, ...segments) }).statePath,
+  join(profileHome, "profiles", "web", ".sagitta-auto-advance.json"));
+assert.throws(() => normalizeConfig({}), /dshHomePath/u);
 assert.equal(DEFAULT_CODEX_MAX_CONCURRENT, 4);
 assert.equal(taskNeedsCodex({ requires_codex: false }), false);
 assert.equal(taskNeedsCodex({ execution_resource: "local" }), false);
@@ -107,6 +103,7 @@ assert.equal(taskNeedsCodex({ execution_resource: "codex" }), true);
 assert.equal(taskNeedsCodex({}), true, "missing resource metadata is conservatively codex-capable");
 const serviceSource = readFileSync(new URL("../lib/service.js", import.meta.url), "utf8");
 assert.doesNotMatch(serviceSource, /(?:from|import)\s+["'][^"']*codex-dispatch/u, "resource sensing must not import the codex plugin");
+assert.doesNotMatch(serviceSource, /@sagitta\/memory\/lib\/http\.js|\bfetch\s*\(/u, "task networking must use manager.request");
 assert.match(serviceSource, /asyncWork\.listActive\(state\.agent\.id, \{\}\)/u, "resource sensing must use the generic registry");
 assert.equal(TASK_RECHECK_DELAY_MS, 30000, "pending/running recheck remains quieter than the 15s idle probe");
 assert.equal(hasOpenNeedHuman({ need_humans: [{ type: "notify", status: "open" }] }), false);
@@ -117,14 +114,14 @@ const mappedNotifyOnly = mapApiTaskSnapshot([
     open_need_human: true,
     need_humans: [{ type: "notify", status: "open" }],
   }),
-], "smoke-TASKS.md");
+]);
 assert.equal(mappedNotifyOnly.sections[0].items[0].open_need_human, false);
 const mappedStatusSnapshot = mapApiTaskSnapshot([
   task("tsk-ui-progress", "in_progress", null, { claim_state: "mine" }, 23),
   task("tsk-ui-blocked", "blocked", null, {}, 22),
   task("tsk-ui-open", "open", null, {}, 21),
   task("tsk-ui-temp", "in_progress", null, { claim_state: "mine", type: "temp" }, 20),
-], "smoke-TASKS.md");
+]);
 const mappedStatusItems = mappedStatusSnapshot.sections.flatMap((section) => section.items);
 assert.deepEqual(mappedStatusItems.map((item) => item.status), ["in_progress", "blocked", "open", "in_progress"]);
 assert.equal(mappedStatusItems.find((item) => item.task_id === "tsk-ui-progress").acceptance, "- [ ] target one\n- [x] target two");
@@ -136,6 +133,7 @@ const resolvedRequests = [];
 const blockedRequests = [];
 const taskReadAgentIds = [];
 const taskReadUrls = [];
+const managerRequestCalls = [];
 const pendingNeedHumans = [
   {
     id: "nh-notify",
@@ -226,18 +224,24 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const workerUrl = `http://127.0.0.1:${server.address().port}`;
 
-function makeHarness({ api = true, runningWork = false, activeWorks, codexActiveCount = 0, recentWorks = [], enabled = true } = {}) {
+const manager = {
+  async request(path, init = {}) {
+    managerRequestCalls.push({
+      path,
+      method: init.method,
+      headers: { ...init.headers },
+      body: init.body
+    });
+    return fetch(new URL(path, workerUrl), init);
+  }
+};
+
+function makeHarness({ api = true, runningWork = false, activeWorks, codexActiveCount = 0, recentWorks = [], enabled = true, subscribeToEvents = false } = {}) {
   const agent = {
     id: "agent-smoke",
     status: "idle",
     inbox: { nextStep: [], nextTurn: [] },
     followups: [],
-    directDrives: [],
-    send(message, target, wakeup) {
-      this.directDrives.push({ message, target, wakeup });
-      this.followups.push(message);
-      this.inbox.nextTurn.push(message);
-    },
     followup(message) {
       this.followups.push(message);
       this.inbox.nextTurn.push(message);
@@ -270,7 +274,9 @@ function makeHarness({ api = true, runningWork = false, activeWorks, codexActive
     },
     listRecent: (ownerId) => ownerId === agent.id ? recentWorks : []
   };
+  const subscriptions = new Map();
   const ctx = {
+    reflect: { provide() {} },
     fiber: { state: 2 },
     agents: {
       list: () => [agent],
@@ -279,19 +285,28 @@ function makeHarness({ api = true, runningWork = false, activeWorks, codexActive
     },
     get: (name) => name === "sagitta-async-work" ? asyncWork : undefined,
     logger: { warn() {}, debug() {} },
-    emit: (_event, payload) => events.push(payload),
+    inject() {},
+    effect() {},
+    on(event, listener) {
+      if (!subscriptions.has(event)) subscriptions.set(event, new Set());
+      subscriptions.get(event).add(listener);
+      return () => subscriptions.get(event)?.delete(listener);
+    },
+    emit(event, ...args) {
+      events.push(args.at(-1));
+      for (const listener of subscriptions.get(event) ?? []) listener(...args);
+    },
   };
-  const service = Object.create(AutoAdvanceService.prototype);
+  const service = subscribeToEvents
+    ? new AutoAdvanceService(ctx, {
+      statePath: join(tmpdir(), "sagitta-auto-advance-settled-subscription-smoke-state.json"),
+    })
+    : Object.create(AutoAdvanceService.prototype);
   service.ctx = ctx;
+  service.manager = api ? manager : undefined;
   service.config = {
-    tasksPath: join(tmpdir(), "sagitta-auto-advance-smoke-TASKS.md"),
-    taskApiTimeoutMs: 1000,
     taskPageSize: 200,
-    proxy: "direct",
     statePath: join(tmpdir(), "sagitta-auto-advance-smoke-state.json"),
-    apiConfig: api ? { workerApiUrl: workerUrl, d1ReadToken: "smoke-token", d1WriteToken: "smoke-write-token" } : {},
-    manager: undefined,
-    managerApiConfig: {},
     idleTimeoutMs: 1000,
   };
   service.persistedModes = new Map();
@@ -310,7 +325,6 @@ function makeHarness({ api = true, runningWork = false, activeWorks, codexActive
       lastAutoMessageId: undefined,
       pendingAutoMode: undefined,
       autonomousMode: false,
-      settledWorkIds: new Set(),
       ownedTaskIds: new Set(),
       requestController: undefined,
       retryAttempt: 0,
@@ -326,66 +340,35 @@ function makeHarness({ api = true, runningWork = false, activeWorks, codexActive
     state,
     agent,
     ctx,
+    emit(event, ...args) { ctx.emit(event, ...args); },
     events,
     setActiveWorks(next) { currentActiveWorks = Array.isArray(next) ? [...next] : []; },
   };
 }
 
-// Settlement is a basic wake-up even when autonomous mode is disabled. The
-// notice carries the settled work identity and is idempotent per work.
-const chatSettleHarness = makeHarness({ api: false, enabled: false });
-const completedWork = {
+// Settlement only resets auto-advance's own probe timer. The async-work
+// service owns the settlement notice and delivery path.
+const chatSettleHarness = makeHarness({ api: false, enabled: false, subscribeToEvents: true });
+const resetReasons = [];
+const resetTimer = chatSettleHarness.service.resetTimer.bind(chatSettleHarness.service);
+chatSettleHarness.service.resetTimer = (state, reason) => {
+  resetReasons.push({ state, reason });
+  return resetTimer(state, reason);
+};
+chatSettleHarness.emit("async-work/settled", {
   ownerId: "agent-smoke",
   workId: "work-settled",
   taskId: "task-settled",
   kind: "codex",
   status: "completed",
   reason: null,
-};
-chatSettleHarness.state.autonomousMode = true;
-assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), true);
-assert.equal(chatSettleHarness.agent.followups.length, 1, "disabled autonomous mode must still receive settlement notice");
-assert.equal(chatSettleHarness.agent.inbox.nextTurn.length, 1, "idle settlement must enter next-turn inbox");
-assert.equal(chatSettleHarness.agent.directDrives.length, 1, "idle settlement must explicitly wake the agent driver");
-assert.equal(chatSettleHarness.agent.directDrives[0].target, "next-turn");
-assert.equal(chatSettleHarness.agent.directDrives[0].wakeup, true);
-assert.match(chatSettleHarness.agent.followups[0].content[0].text, /异步任务已完成/u);
-assert.match(chatSettleHarness.agent.followups[0].content[0].text, /work_id=work-settled/u);
-assert.match(chatSettleHarness.agent.followups[0].content[0].text, /task_id=task-settled/u);
-assert.match(chatSettleHarness.agent.followups[0].content[0].text, /status=completed/u);
-assert.match(chatSettleHarness.agent.followups[0].content[0].text, /kind=codex/u);
-assert.equal(chatSettleHarness.service.handleAsyncWorkSettled(completedWork), false, "the same work must not notify twice");
-assert.equal(chatSettleHarness.agent.followups.length, 1);
-
-const enabledSettleHarness = makeHarness({ api: false, enabled: true });
-assert.equal(enabledSettleHarness.service.handleAsyncWorkSettled(completedWork), true, "enabled settlement must still queue a notice");
-assert.equal(enabledSettleHarness.agent.inbox.nextTurn.length, 1);
-assert.equal(enabledSettleHarness.agent.directDrives.length, 1);
-
-// A settlement racing a running turn is queued for the next turn instead of
-// waiting for an agent/status idle event.
-const runningSettleHarness = makeHarness({ api: false, enabled: false });
-const runningWorkSettlement = { ownerId: "agent-smoke", workId: "work-running", taskId: "task-running", status: "completed" };
-runningSettleHarness.agent.status = "running";
-assert.equal(runningSettleHarness.service.handleAsyncWorkSettled(runningWorkSettlement), true);
-assert.equal(runningSettleHarness.agent.followups.length, 1, "running agent must queue settlement notice");
-assert.equal(runningSettleHarness.agent.inbox.nextTurn.length, 1, "running agent must retain settlement in next-turn inbox");
-assert.equal(runningSettleHarness.agent.directDrives.length, 0, "running agent must not be directly interrupted");
-
-const inFlightSettleHarness = makeHarness({ api: false, enabled: false });
-inFlightSettleHarness.state.requestController = {};
-assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({
-  ownerId: "agent-smoke",
-  workId: "work-in-flight",
-  taskId: "task-in-flight",
-  status: "completed",
-}), true);
-assert.equal(inFlightSettleHarness.agent.followups.length, 1, "settlement must queue while a request is in flight");
-assert.equal(inFlightSettleHarness.agent.inbox.nextTurn.length, 1, "in-flight settlement must remain in next-turn inbox");
-assert.equal(inFlightSettleHarness.agent.directDrives.length, 0, "in-flight settlement must use the deferred queue path");
-inFlightSettleHarness.state.disposed = true;
-inFlightSettleHarness.state.requestController = undefined;
-assert.equal(inFlightSettleHarness.service.handleAsyncWorkSettled({ ownerId: "agent-smoke", workId: "work-disposed", status: "completed" }), false);
+});
+assert.deepEqual(resetReasons, [{ state: chatSettleHarness.state, reason: "async-work-settled" }],
+  "settlement must reset auto-advance's timer");
+assert.equal(chatSettleHarness.agent.followups.length, 0, "auto-advance must not create a settlement notice");
+assert.equal(chatSettleHarness.agent.inbox.nextTurn.length, 0, "settlement must not enter auto-advance's next-turn inbox");
+assert.equal(chatSettleHarness.agent.inbox.nextStep.length, 0, "settlement must not enter auto-advance's next-step inbox");
+chatSettleHarness.service.removeProcessShutdownHooks();
 
 // Header remote snapshot is owner-scoped and keeps running/recent terminal
 // records in separate, browser-safe shapes.
@@ -436,6 +419,12 @@ try {
   const pendingSnapshot = await ownedHarness.service.getTasks();
   assert.equal(taskReadAgentIds.at(-1), "agent-smoke", "UI task read must use the selected session id");
   assert.equal(taskReadUrls.at(-1).searchParams.get("include_temp"), "1", "UI task read must include the selected agent's temp lease");
+  const uiTaskRequest = managerRequestCalls.findLast((call) => call.path.startsWith("/task?"));
+  assert.equal(uiTaskRequest.method, "GET", "UI task read must use manager.request GET");
+  assert.match(uiTaskRequest.path, /\/task\?page=1&size=200&include_temp=1/u);
+  assert.equal(uiTaskRequest.headers["X-Agent-Id"], "agent-smoke", "manager.request must receive the selected session id");
+  const uiNeedHumanRequest = managerRequestCalls.findLast((call) => call.path === "/need-human?status=open");
+  assert.equal(uiNeedHumanRequest.method, "GET", "need-human read must use manager.request GET");
   const pendingItems = pendingSnapshot.sections.flatMap((section) => section.items);
   assert.equal(pendingItems.find((item) => item.task_id === "tsk-mine").status, "in_progress");
   assert.equal(pendingItems.find((item) => item.task_id === "tsk-mine").acceptance, "- [ ] target one\n- [x] target two");
@@ -447,12 +436,18 @@ try {
   assert.deepEqual(resolvedRequests[0], {
     id: "nh-notify",
     body: { resolve_kind: "solved", resolved_by: "ripple" },
-    authorization: "Bearer smoke-write-token",
+    authorization: undefined,
   });
+  const resolveRequest = managerRequestCalls.findLast((call) => call.path === "/task/need-human/nh-notify/resolve");
+  assert.equal(resolveRequest.method, "POST");
+  assert.deepEqual(JSON.parse(resolveRequest.body), { resolve_kind: "solved", resolved_by: "ripple" });
   const refreshedPendingSnapshot = await ownedHarness.service.getTasks();
   assert.deepEqual(refreshedPendingSnapshot.pendingRequests.map((item) => item.type), ["need"]);
   await ownedHarness.service.onTimer(ownedHarness.state, 1);
   assert.equal(taskReadAgentIds.at(-1), "agent-smoke", "auto-advance qualification read must use state.agent.id");
+  const qualificationRequest = managerRequestCalls.findLast((call) => call.path.startsWith("/task?"));
+  assert.equal(qualificationRequest.method, "GET");
+  assert.equal(qualificationRequest.headers["X-Agent-Id"], "agent-smoke");
   assert.equal(ownedHarness.agent.followups.length, 1);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /涟漪已离开/u);
   assert.match(ownedHarness.agent.followups[0].content[0].text, /tsk-mine/u);
@@ -562,22 +557,13 @@ try {
   assert.ok(errorHarness.state.timer !== undefined);
   errorHarness.service.clearTimer(errorHarness.state);
 
-  // 严格资格判断没有 TASKS.md 文件兜底。
+  // 云端通道不可用时严格失败，不读取本地任务文件。
   const noApiHarness = makeHarness({ api: false });
   await noApiHarness.service.onTimer(noApiHarness.state, 1);
   assert.equal(noApiHarness.agent.followups.length, 0);
   assert.equal(noApiHarness.state.enabled, true);
   noApiHarness.service.clearTimer(noApiHarness.state);
-
-  // UI 的旧文件只作为 stale 展示来源，不能参与自动推进资格。
-  const directory = mkdtempSync(join(tmpdir(), "sagitta-auto-advance-smoke-"));
-  const tasksPath = join(directory, "TASKS.md");
-  writeFileSync(tasksPath, "# Tasks\n- [ ] UI-only stale task\n", "utf8");
-  const staleHarness = makeHarness({ api: false });
-  staleHarness.service.config.tasksPath = tasksPath;
-  const stale = await staleHarness.service.getTasks();
-  assert.equal(stale.source, "file-stale");
-  assert.match(stale.error, /task-api-unavailable/u);
+  await assert.rejects(() => noApiHarness.service.getTasks(), /sagitta-manager\.request 不可用/u);
   const clientSource = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
   assert.match(clientSource, /📢 待你确认/u);
   assert.match(clientSource, /remoteApi\.resolveNeedHuman/u);
@@ -619,9 +605,7 @@ try {
   assert.equal(headerRegistrations[0].options.name, "conversation.session.header.actions");
   const getTasksDescriptor = mountedRemotes[0].descriptors.find((descriptor) => descriptor.method === "getTasks");
   const parsedClientSnapshot = getTasksDescriptor.result.schema.parse({
-    path: "smoke-TASKS.md",
     updatedAt: 1,
-    source: "cloud",
     sections: [{ title: "smoke", items: [{
       text: "进行中任务",
       done: false,
@@ -661,10 +645,9 @@ try {
   assert.equal(parsedAsyncWorks.running[0].status, "running");
   assert.equal(parsedAsyncWorks.recent[0].status, "failed");
   assert.match(clientSource, /ctx\.slots\.inject\("conversation\.session\.header\.actions"/u);
-  rmSync(directory, { recursive: true, force: true });
 
   // 模拟 DSH 的 process SIGINT/SIGTERM → fiber.dispose：当前快照中的 owned
-  // in_progress 任务并行 PATCH blocked，携带写 token 与 session agent id。
+  // in_progress 任务经 manager.request 并行 PATCH blocked，携带 session agent id。
   responseMode = "owned";
   const shutdownHarness = makeHarness();
   shutdownHarness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
@@ -678,23 +661,28 @@ try {
     }],
   });
   assert.deepEqual(shutdownHarness.service.ownedInProgressTasks(shutdownHarness.state, shutdownHarness.state.cloudSnapshot).map((item) => item.task_id), ["tsk-shutdown-a", "tsk-shutdown-b"]);
-  assert.equal(shutdownHarness.service.resolveTaskApiConfig().workerApiUrl, workerUrl);
-  assert.equal(shutdownHarness.service.resolveTaskApiConfig().d1WriteToken, "smoke-write-token");
+  assert.equal(shutdownHarness.service.manager, manager);
   shutdownHarness.service.processShutdownRequested = true;
   await shutdownHarness.service.blockOwnedTasksOnProcessShutdown();
   assert.deepEqual(blockedRequests.slice(-2).sort((first, second) => first.id.localeCompare(second.id)), [
     {
       id: "tsk-shutdown-a",
       body: { status: "blocked", blocked_reason: "sagitta 进程中断退出" },
-      authorization: "Bearer smoke-write-token",
+      authorization: undefined,
       agentId: "agent-smoke",
     },
     {
       id: "tsk-shutdown-b",
       body: { status: "blocked", blocked_reason: "sagitta 进程中断退出" },
-      authorization: "Bearer smoke-write-token",
+      authorization: undefined,
       agentId: "agent-smoke",
     },
+  ]);
+  const shutdownCalls = managerRequestCalls.filter((call) => /^\/task\/tsk-shutdown-(?:a|b)$/u.test(call.path));
+  assert.deepEqual(shutdownCalls.map((call) => call.method).sort(), ["PATCH", "PATCH"]);
+  assert.deepEqual(shutdownCalls.map((call) => JSON.parse(call.body)), [
+    { status: "blocked", blocked_reason: "sagitta 进程中断退出" },
+    { status: "blocked", blocked_reason: "sagitta 进程中断退出" }
   ]);
 
   const normalDisposeHarness = makeHarness();
@@ -713,13 +701,31 @@ try {
   assert.equal(normalStopHarness.service.stopByProtocol(normalStopHarness.state), true);
   assert.equal(blockedRequests.length, 2, "stopByProtocol must not mark tasks blocked");
 
-  console.log("auto-advance smoke: PASS (need/notify mapping, notify resolve POST + refresh, task-driven branches, cloud defer, stale UI fallback)");
+  console.log("auto-advance smoke: PASS (need/notify mapping, notify resolve POST + refresh, task-driven branches, cloud defer, manager channel)");
 } finally {
   server.close();
 }
 
 function challengeHarness(autonomousMode, { pendingStatus = null, runningWork = false } = {}) {
   const harness = makeHarness({ api: false, runningWork });
+  const taskPage = {
+    total: 2,
+    page: 1,
+    size: 200,
+    has_more: false,
+    source: "cloud",
+    items: [
+      task("tsk-work", "in_progress", pendingStatus, { claim_state: "mine" }),
+      task("tsk-temp", "in_progress", null, { claim_state: "mine", type: "temp" }),
+    ]
+  };
+  harness.service.manager = {
+    request: async (path) => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, data: path.startsWith("/task?") ? taskPage : { items: [] } })
+    })
+  };
   harness.state.autonomousMode = autonomousMode;
   harness.state.cloudSnapshot = splitCloudTaskSnapshotStrict({
     pages: [{

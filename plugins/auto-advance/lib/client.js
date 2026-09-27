@@ -83,7 +83,7 @@ window.__ModuleLoader__.load({
     }
     function tasksSchema() {
       return strictSchema((value) => {
-        if (value === null || typeof value !== "object" || typeof value.path !== "string" || (value.updatedAt !== null && typeof value.updatedAt !== "number") || !Array.isArray(value.sections) || (value.source !== undefined && !["cloud", "file", "file-stale"].includes(value.source))) throw new Error("invalid task snapshot");
+        if (value === null || typeof value !== "object" || (value.updatedAt !== null && typeof value.updatedAt !== "number") || !Array.isArray(value.sections)) throw new Error("invalid task snapshot");
         for (const section of value.sections) {
           if (section === null || typeof section.title !== "string" || !Array.isArray(section.items)) throw new Error("invalid task section");
           for (const item of section.items) {
@@ -139,12 +139,6 @@ window.__ModuleLoader__.load({
       waiting: Object.freeze({ label: "等待中", icon: "◷", priority: 1 })
     });
     const STATUS_ALIASES = Object.freeze({ done: "completed" });
-    const STATUS_DETECTORS = Object.freeze([
-      Object.freeze({ status: "in_progress", pattern: /(?:🔄|进行中|推进中|开发中|处理中|执行中|active|running)/iu }),
-      Object.freeze({ status: "blocked", pattern: /(?:🚩|阻塞|阻碍|blocked|block)/iu }),
-      Object.freeze({ status: "completed", pattern: /(?:✅|已完成|完成|结案|closed|done|completed)/iu }),
-      Object.freeze({ status: "waiting", pattern: /(?:⏳|🕒|等待|待处理|待确认|pending|waiting|todo)/iu })
-    ]);
     const STATUS_PRIORITY = Object.freeze(Object.fromEntries(Object.entries(STATUS_META).map(([status, meta]) => [status, meta.priority])));
 
     const STYLE = `
@@ -272,33 +266,11 @@ window.__ModuleLoader__.load({
       @media (prefers-reduced-motion: reduce) { .saw-trigger[data-running="true"] .saw-trigger-icon { animation: none; } }
     `;
 
-    function statusFromValue(value, done, allowLegacyGuess = false) {
+    function statusFromValue(value, done) {
       const explicit = safeText(value).trim().toLowerCase();
       const canonical = STATUS_ALIASES[explicit] ?? explicit;
       if (Object.prototype.hasOwnProperty.call(STATUS_META, canonical)) return canonical;
-      if (allowLegacyGuess) {
-        for (const detector of STATUS_DETECTORS) if (detector.pattern.test(safeText(value))) return detector.status;
-      }
       return done === true ? "completed" : "open";
-    }
-
-    function startsLikeStatus(value) {
-      return /^(?:✅|🔄|🚩|⏳|🕒|进行中|推进中|开发中|处理中|执行中|阻塞|阻碍|完成|结案|等待|待处理|待确认|running|blocked|completed|done|waiting|todo|pending)/iu.test(value.trim());
-    }
-
-    function splitStatusSuffix(value) {
-      const text = safeText(value).trim();
-      for (const [opening, closing] of [["（", "）"], ["(", ")"]]) {
-        let start = text.indexOf(opening);
-        while (start >= 0) {
-          const suffix = text.slice(start + 1);
-          if (suffix.endsWith(closing) && startsLikeStatus(suffix.slice(0, -1))) {
-            return { text: text.slice(0, start).trim(), status: suffix.slice(0, -1).trim() };
-          }
-          start = text.indexOf(opening, start + 1);
-        }
-      }
-      return { text, status: "" };
     }
 
     function parseTaskDate(value) {
@@ -311,16 +283,11 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    function normalizeTask(item, order, allowLegacyStatusGuess = false) {
+    function normalizeTask(item, order) {
       const rawText = safeText(item?.text).trim();
-      const hasExplicitStatus = safeText(item?.status).trim().length > 0;
-      const split = allowLegacyStatusGuess && !hasExplicitStatus ? splitStatusSuffix(rawText) : { text: rawText, status: "" };
-      const status = hasExplicitStatus
-        ? statusFromValue(item.status, item?.done === true)
-        : statusFromValue(split.status, item?.done === true, allowLegacyStatusGuess);
       return {
-        text: split.text || rawText || "未命名事项",
-        status,
+        text: rawText || "未命名事项",
+        status: statusFromValue(item?.status, item?.done === true),
         updatedAt: parseTaskDate(item?.updatedAt ?? rawText),
         acceptance: safeText(item?.acceptance).trim(),
         kind: safeText(item?.kind ?? item?.type).trim().toLowerCase() || "task",
@@ -337,11 +304,6 @@ window.__ModuleLoader__.load({
 
     function isReportInboxSection(title) {
       return /(?:§\s*2\b|汇报箱|需\s*涟漪\s*确认\s*[\/／]\s*行动|非阻塞说明)/iu.test(title);
-    }
-
-    function rawTaskContent(snapshot) {
-      const raw = snapshot?.raw ?? snapshot?.markdown ?? snapshot?.content;
-      return typeof raw === "string" ? raw.trim() : "";
     }
 
     function pendingRequestItems(snapshot) {
@@ -376,11 +338,10 @@ window.__ModuleLoader__.load({
     function normalizedTaskItems(snapshot) {
       const items = [];
       let order = 0;
-      const allowLegacyStatusGuess = snapshot?.source === "file-stale";
       for (const section of Array.isArray(snapshot?.sections) ? snapshot.sections : []) {
         const title = safeText(section?.title).trim() || "未分类";
         if (isReportInboxSection(title)) continue;
-        const sectionItems = (Array.isArray(section?.items) ? section.items : []).map((item) => normalizeTask(item, order++, allowLegacyStatusGuess));
+        const sectionItems = (Array.isArray(section?.items) ? section.items : []).map((item) => normalizeTask(item, order++));
         if (sectionItems.length === 0) continue;
         const legacyFlat = isLegacyFlatSection(title, sectionItems);
         for (const item of sectionItems) {
@@ -902,7 +863,6 @@ window.__ModuleLoader__.load({
         }
         panel.append(status);
         const groups = taskGroups(tasks);
-        const rawContent = rawTaskContent(tasks);
         const pending = pendingRequestItems(tasks);
         const needs = pending.filter((request) => pendingRequestType(request) === "need");
         const notifications = pending.filter((request) => pendingRequestType(request) === "notify");
@@ -929,9 +889,7 @@ window.__ModuleLoader__.load({
         const taskTitle = createElement("div", { class: "saa-task-title" });
         taskTitle.append(createElement("span", {}, "项目进度"), createElement("span", { class: "saa-task-count" }, `${groups.length} 个项目`));
         taskScroll.append(taskTitle);
-        if (tasks?.source === "file-stale") taskScroll.append(createElement("div", { class: "saa-stale" }, "⚠ file-stale：云端任务暂不可用，以下仅供展示"));
         if (tasks?.error) taskScroll.append(createElement("div", { class: "saa-error" }, tasks.error));
-        else if (groups.length === 0 && rawContent) taskScroll.append(createElement("pre", { class: "saa-raw" }, rawContent));
         else if (groups.length === 0) taskScroll.append(createElement("div", { class: "saa-empty" }, "暂无任务"));
         else {
           const list = createElement("ul", { class: "saa-project-list" });

@@ -7,30 +7,25 @@
 
 import { Service } from "@deepseek-ai/cordis";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import z from "@deepseek-ai/schemastery";
 import {
   AsyncWorkError,
   AsyncWorkRegistry,
   DEFAULT_TIMEOUT_MS,
-  DEFAULT_RECENT_LIMIT,
-  DEFAULT_RECENT_TTL_MS,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
   WORK_STATUSES,
-  normalizeDefaultTimeout,
 } from "./registry.js";
 
 const name = "sagitta-async-work";
 const ASYNC_WORK_SETTLED_EVENT = "async-work/settled";
-const inject = ["tools"];
+const inject = ["tools", "agents"];
+const SETTLEMENT_LABELS = Object.freeze({ complete: "完成", fail: "失败", cancel: "取消" });
 
 const Config = z.object({
   defaultTimeoutMs: z.number().default(DEFAULT_TIMEOUT_MS)
     .description(`默认工作超时（${MIN_TIMEOUT_MS}–${MAX_TIMEOUT_MS} 毫秒）；每次 register 仍由服务端校验。`),
-  recentLimit: z.number().default(DEFAULT_RECENT_LIMIT)
-    .description("每个 owner 保留的最近终态工作数量；0 表示关闭历史环。"),
-  recentTtlMs: z.number().default(DEFAULT_RECENT_TTL_MS)
-    .description("最近终态工作保留时间（毫秒），同时受 recentLimit 限制。"),
 });
 
 const nullableString = () => ({ oneOf: [{ type: "string" }, { type: "null" }] });
@@ -47,6 +42,32 @@ const WORK_FIELDS = {
   reason: { ...nullableString(), required: true },
 };
 const WORK_SCHEMA = { type: "object", additionalProperties: false, properties: WORK_FIELDS };
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function settledWorkInfo(settled) {
+  return {
+    workId: nonEmptyString(settled?.workId ?? settled?.work_id),
+    taskId: nonEmptyString(settled?.taskId ?? settled?.task_id),
+    status: nonEmptyString(settled?.status),
+    kind: nonEmptyString(settled?.kind),
+    reason: nonEmptyString(settled?.reason),
+  };
+}
+
+function settledNotice(settled) {
+  const info = settledWorkInfo(settled);
+  const details = [
+    `task_id=${info.taskId ?? "unknown"}`,
+    `status=${info.status ?? "unknown"}`,
+    info.workId === undefined ? undefined : `work_id=${info.workId}`,
+    info.kind === undefined ? undefined : `kind=${info.kind}`,
+    info.reason === undefined ? undefined : `reason=${info.reason}`,
+  ].filter((value) => value !== undefined);
+  return `异步任务已完成：${details.join(" ")}，可继续推进或汇报结果。`;
+}
 
 function ownerIdOf(exec) {
   const ownerId = exec?.agent?.id;
@@ -139,109 +160,88 @@ function registerAsyncWorkTools(ctx, service) {
     presentCall: (args) => presentCall("async_status", args),
   });
 
-  for (const operation of [
-    { name: "async_complete", method: "complete", label: "完成", reason: false },
-    { name: "async_fail", method: "fail", label: "失败", reason: true },
-    { name: "async_cancel", method: "cancel", label: "取消", reason: false },
-  ]) {
-    registerTool(ctx, service, {
-      name: operation.name,
-      description:
-        `${operation.label}一项有界异步工作。work_id 与 task_id 都必填，服务端会核对 task_id 绑定；` +
-        "已进入终态的工作不能再次变更。",
-      parameters: {
-        work_id: { type: "string", required: true, description: "async_register 返回的 work_id。" },
-        task_id: { type: "string", required: true, description: "必须与工作登记时的 task_id 完全一致。" },
-        ...(operation.reason ? { reason: { type: "string", description: "失败原因（可选）。" } } : {}),
-      },
-      output: {
-        schema: WORK_SCHEMA,
-        render: (_args, value) => [{
-          type: "text",
-          text: `## 异步工作${operation.label}\n\n- work_id：${value.work_id}\n- task_id：${value.task_id}\n- 状态：${value.status}${value.reason ? `\n- 原因：${value.reason}` : ""}`,
-        }],
-        presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
-      },
-      async execute(args, exec) {
-        const ownerId = ownerIdOf(exec);
-        if (operation.reason) return service[operation.method](ownerId, args.work_id, args.reason, args.task_id);
-        return service[operation.method](ownerId, args.work_id, args.task_id);
-      },
-      presentCall: (args) => presentCall(operation.name, args),
-    });
-  }
+  registerTool(ctx, service, {
+    name: "async_settle",
+    description:
+      "结算一项有界异步工作。work_id、task_id、action 都必填，action 为 complete、fail 或 cancel；" +
+      "reason 仅用于 fail。服务端会核对 task_id 绑定，已进入终态的工作不能再次变更。",
+    parameters: {
+      work_id: { type: "string", required: true, description: "async_register 返回的 work_id。" },
+      task_id: { type: "string", required: true, description: "必须与工作登记时的 task_id 完全一致。" },
+      action: { type: "string", required: true, enum: ["complete", "fail", "cancel"], description: "结算动作。" },
+      reason: { type: "string", description: "失败原因（仅 action=fail 时使用）。" },
+    },
+    output: {
+      schema: WORK_SCHEMA,
+      render: (args, value) => [{
+        type: "text",
+        text: `## 异步工作${SETTLEMENT_LABELS[args.action]}\n\n- work_id：${value.work_id}\n- task_id：${value.task_id}\n- 状态：${value.status}${value.reason ? `\n- 原因：${value.reason}` : ""}`,
+      }],
+      presentationMeta: (_args, value) => ({ work_id: value.work_id, task_id: value.task_id, status: value.status }),
+    },
+    async execute(args, exec) {
+      return service.settle(ownerIdOf(exec), args.work_id, args.task_id, args.action, args.reason);
+    },
+    presentCall: (args) => presentCall("async_settle", args),
+  });
 }
 
 class AsyncWorkService extends Service {
   constructor(ctx, config = {}) {
     super(ctx, name);
-    const configuredTimeout = config.defaultTimeoutMs ?? config.workTimeoutMs;
     this.registry = new AsyncWorkRegistry({
-      defaultTimeoutMs: configuredTimeout === undefined ? DEFAULT_TIMEOUT_MS : normalizeDefaultTimeout(configuredTimeout),
-      recentLimit: config.recentLimit,
-      recentTtlMs: config.recentTtlMs,
+      defaultTimeoutMs: config.defaultTimeoutMs,
+      onListenerError: (error, listener) => ctx.logger.error(error, listener),
     });
     this.disposeSettled = this.registry.onSettled((payload) => {
-      try {
-        this.ctx.emit?.(ASYNC_WORK_SETTLED_EVENT, payload);
-      } catch {
-        // Event delivery is advisory; registry settlement must remain committed.
-      }
+      this.ctx.emit?.(ASYNC_WORK_SETTLED_EVENT, payload);
+      this.notifyOwner(payload);
     });
-    this.unavailableReason = null;
   }
 
-  _ensureAvailable() {
-    if (this.unavailableReason !== null) {
-      throw new AsyncWorkError(503, "ASYNC_WORK_UNAVAILABLE", `async-work 服务不可用：${this.unavailableReason}`);
-    }
-  }
-
-  markUnavailable(reason) {
-    this.unavailableReason = String(reason || "未知原因");
-  }
-
-  markAvailable() {
-    this.unavailableReason = null;
+  notifyOwner(payload) {
+    const agent = this.ctx.agents?.get?.(payload.ownerId);
+    if (agent === undefined) return;
+    const message = createUserMessage({
+      content: [{ type: "text", text: settledNotice(payload) }],
+      source: { kind: "plugin", plugin: name, form: "notice", summary: "async work settled" }
+    });
+    agent.steer(message);
   }
 
   register(input) {
-    this._ensureAvailable();
     return this.registry.register(input);
   }
 
   listActive(ownerId, filter = {}) {
-    this._ensureAvailable();
     return this.registry.listActive(ownerId, filter);
   }
 
   get(ownerId, workId) {
-    this._ensureAvailable();
     return this.registry.get(ownerId, workId);
   }
 
-  listRecent(ownerId, options = {}) {
-    this._ensureAvailable();
-    return this.registry.listRecent(ownerId, options);
+  listRecent(ownerId) {
+    return this.registry.listRecent(ownerId);
+  }
+
+  settle(ownerId, workId, taskId, action, reason) {
+    return this.registry.settle(ownerId, workId, taskId, action, reason);
   }
 
   complete(ownerId, workId, taskId) {
-    this._ensureAvailable();
     return this.registry.complete(ownerId, workId, taskId);
   }
 
   fail(ownerId, workId, reason, taskId) {
-    this._ensureAvailable();
     return this.registry.fail(ownerId, workId, reason, taskId);
   }
 
   cancel(ownerId, workId, taskId) {
-    this._ensureAvailable();
     return this.registry.cancel(ownerId, workId, taskId);
   }
 
   reap(ownerId) {
-    this._ensureAvailable();
     return this.registry.reap(ownerId);
   }
 
@@ -277,8 +277,6 @@ export {
   ASYNC_WORK_SETTLED_EVENT,
   Config,
   DEFAULT_TIMEOUT_MS,
-  DEFAULT_RECENT_LIMIT,
-  DEFAULT_RECENT_TTL_MS,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
   WORK_FIELDS,

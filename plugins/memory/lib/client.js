@@ -17,11 +17,9 @@
 //   GET  /mem/delegations/{task_id}         读 delegation
 //   · 召回条目带 trust_level/trust_hint（服务端按 score 生成）与 validation_events（validated 事件）
 // ============================================================================
-// 凭据纪律：所有请求头在此组装，token 只存于进程内存，绝不进入任何输出文
-// 本（工具结果、错误消息、日志）。错误消息只给“是否配置 + 掩码尾巴 + 指引”。
+// 凭据纪律：凭据和传输请求头由 sagitta-manager 统一处理；本客户端只组装
+// 端点参数和 task 所需的调用方 header。
 // ============================================================================
-
-import { request, validateBaseUrl, HttpStatusError, HttpNetworkError, HttpTimeoutError } from "./http.js";
 
 /** 服务端返回的业务错误（{ok:false, error:{code,message}} 已解包）。 */
 export class MemoryApiError extends Error {
@@ -37,7 +35,7 @@ function isPlainObject(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function isAccessLoginBody(status, statusText, headers, bodyText) {
+function isAccessLoginBody(status, bodyText) {
   // Cloudflare Access 未匹配时返回 302（登录跳转）或 200 + HTML 登录页
   const normalized = bodyText.trimStart();
   if (status === 302 || status === 307 || status === 303) return true;
@@ -46,29 +44,13 @@ function isAccessLoginBody(status, statusText, headers, bodyText) {
 }
 
 /**
- * 把三类失败（网络/超时/HTTP 状态）归一化为可读中文错误。
+ * 把 manager 返回的 HTTP 业务错误归一化为可读中文错误。
  * @returns {Error} 抛出用（MemoryApiError 或 MemoryNetworkError）
  */
-function translateFailure(err, { proxy, timeoutMs }) {
-  if (err instanceof HttpTimeoutError) {
-    return new Error(
-      `请求超时（${err.timeoutMs}ms）：云端无响应。若本机网络无法直连 workers.dev，` +
-        `请确认 clash 代理（默认 ${proxy}）在运行且插件 proxy 配置正确；` +
-        `也可在插件 config 中把 timeoutMs 调大。`
-    );
-  }
-  if (err instanceof HttpNetworkError) {
-    const causeMsg = err.cause && err.cause.message ? String(err.cause.message) : "";
-    const isAbort = /abort/i.test(causeMsg) && /aborted/i.test(causeMsg);
-    if (isAbort) return new Error("请求已中止（被调用方取消）。");
-    return new Error(
-      `网络错误：${causeMsg || "无法连接"}。检查点：① clash 代理 ${proxy} 是否运行；` +
-        `② 插件 proxy 配置（直连模式需本机网络能直达 ${"workers.dev"}）；③ 目标地址 baseUrl 是否正确。`
-    );
-  }
-  if (err instanceof HttpStatusError) {
+function translateFailure(err) {
+  if (err?.status !== undefined) {
     const bodyText = err.bodyText || "";
-    if (isAccessLoginBody(err.status, err.statusText, err.headers, bodyText)) {
+    if (isAccessLoginBody(err.status, bodyText)) {
       return new Error(
         `请求被 Cloudflare Access 拦截（HTTP ${err.status}，返回了登录页而非 API）。` +
           `指引：确认 Sagitta Manager 中对应 D1 token 已配置为裸 token，` +
@@ -122,192 +104,57 @@ function truncateForError(text) {
   return t.length > 300 ? t.slice(0, 300) + "…" : t;
 }
 
-/**
- * 组装认证头。认证优先级与 auto-advance 一致：有对应 Bearer token 时只发
- * Bearer；否则发成对的 Cloudflare Access headers。任何情况下都不打印明文。
- */
-export function buildAuthHeaders(auth) {
-  const headers = {};
-  if (auth.bearerPresent) {
-    headers["Authorization"] = `Bearer ${auth.authToken}`;
-  } else if (auth.accessPresent) {
-    headers["CF-Access-Client-Id"] = auth.accessClientId;
-    headers["CF-Access-Client-Secret"] = auth.accessClientSecret;
-  }
-  return headers;
-}
-
 function textValue(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function normalizedAuth(auth = {}) {
-  const accessClientId = textValue(auth.accessClientId);
-  const accessClientSecret = textValue(auth.accessClientSecret);
-  const authToken = textValue(auth.authToken);
-  return {
-    accessClientId,
-    accessClientSecret,
-    authToken,
-    accessPresent: accessClientId.length > 0 && accessClientSecret.length > 0,
-    bearerPresent: authToken.length > 0,
-  };
-}
-
-function normalizedApiConfig(config = {}) {
-  return {
-    workerApiUrl: textValue(config.workerApiUrl).replace(/\/+$/, ""),
-    d1ReadToken: textValue(config.d1ReadToken),
-    d1WriteToken: textValue(config.d1WriteToken),
-    accessClientId: textValue(config.accessClientId),
-    accessClientSecret: textValue(config.accessClientSecret),
-  };
-}
-
-function managerConfig(manager) {
-  if (typeof manager?.getApiConfig !== "function") return undefined;
-  try {
-    return normalizedApiConfig(manager.getApiConfig());
-  } catch {
-    return undefined;
-  }
-}
-
-function hasConfiguredApiValue(config) {
-  return !!config && [
-    config.workerApiUrl,
-    config.d1ReadToken,
-    config.d1WriteToken,
-    config.accessClientId,
-    config.accessClientSecret,
-  ].some((value) => value.length > 0);
-}
-
-function isLoopbackHostname(hostname) {
-  const value = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
-  return value === "localhost" || value === "::1" || /^127\./u.test(value);
-}
-
-/** True for the local endpoints allowed to use direct transport. */
-export function isLoopbackUrl(value) {
-  try {
-    return isLoopbackHostname(new URL(value).hostname);
-  } catch {
-    return false;
-  }
-}
-
-function assertTransportPolicy(baseUrl, proxy) {
-  const configuredProxy = typeof proxy === "string" ? proxy.trim() : "";
-  const direct = configuredProxy.length === 0 || configuredProxy.toLowerCase() === "direct";
-  if (direct && !isLoopbackUrl(baseUrl)) {
-    throw new Error(
-      "配置错误：访问非 loopback Worker 禁止使用 direct；请配置 DSH_MEMORY_PROXY 或插件 proxy（HTTP CONNECT 代理），" +
-      "未配置代理时已 fail closed。"
-    );
-  }
-}
-
-function missingConfigurationError(operation, runtime) {
-  const missing = [];
-  if (!runtime.baseUrl) missing.push("Worker API 地址");
-  if (!runtime.auth.accessPresent && !runtime.auth.bearerPresent) {
-    missing.push(operation === "read" ? "D1 读 token" : "D1 写 token");
-  }
-  return new Error(
-    `Sagitta Manager 未配置：${missing.join("、") || "API 配置"}。` +
-      `请到 Settings > Plugins > Sagitta Manager 配置 Worker API URL 和对应的 D1 ${operation === "read" ? "读" : "写"} token。`
-  );
-}
-
 /**
- * 内存 API 客户端。每个方法返回服务端 {data:…} 解包后的对象；错误抛
- * MemoryApiError / 中文指引 Error。
+ * 内存 API 客户端。它只负责组装 memory/task 端点参数；所有网络、凭据、
+ * CONNECT 隧道和超时都由 sagitta-manager.request 负责。
  */
 export class SagittaMemoryClient {
-  constructor(config = {}, manager) {
-    this.config = config;
+  constructor(manager) {
+    if (!manager || typeof manager.request !== "function") {
+      throw new Error("sagitta-memory requires sagitta-manager.request");
+    }
     this.manager = manager;
-    this.fallback = {
-      baseUrl: textValue(config.baseUrl).replace(/\/+$/, ""),
-      auth: normalizedAuth(config.auth),
-    };
-    this.baseUrl = this.fallback.baseUrl;
   }
 
-  /**
-   * Read manager's current snapshot for every request. The old explicit
-   * config is only a migration fallback when manager is absent/unconfigured.
-   */
-  getRuntimeConfig(operation = "read") {
-    const current = managerConfig(this.manager);
-    const baseUrl = current?.workerApiUrl || this.fallback.baseUrl;
-    const token = operation === "read" ? current?.d1ReadToken : current?.d1WriteToken;
-    const auth = hasConfiguredApiValue(current)
-      ? normalizedAuth({
-        authToken: token,
-        accessClientId: current.accessClientId,
-        accessClientSecret: current.accessClientSecret,
-      })
-      : this.fallback.auth;
-    const runtime = {
-      baseUrl,
-      proxy: this.config.proxy,
-      timeoutMs: this.config.timeoutMs,
-      auth,
-      source: hasConfiguredApiValue(current) ? "manager" : "fallback",
-    };
-    this.baseUrl = runtime.baseUrl;
-    return runtime;
-  }
+  async request(path, { method = "GET", query, body, signal, agentId } = {}) {
+    const headers = {};
+    const callerAgentId = textValue(agentId);
+    if (callerAgentId) headers["X-Agent-Id"] = callerAgentId;
+    const init = { method, headers };
+    if (body !== undefined) {
+      headers["content-type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    if (signal !== undefined) init.signal = signal;
 
-  async request(path, { method = "GET", operation = method === "GET" ? "read" : "write", query, body, signal, agentId } = {}) {
-    const runtime = this.getRuntimeConfig(operation);
-    if (!runtime.baseUrl || (!runtime.auth.accessPresent && !runtime.auth.bearerPresent)) {
-      throw missingConfigurationError(operation, runtime);
-    }
-    let url;
-    try {
-      const baseUrl = validateBaseUrl(runtime.baseUrl).toString().replace(/\/+$/, "");
-      assertTransportPolicy(baseUrl, runtime.proxy);
-      url = baseUrl + path + (query ? buildQuery(query) : "");
-    } catch (err) {
-      throw translateFailure(err, { proxy: runtime.proxy, timeoutMs: runtime.timeoutMs });
-    }
     let response;
     try {
-      const headers = buildAuthHeaders(runtime.auth);
-      const callerAgentId = textValue(agentId);
-      if (callerAgentId) headers["X-Agent-Id"] = callerAgentId;
-      response = await request({
-        method,
-        url,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        timeoutMs: runtime.timeoutMs,
-        signal,
-        proxy: runtime.proxy,
-      });
-    } catch (err) {
-      throw translateFailure(err, { proxy: runtime.proxy, timeoutMs: runtime.timeoutMs });
+      response = await this.manager.request(path + (query ? buildQuery(query) : ""), init);
+    } catch (error) {
+      throw translateFailure(error);
     }
 
-    const bodyText = response.body.toString("utf8");
-    if (response.status >= 200 && response.status < 300) {
-      if (bodyText.trim().length === 0) return {};
-      try {
-        const parsed = JSON.parse(bodyText);
-        if (isPlainObject(parsed) && parsed.ok === true && "data" in parsed) return parsed.data;
-        if (isPlainObject(parsed) && "ok" in parsed) return parsed; // health 等无 data 包装
-        return parsed;
-      } catch {
-        return { raw: bodyText };
-      }
+    const bodyText = await response.text();
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status} ${response.statusText || ""}`.trim());
+      error.status = response.status;
+      error.statusText = response.statusText || "";
+      error.bodyText = bodyText;
+      throw translateFailure(error);
     }
-    throw translateFailure(new HttpStatusError(response.status, response.statusText, response.headers, bodyText), {
-      proxy: runtime.proxy,
-      timeoutMs: runtime.timeoutMs,
-    });
+    if (bodyText.trim().length === 0) return {};
+    try {
+      const parsed = JSON.parse(bodyText);
+      if (isPlainObject(parsed) && parsed.ok === true && "data" in parsed) return parsed.data;
+      if (isPlainObject(parsed) && "ok" in parsed) return parsed;
+      return parsed;
+    } catch {
+      return { raw: bodyText };
+    }
   }
 
   // ---- 端点方法 -------------------------------------------------------------

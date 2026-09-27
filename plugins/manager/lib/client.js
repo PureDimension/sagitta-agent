@@ -4,155 +4,273 @@ window.__ModuleLoader__.load({
     var module = { exports: {} };
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
-    const react = require("react");
-    const react_jsx_runtime = require("react/jsx-runtime");
-    const { jsx, jsxs } = react_jsx_runtime;
+    const React = require("react");
+    const { jsx, jsxs } = require("react/jsx-runtime");
 
     const name = "sagitta-manager";
     const namespace = "sagitta-manager";
     const inject = ["slots", "settingsScope"];
-    const RESTART_UNAVAILABLE = "restart-unavailable";
-    const FIELDS = [
-      { field: "workerApiUrl", label: "Worker API 地址", hint: "Sagitta Worker 运行时 API 根地址；memory、task 和健康检查从这里派生。", secret: false },
-      { field: "cfAccountId", label: "CF 账户 ID", hint: "Worker direct PUT 部署使用的 Cloudflare 账户 ID；非 secret。", secret: false },
-      { field: "cfScriptName", label: "Worker 脚本名", hint: "Worker direct PUT 部署使用的 Cloudflare Worker 脚本名；非 secret。", secret: false },
-      { field: "workerUploadToken", label: "Worker 部署 Token", hint: "仅 updater 部署 Worker 使用；输入框不会回填已存 Token。", secret: true },
-      { field: "accessClientId", label: "Access Client ID", hint: "Cloudflare Access 服务令牌 Client ID；memory/auto-advance 访问 worker 的网关放行凭据（CF-Access-Client-Id 头）。", secret: true },
-      { field: "accessClientSecret", label: "Access Client Secret", hint: "与 accessClientId 成对的 Secret；网关放行后 worker 免 Bearer。", secret: true },
-      { field: "d1ReadToken", label: "D1 读 Token", hint: "memory recall/list/search 与 task list/get 使用（Bearer 语义；Access 已配时可不填）。", secret: true },
-      { field: "d1WriteToken", label: "D1 写 Token", hint: "memory remember/consolidate/verify 与 task 写操作使用。", secret: true }
+    const fields = [
+      { key: "workerApiUrl", label: "Worker API 地址", hint: "Sagitta Worker 运行时 API 根地址。" },
+      { key: "proxy", label: "HTTP 代理", hint: "留空表示直连；默认使用本机 7897 端口。" },
+      { key: "scriptName", label: "Worker 脚本名", hint: "Cloudflare Worker 脚本名。" },
+      { key: "cfAccountId", label: "Cloudflare 账户 ID", hint: "部署 Worker 使用的 Cloudflare 账户 ID；非密钥。" },
+      { key: "repoPath", label: "仓库路径", hint: "部署时读取 worker/worker.js；留空表示关闭自动部署。" },
+      { key: "codexModel", label: "codex 默认模型", hint: "codex 派单使用的默认模型。" },
+      { key: "accessIdRef", label: "Access Client ID 引用名", hint: "凭据域中 Access Client ID 的引用名。" },
+      { key: "accessSecretRef", label: "Access Client Secret 引用名", hint: "凭据域中 Access Client Secret 的引用名。" },
+      { key: "uploadTokenRef", label: "Worker 上传 Token 引用名", hint: "凭据域中 Cloudflare 上传 Token 的引用名。" }
     ];
-    const EMPTY_SCOPE_SNAPSHOT = { status: "unavailable", value: undefined, base: undefined, user: undefined, revision: undefined, writable: false, mode: "memory" };
-    const COPY = { title: "Sagitta Manager", description: "统一管理 Sagitta Worker 与 D1 访问配置。", configured: "已配置", notConfigured: "未配置", health: "Worker 健康状态", healthNotConfigured: "未配置地址", healthChecking: "检查中…", healthOk: "正常", healthFailed: "不可用", save: "保存", saveRestart: "保存并重启", saving: "保存中…", clear: "清除", saved: "配置已保存。", restartUnavailable: "配置已保存，请手动重启 DSH（dsh --profile web）。", readOnly: "本部署的设置为只读。", saveFailed: "配置未保存，请检查设置服务后重试。" };
-    const STYLE = `.sagitta-manager-card{list-style:none;padding:16px;border:1px solid var(--dsw-alias-border-l2,rgba(128,144,164,.25));border-radius:12px;color:var(--dsw-alias-label-primary,#e8edf5);background:var(--dsw-alias-bg-layer-3,#1d2430)}.sagitta-manager-header h3{margin:0;font-size:15px}.sagitta-manager-header p,.sagitta-manager-health,.sagitta-manager-field-foot,.sagitta-manager-readonly,.sagitta-manager-message{color:var(--dsw-alias-label-tertiary,#9aa8ba);font-size:12px;line-height:1.5}.sagitta-manager-header p{margin:4px 0 14px}.sagitta-manager-health{display:flex;justify-content:space-between;gap:12px;padding:8px 10px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,rgba(255,255,255,.04))}.sagitta-manager-health strong{color:inherit;font-weight:600}.sagitta-manager-fields{margin-top:8px}.sagitta-manager-field{display:grid;gap:6px;padding:11px 0;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,144,164,.18))}.sagitta-manager-field-head,.sagitta-manager-field-foot,.sagitta-manager-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.sagitta-manager-field-head label{font-size:13px;font-weight:600}.sagitta-manager-badge{padding:1px 7px;border-radius:999px;font-size:11px}.sagitta-manager-badge.is-configured{color:#8ed9ae;background:rgba(73,177,111,.14)}.sagitta-manager-badge.is-unconfigured{color:var(--dsw-alias-label-tertiary,#9aa8ba);background:rgba(128,144,164,.12)}.sagitta-manager-field input{min-width:0;height:32px;padding:0 9px;border:1px solid var(--dsw-alias-border-l2,rgba(128,144,164,.3));border-radius:7px;color:inherit;background:var(--dsw-alias-bg-layer-3,#1d2430);font:inherit}.sagitta-manager-field input:focus-visible{border-color:var(--dsw-alias-brand-primary,#6e9eff);outline:2px solid var(--dsw-alias-brand-primary,#6e9eff);outline-offset:1px}.sagitta-manager-field-foot{align-items:flex-start}.sagitta-manager-field-foot span{flex:1}.sagitta-manager-field-foot button,.sagitta-manager-actions button{border:1px solid var(--dsw-alias-border-l2,rgba(128,144,164,.3));border-radius:7px;padding:4px 10px;color:inherit;background:transparent;cursor:pointer;font:inherit;font-size:12px}.sagitta-manager-actions{justify-content:flex-end;margin-top:13px}.sagitta-manager-actions button:last-child{border-color:var(--dsw-alias-label-primary,#e8edf5);color:var(--dsw-alias-bg-layer-3,#1d2430);background:var(--dsw-alias-label-primary,#e8edf5)}.sagitta-manager-field button:disabled,.sagitta-manager-actions button:disabled{opacity:.45;cursor:default}.sagitta-manager-readonly,.sagitta-manager-message{margin:10px 0 0}.sagitta-manager-message{color:var(--dsw-alias-label-secondary,#c7d0dc)}`;
-    function installStyles() { if (typeof document === "undefined" || document.querySelector("style[data-sagitta-manager]") !== null) return; const style = document.createElement("style"); style.dataset.sagittaManager = "true"; style.textContent = STYLE; document.head.appendChild(style); }
+    const credentialFields = [
+      { key: "accessId", refKey: "accessIdRef", label: "Access Client ID", hint: "留空保持当前凭据；明文不会回显。" },
+      { key: "accessSecret", refKey: "accessSecretRef", label: "Access Client Secret", hint: "留空保持当前凭据；明文不会回显。" },
+      { key: "uploadToken", refKey: "uploadTokenRef", label: "Worker 上传 Token", hint: "留空保持当前凭据；明文不会回显。" }
+    ];
+    const styleText = `
+      .sagitta-manager-card { border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-3); border-radius: 12px; list-style: none; color: var(--dsw-alias-label-primary); }
+      .sagitta-manager-header { width: 100%; padding: 14px 16px; border: 0; color: inherit; background: transparent; text-align: left; }
+      .sagitta-manager-title { display: block; font-size: 15px; font-weight: 600; line-height: 1.4; }
+      .sagitta-manager-description, .sagitta-manager-hint, .sagitta-manager-readonly, .sagitta-manager-error { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
+      .sagitta-manager-description { display: block; margin-top: 4px; }
+      .sagitta-manager-body { margin: 0 16px; border-top: 1px solid var(--dsw-alias-border-l2); padding-bottom: 8px; }
+      .sagitta-manager-field { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; }
+      .sagitta-manager-field + .sagitta-manager-field { border-top: 1px solid var(--dsw-alias-border-l2); }
+      .sagitta-manager-field-head { display: flex; align-items: center; gap: 8px; }
+      .sagitta-manager-label { min-width: 0; color: var(--dsw-alias-label-primary); flex: 1; font-size: 13px; font-weight: 500; line-height: 1.5; }
+      .sagitta-manager-overridden, .sagitta-manager-pending, .sagitta-manager-secret-state { border-radius: 999px; padding: 1px 8px; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-module-platform); font-size: 11px; line-height: 17px; }
+      .sagitta-manager-secret-state.is-unset { color: var(--dsw-alias-label-tertiary); background: transparent; }
+      .sagitta-manager-reset { border: 0; padding: 0; color: var(--dsw-alias-label-secondary); background: transparent; cursor: pointer; font: inherit; font-size: 12px; }
+      .sagitta-manager-reset:hover:not(:disabled) { color: var(--dsw-alias-label-primary); }
+      .sagitta-manager-input { height: 34px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 0 12px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-3); font: inherit; font-size: 13px; }
+      .sagitta-manager-input:focus-visible { border-color: var(--dsw-alias-brand-primary); outline: none; }
+      .sagitta-manager-input:disabled, .sagitta-manager-reset:disabled { color: var(--dsw-alias-label-tertiary); cursor: default; }
+      .sagitta-manager-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--dsw-alias-border-l2); padding: 12px 0 4px; }
+      .sagitta-manager-footer button { border: 1px solid transparent; border-radius: 8px; padding: 5px 14px; cursor: pointer; font: inherit; font-size: 13px; line-height: 1.5; }
+      .sagitta-manager-discard { border-color: var(--dsw-alias-border-l2) !important; color: var(--dsw-alias-label-secondary); background: transparent; }
+      .sagitta-manager-save { color: var(--dsw-alias-bg-layer-3); background: var(--dsw-alias-label-primary); }
+      .sagitta-manager-footer button:disabled { opacity: .4; cursor: default; }
+      .sagitta-manager-error { min-width: 0; margin: 0; color: var(--dsw-alias-label-error); flex: 1; }
+    `;
 
-    function safeString(value) { return typeof value === "string" ? value : ""; }
-    function isConfigured(value) { return safeString(value).trim().length > 0; }
-    function useExternalSnapshot(source, fallback) {
-      const getSnapshot = react.useCallback(() => source?.getSnapshot?.() ?? fallback, [source, fallback]);
-      const subscribe = react.useCallback((listener) => source?.subscribe?.(listener) ?? (() => {}), [source]);
-      return react.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+    function installStyles() {
+      if (document.querySelector("style[data-sagitta-manager]") !== null) return;
+      const style = document.createElement("style");
+      style.dataset.sagittaManager = "true";
+      style.textContent = styleText;
+      document.head.appendChild(style);
     }
-    function currentSecretState(describe, scopeSnapshot, field) {
-      const mirrorSnapshot = describe?.getSnapshot?.();
-      const row = mirrorSnapshot?.view?.namespaces?.find((entry) => entry.ns === namespace);
-      const descriptorSecret = row?.secrets?.find((entry) => entry.path?.length === 1 && entry.path[0] === field);
-      if (descriptorSecret !== undefined) return descriptorSecret.set === true;
-      const scopeSecret = scopeSnapshot?.secrets?.find?.((entry) => entry.path?.length === 1 && entry.path[0] === field);
-      if (scopeSecret !== undefined) return scopeSecret.set === true;
-      return isConfigured(scopeSnapshot?.value?.[field]);
+
+    function useScopeSnapshot(scope) {
+      return React.useSyncExternalStore(
+        (listener) => scope.subscribe(listener),
+        () => scope.getSnapshot(),
+        () => scope.getSnapshot()
+      );
     }
-    function healthEndpoint(apiUrl) {
-      if (!isConfigured(apiUrl)) return undefined;
-      try { return new URL("health", `${apiUrl.replace(/\/+$/, "")}/`).toString(); } catch { return undefined; }
+
+    function fieldValue(snapshot, key) {
+      const value = snapshot.value?.[key];
+      return typeof value === "string" ? value : "";
     }
-    function useWorkerHealth(apiUrl) {
-      const [health, setHealth] = react.useState(() => ({ kind: apiUrl ? "checking" : "not-configured" }));
-      react.useEffect(() => {
-        const endpoint = healthEndpoint(apiUrl);
-        if (endpoint === undefined) { setHealth({ kind: "not-configured" }); return undefined; }
-        const controller = new AbortController();
-        setHealth({ kind: "checking" });
-        if (typeof fetch !== "function") { setHealth({ kind: "failed" }); return () => controller.abort(); }
-        fetch(endpoint, { method: "GET", signal: controller.signal })
-          .then((response) => setHealth({ kind: response.ok ? "ok" : "failed" }))
-          .catch((error) => { if (error?.name !== "AbortError") setHealth({ kind: "failed" }); });
-        return () => controller.abort();
-      }, [apiUrl]);
-      return health;
+
+    function userHas(snapshot, key) {
+      return snapshot.user !== undefined && Object.hasOwn(snapshot.user, key);
     }
-    function healthText(health) {
-      switch (health.kind) { case "ok": return COPY.healthOk; case "checking": return COPY.healthChecking; case "failed": return COPY.healthFailed; default: return COPY.healthNotConfigured; }
+
+    function errorMessage(error) {
+      return error instanceof Error ? error.message : String(error);
     }
-    function requestHostRestart(reason, adapter) {
-      if (typeof adapter !== "function") return RESTART_UNAVAILABLE;
-      try { return adapter(reason); } catch { return RESTART_UNAVAILABLE; }
-    }
-    function fieldRow(field, value, configuredState, draft, writable, onEdit, onClear) {
-      const id = `sagitta-manager-${field.field}`;
-      return jsxs("div", { className: "sagitta-manager-field", children: [
-        jsxs("div", { className: "sagitta-manager-field-head", children: [
-          jsx("label", { htmlFor: id, children: field.label }),
-          jsx("span", { className: `sagitta-manager-badge ${configuredState ? "is-configured" : "is-unconfigured"}`, children: configuredState ? COPY.configured : COPY.notConfigured })
-        ] }),
-        jsx("input", { id, type: field.secret ? "password" : "text", autoComplete: field.secret ? "new-password" : "off", value: draft, disabled: !writable, onChange: (event) => onEdit(field.field, event.target.value), "aria-label": field.label }),
-        jsxs("div", { className: "sagitta-manager-field-foot", children: [
-          jsx("span", { children: field.secret ? field.hint : `${field.hint} 当前值：${safeString(value) || COPY.notConfigured}` }),
-          jsx("button", { type: "button", disabled: !writable, onClick: () => onClear(field.field), children: COPY.clear })
-        ] })
-      ] });
-    }
-    function ManagerCard(props) {
-      const scope = props.scope;
-      const snapshot = useExternalSnapshot(scope, EMPTY_SCOPE_SNAPSHOT);
-      const value = snapshot.value && typeof snapshot.value === "object" ? snapshot.value : {};
-      const [drafts, setDrafts] = react.useState(() => ({ workerApiUrl: "", cfAccountId: "", cfScriptName: "", workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
-      const [staged, setStaged] = react.useState(() => new Set());
-      const [saving, setSaving] = react.useState(false);
-      const [message, setMessage] = react.useState("");
-      const workerApiUrl = safeString(value.workerApiUrl);
-      const cfAccountId = safeString(value.cfAccountId);
-      const cfScriptName = safeString(value.cfScriptName);
-      const health = useWorkerHealth(workerApiUrl);
-      const writable = snapshot.writable === true && snapshot.status === "ready";
-      react.useEffect(() => { if (snapshot.status !== "ready" || staged.size > 0) return; setDrafts((previous) => ({ ...previous, workerApiUrl, cfAccountId, cfScriptName })); }, [snapshot.status, snapshot.revision, staged.size, workerApiUrl, cfAccountId, cfScriptName]);
-      const edit = (field, text) => {
-        setMessage(""); setDrafts((previous) => ({ ...previous, [field]: text }));
-        setStaged((previous) => { const next = new Set(previous); if (text.length === 0) next.delete(field); else next.add(field); return next; });
-      };
-      const clear = async (field) => {
-        if (!writable || typeof scope?.unset !== "function") return;
-        setSaving(true); setMessage("");
-        try {
-          await scope.unset(field); setDrafts((previous) => ({ ...previous, [field]: "" }));
-          setStaged((previous) => { const next = new Set(previous); next.delete(field); return next; }); setMessage(COPY.saved);
-        } catch { setMessage(COPY.saveFailed); } finally { setSaving(false); }
-      };
-      const save = async (restart) => {
-        if (!writable || typeof scope?.set !== "function" || saving) return RESTART_UNAVAILABLE;
-        setSaving(true); setMessage("");
-        try {
-          for (const field of FIELDS) { const draft = safeString(drafts[field.field]); if (draft.length > 0 && staged.has(field.field)) await scope.set(field.field, draft); }
-          const current = scope.getSnapshot?.()?.value;
-          setStaged(new Set()); setDrafts((previous) => ({ ...previous, workerApiUrl: safeString(current?.workerApiUrl), cfAccountId: safeString(current?.cfAccountId), cfScriptName: safeString(current?.cfScriptName), workerUploadToken: "", d1ReadToken: "", d1WriteToken: "" }));
-          if (!restart) { setMessage(COPY.saved); return "saved"; }
-          const result = await Promise.resolve(requestHostRestart("sagitta-manager settings saved", props.requestHostRestart));
-          setMessage(result === "restarted" || result === true ? COPY.saved : COPY.restartUnavailable); return result;
-        } catch { setMessage(COPY.saveFailed); return "save-failed"; } finally { setSaving(false); }
-      };
+
+    function ManagerCard({ scope, api, remote }) {
+      const snapshot = useScopeSnapshot(scope);
+      const allFields = [...fields, ...credentialFields];
+      const [drafts, setDrafts] = React.useState(() => Object.fromEntries(allFields.map(({ key }) => [key, ""])));
+      const [staged, setStaged] = React.useState(() => new Set());
+      const [baseRevision, setBaseRevision] = React.useState(snapshot.revision);
+      const [saving, setSaving] = React.useState(false);
+      const [error, setError] = React.useState("");
+      const [credentialViews, setCredentialViews] = React.useState(() => Object.fromEntries(credentialFields.map(({ key }) => [key, {
+        ref: "",
+        configured: false,
+        writable: false,
+        error: ""
+      }])));
+      const [credentialReload, setCredentialReload] = React.useState(0);
+      const writable = snapshot.status === "ready" && snapshot.writable === true;
+      const credentialRefs = credentialFields.map((field) => {
+        const value = staged.has(field.refKey) ? drafts[field.refKey] : fieldValue(snapshot, field.refKey);
+        return typeof value === "string" ? value.trim() : "";
+      });
+      const credentialRefsKey = credentialRefs.join("\u0000");
+
+      React.useEffect(() => {
+        if (staged.size !== 0) return;
+        setDrafts(Object.fromEntries(allFields.map(({ key }) => [key, ""])));
+        setBaseRevision(snapshot.revision);
+      }, [snapshot.revision, snapshot.status, staged.size]);
+
+      React.useEffect(() => {
+        let disposed = false;
+        async function readCredentials() {
+          for (let index = 0; index < credentialFields.length; index += 1) {
+            const field = credentialFields[index];
+            const ref = credentialRefs[index];
+            if (ref === "") {
+              setCredentialViews((current) => ({ ...current, [field.key]: { ref, configured: false, writable: false, error: "" } }));
+              continue;
+            }
+            setCredentialViews((current) => ({ ...current, [field.key]: { ref, configured: false, writable: true, error: "" } }));
+            try {
+              const response = await api.credentials.describe({ refs: [ref] });
+              if (!response.result.ok) throw new Error(`credential describe failed: ${ref}`);
+              const view = response.result.value.credentials[ref];
+              if (disposed) return;
+              const currentSnapshot = scope.getSnapshot();
+              const currentValue = staged.has(field.refKey) ? drafts[field.refKey] : fieldValue(currentSnapshot, field.refKey);
+              if (ref !== (typeof currentValue === "string" ? currentValue.trim() : "")) continue;
+              setCredentialViews((current) => ({ ...current, [field.key]: {
+                ref,
+                configured: view?.configured === true,
+                writable: view?.writable ?? true,
+                error: ""
+              } }));
+            } catch (readError) {
+              if (disposed) return;
+              setCredentialViews((current) => ({ ...current, [field.key]: {
+                ref,
+                configured: false,
+                writable: false,
+                error: errorMessage(readError)
+              } }));
+              setError(errorMessage(readError));
+            }
+          }
+        }
+        void readCredentials();
+        return () => {
+          disposed = true;
+        };
+      }, [api, scope, credentialRefsKey, credentialReload]);
+
+      React.useEffect(() => remote.$on("credentials/reference-updated", (ref) => {
+        if (credentialRefs.includes(ref)) setCredentialReload((current) => current + 1);
+      }), [remote, credentialRefsKey]);
+
       if (snapshot.status === "unavailable") return null;
+
+      const edit = (key, value) => {
+        if (staged.size === 0) setBaseRevision(snapshot.revision);
+        setDrafts((current) => ({ ...current, [key]: value }));
+        setStaged((current) => new Set(current).add(key));
+        setError("");
+      };
+
+      const reset = (key) => {
+        if (staged.size === 0) setBaseRevision(snapshot.revision);
+        setDrafts((current) => ({ ...current, [key]: typeof snapshot.base?.[key] === "string" ? snapshot.base[key] : "" }));
+        setStaged((current) => new Set(current).add(key));
+        setError("");
+      };
+
+      const discard = () => {
+        setStaged(new Set());
+        setError("");
+      };
+
+      const save = async () => {
+        if (!writable || saving || staged.size === 0) return;
+        if (snapshot.revision !== baseRevision) {
+          setError("配置已被其他页面修改，请先丢弃草稿并重新编辑。");
+          return;
+        }
+        setSaving(true);
+        setError("");
+        try {
+          let landed = true;
+          for (const field of fields) {
+            if (!staged.has(field.key)) continue;
+            const value = drafts[field.key].trim();
+            if (value === "") await scope.unset(field.key);
+            else await scope.set(field.key, value);
+            const after = scope.getSnapshot();
+            landed = landed && (value === "" ? !userHas(after, field.key) : after.user?.[field.key] === value);
+          }
+          if (!landed) throw new Error("配置未保存，请检查设置服务后重试。");
+          const current = scope.getSnapshot();
+          for (const field of credentialFields) {
+            if (!staged.has(field.key)) continue;
+            const value = drafts[field.key].trim();
+            if (value === "") continue;
+            const ref = fieldValue(current, field.refKey).trim();
+            if (ref === "") throw new Error(`${field.label} 没有有效的引用名`);
+            await api.credentials.set({ ref, value });
+          }
+          setCredentialReload((currentReload) => currentReload + 1);
+          setStaged(new Set());
+        } catch (saveError) {
+          setError(errorMessage(saveError));
+        } finally {
+          setSaving(false);
+        }
+      };
+
       return jsx("li", { className: "sagitta-manager-card", children: [
-        jsxs("header", { className: "sagitta-manager-header", children: [jsx("h3", { children: COPY.title }), jsx("p", { children: COPY.description })] }),
-        jsxs("div", { className: "sagitta-manager-health", role: "status", children: [jsx("strong", { children: COPY.health }), jsx("span", { children: healthText(health) })] }),
-        jsx("div", { className: "sagitta-manager-fields", children: FIELDS.map((field) => fieldRow(field, value[field.field], field.secret ? currentSecretState(props.describe, snapshot, field.field) : isConfigured(value[field.field]), drafts[field.field], writable && !saving, edit, clear)) }),
-        snapshot.writable !== true ? jsx("p", { className: "sagitta-manager-readonly", children: COPY.readOnly }) : null,
-        message ? jsx("p", { className: "sagitta-manager-message", role: "status", children: message }) : null,
-        jsxs("footer", { className: "sagitta-manager-actions", children: [
-          jsx("button", { type: "button", disabled: !writable || saving || staged.size === 0, onClick: () => void save(false), children: saving ? COPY.saving : COPY.save }),
-          jsx("button", { type: "button", disabled: !writable || saving, onClick: () => void save(true), children: saving ? COPY.saving : COPY.saveRestart })
+        jsxs("header", { className: "sagitta-manager-header", children: [
+          jsx("span", { className: "sagitta-manager-title", children: "Sagitta Manager" }),
+          jsx("span", { className: "sagitta-manager-description", children: "统一管理 Worker 地址、代理、部署来源与凭据。" })
+        ] }),
+        jsxs("div", { className: "sagitta-manager-body", children: [
+          fields.map((field) => jsxs("div", { className: "sagitta-manager-field", children: [
+            jsxs("div", { className: "sagitta-manager-field-head", children: [
+              jsx("label", { className: "sagitta-manager-label", htmlFor: `sagitta-manager-${field.key}`, children: field.label }),
+              staged.has(field.key) ? jsx("span", { className: "sagitta-manager-pending", children: "未保存" }) : userHas(snapshot, field.key) ? jsx("span", { className: "sagitta-manager-overridden", children: "已覆盖" }) : null,
+              userHas(snapshot, field.key) ? jsx("button", { className: "sagitta-manager-reset", type: "button", disabled: !writable || saving, onClick: () => reset(field.key), children: "重置" }) : null
+            ] }),
+            jsx("input", { className: "sagitta-manager-input", id: `sagitta-manager-${field.key}`, type: "text", value: staged.has(field.key) ? drafts[field.key] : fieldValue(snapshot, field.key), disabled: !writable || saving, onChange: (event) => edit(field.key, event.target.value) }),
+            jsx("p", { className: "sagitta-manager-hint", children: field.hint })
+          ] }, field.key)),
+          credentialFields.map((field, index) => {
+            const view = credentialViews[field.key];
+            const configured = view.configured === true;
+            const canWrite = writable && view.writable === true && credentialRefs[index] !== "";
+            return jsxs("div", { className: "sagitta-manager-field", children: [
+              jsxs("div", { className: "sagitta-manager-field-head", children: [
+                jsx("label", { className: "sagitta-manager-label", htmlFor: `sagitta-manager-${field.key}`, children: field.label }),
+                jsx("span", { className: `sagitta-manager-secret-state${configured ? "" : " is-unset"}`, children: configured ? "已配置" : "未配置" }),
+                staged.has(field.key) ? jsx("span", { className: "sagitta-manager-pending", children: "未保存" }) : null
+              ] }),
+              jsx("input", { className: "sagitta-manager-input", id: `sagitta-manager-${field.key}`, type: "password", autoComplete: "off", value: staged.has(field.key) ? drafts[field.key] : "", disabled: !canWrite || saving, onChange: (event) => edit(field.key, event.target.value) }),
+              jsx("p", { className: "sagitta-manager-hint", children: view.error || field.hint })
+            ] }, field.key);
+          }),
+          !writable ? jsx("p", { className: "sagitta-manager-readonly", children: "本部署的设置为只读。" }) : null,
+          jsxs("footer", { className: "sagitta-manager-footer", children: [
+            error ? jsx("p", { className: "sagitta-manager-error", role: "status", children: error }) : null,
+            jsx("button", { className: "sagitta-manager-discard", type: "button", disabled: saving || staged.size === 0, onClick: discard, children: "丢弃" }),
+            jsx("button", { className: "sagitta-manager-save", type: "button", disabled: !writable || saving || staged.size === 0, onClick: () => void save(), children: saving ? "保存中…" : "保存" })
+          ] })
         ] })
       ] });
     }
-    class ManagerCardController {
-      constructor(ctx, scope, describe, restartAdapter) { this.ctx = ctx; this.scope = scope; this.describe = describe; this.restartAdapter = restartAdapter; }
-      inject() { return { scope: this.scope, describe: this.describe, requestHostRestart: this.restartAdapter }; }
-    }
+
     function apply(ctx) {
       installStyles();
       const scope = ctx.settingsScope.bind({ namespace });
-      const describe = ctx.settingsScope.describe?.();
-      const controller = new ManagerCardController(ctx, scope, describe, undefined);
+      const { api } = ctx.get("connection");
+      const remote = ctx.remote;
       ctx.slots.inject("settings.plugin.item", function* () {
-        yield ctx.slots.register({ name: "settings.plugin.item", key: namespace, locale: namespace, inject: () => controller.inject() }, ManagerCard);
+        yield ctx.slots.register({
+          name: "settings.plugin.item",
+          key: namespace,
+          locale: namespace,
+          inject: () => ({ scope, api, remote })
+        }, ManagerCard);
       });
     }
-    exports.ManagerCard = ManagerCard;
+
     exports.apply = apply;
     exports.inject = inject;
     exports.name = name;
-    exports.namespace = namespace;
-    exports.requestHostRestart = requestHostRestart;
     return module.exports;
   }
 });

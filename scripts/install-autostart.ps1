@@ -1,6 +1,6 @@
 <#
   Optional Windows logon autostart for sagitta-agent.
-  Default policy (decision ④ recommendation): updater runs only when DSH starts.
+  Default policy (decision ④ recommendation): DSH starts only when explicitly launched.
   This script is OFF by default — run it explicitly if Ripple wants DSH to also
   start at Windows logon. Safe to run: backup + DryRun + idempotent.
 

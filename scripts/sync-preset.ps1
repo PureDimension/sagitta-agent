@@ -154,8 +154,7 @@ $TasksFile = if (-not [string]::IsNullOrWhiteSpace($TasksFile)) {
     'D:\workspace\sagitta-experience\TASKS.md'
 }
 $templateVariables = [ordered]@{
-    # Keep this variable table in lockstep with getPresetTemplateVariables in
-    # plugins/updater/lib/preset.js.
+    # Keep this variable table in lockstep with this script's template expansion.
     # SAGITTA_TASKS_FILE is the external live task fact source before Ripple
     # decision ⑤; afterward retire it and move the whole instruction to the
     # task API or an approved migration path.

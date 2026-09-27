@@ -22,7 +22,7 @@ function Ensure-SagittaRepository {
             if (Test-Path -LiteralPath $gitDir -PathType Container) {
                 $status = (& git -C $Path status --porcelain 2>$null | Out-String).Trim()
                 if ($status) { Write-Warning '[install] Sagitta repository is dirty; no pull/overwrite will be attempted.' }
-                else { Write-Host '[install] Sagitta repository is clean; update responsibility remains with updater ff-only logic.' }
+                else { Write-Host '[install] Sagitta repository is clean; update responsibility remains with the Git fast-forward policy.' }
             } else {
                 Write-Host '[install] using existing Sagitta source directory (no Git metadata).'
             }
@@ -101,7 +101,7 @@ function Ensure-SagittaRepository {
             if (Test-Path -LiteralPath $gitDir -PathType Container) {
                 $status = (& git -C $Path status --porcelain 2>$null | Out-String).Trim()
                 if ($status) { Write-Warning '[install] Sagitta repository is dirty; no pull/overwrite will be attempted.' }
-                else { Write-Host '[install] Sagitta repository is clean; update responsibility remains with updater ff-only logic.' }
+                else { Write-Host '[install] Sagitta repository is clean; update responsibility remains with the Git fast-forward policy.' }
             } else {
                 Write-Host '[install] using existing Sagitta source directory (no Git metadata).'
             }

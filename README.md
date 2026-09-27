@@ -1,6 +1,6 @@
 # sagitta-agent
 
-Sagitta 的 DSH 插件、默认 preset、本机 updater，以及 Cloudflare Worker/D1 的参考部署材料。
+Sagitta 的 DSH 插件、默认 preset，以及 Cloudflare Worker/D1 的参考部署材料。
 
 ## 项目特色与目标
 
@@ -15,7 +15,7 @@ Sagitta 的 DSH 插件、默认 preset、本机 updater，以及 Cloudflare Work
 
 ### 特色
 
-- **四插件架构**：`manager`（统一配置/凭据）、`memory`（记忆读写 + 5 个 task 工具）、`auto-advance`（自主推进编排 + 悬浮窗）、`updater`（开机自检/更新）+ `codex-dispatch`（codex 派单）+ `async-work`（通用有界工作注册表）
+- **五插件架构**：`manager`（统一配置/凭据）、`memory`（记忆读写 + 5 个 task 工具）、`auto-advance`（自主推进编排 + 悬浮窗）、`codex-dispatch`（codex 派单）+ `async-work`（通用有界工作注册表）
 - **云端数据层**：Cloudflare Worker + D1 承载记忆与任务，读写 Bearer/Access 双认证，国内网络需代理（`*.workers.dev` 被 GFW 封锁）
 - **任务系统 v2**：pending 状态机 + confirm/round-close + task_events 审计 + 分页 + 任务认领（租约回收）
 - **DSH 深度集成**：悬浮窗实时任务面板、per-session 自主推进开关、preset 开场四流记忆召回、codex 派单注册有界工作
@@ -23,14 +23,14 @@ Sagitta 的 DSH 插件、默认 preset、本机 updater，以及 Cloudflare Work
 ### 仓库布局
 
 ```text
-plugins/    六个 DSH 插件（manager/memory/auto-advance/updater/codex-dispatch/async-work）
+plugins/    五个 DSH 插件（manager/memory/auto-advance/codex-dispatch/async-work）
 presets/    sagitta user preset（persona + 开场指令）
 worker/     Cloudflare Worker 参考实现（/mem + /task 路由 + D1 schema）
 scripts/    安装/部署/校验七件套（幂等 + dry-run + 备份）
 docs/       设计文档（task-api-p1 / task-enforcement-p1 / task-ownership-p2 等）
 ```
 
-> 注：本机实际运行配置（`cordis.patch.yml`、`.env`、TASKS.md 动态文件）刻意不进仓库——密钥不落地，活文件不被 updater 覆盖。
+> 注：本机实际运行配置（`cordis.patch.yml`、`.env`、TASKS.md 动态文件）刻意不进仓库——密钥不落地，活文件不被安装流程覆盖。
 
 ## 前提
 
@@ -53,7 +53,7 @@ pwsh -NoProfile -File .\scripts\install.ps1
 pwsh -NoProfile -File .\scripts\install.ps1 -DryRun
 ```
 
-安装器会检测 DSH；缺失时在 `%LOCALAPPDATA%\DeepSeek-Harness` 浅克隆 DSH，随后在 `<DSH_HOME>\profiles\web` 幂等追加四个本地插件、bundles 和 profile patch，安装 `sagitta` user preset，并检查：
+安装器会检测 DSH；缺失时在 `%LOCALAPPDATA%\DeepSeek-Harness` 浅克隆 DSH，随后在 `<DSH_HOME>\profiles\web` 幂等追加五个本地插件、bundles 和 profile patch，安装 `sagitta` user preset，并检查：
 
 ```text
 <DSH_HOME>/.agent-presets/sagitta/
@@ -94,7 +94,7 @@ dsh --profile web
 
 ## Worker
 
-GitHub 不替用户部署 Worker。请先复制并审阅 `worker/wrangler.toml.example`、`worker/.dev.vars.example` 和 `worker/reference/*`，将本地副本中的占位符替换为自己的配置；真实文件已被 `.gitignore` 排除。D1 schema/migration 必须人工确认，不由 updater 隐式执行。
+GitHub 不替用户部署 Worker。请先复制并审阅 `worker/wrangler.toml.example`、`worker/.dev.vars.example` 和 `worker/reference/*`，将本地副本中的占位符替换为自己的配置；真实文件已被 `.gitignore` 排除。D1 schema/migration 必须人工确认。
 
 代码上传支持人工调用：
 
@@ -115,6 +115,6 @@ dsh --profile web --dump-config
 pwsh -NoProfile -File .\scripts\verify-install.ps1
 ```
 
-重点检查四个插件行、`agent-presets.default=sagitta`、profile path、Manager configured 状态、`/mem/health`、一次只读 recall 和 auto-advance 面板。updater 随每次 `dsh --profile web` 启动做本机源码、插件和 preset 自检；更新冲突、脏工作树、网络失败和未配置凭据会成为可重试诊断，不阻塞 DSH 启动。
+重点检查五个插件行、`agent-presets.default=sagitta`、profile path、Manager configured 状态、`/mem/health`、一次只读 recall 和 auto-advance 面板。
 
 Windows 登录自动启动 DSH 不属于默认安装范围。Worker migration 仍需人工确认。

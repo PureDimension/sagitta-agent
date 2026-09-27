@@ -22,29 +22,15 @@ const Config = z.object({
   advancePromptBackoffFactor: z.number().min(1).default(2).description("Exponential backoff factor for repeated owned-task continuation prompts."),
   advancePromptMaxCooldownMs: z.number().min(0).default(300000).description("Maximum cooldown between repeated owned-task continuation prompts (milliseconds)."),
   advancePromptMaxInjections: z.number().min(1).default(3).description("Maximum continuation prompt injections for one unchanged task snapshot."),
-  statePath: z.string().description("JSON file used to persist the per-session mode. Defaults to the resolved Sagitta workspace."),
-  tasksPath: z.string().description("Read-only Markdown task file shown by the client panel. Defaults to the resolved Sagitta workspace."),
-  proxy: z.string().default(process.env.DSH_MEMORY_PROXY || "direct").description("HTTP 代理（CONNECT 隧道）用于读云端 /task；与 memory 共用 DSH_MEMORY_PROXY；'direct' 或空串仅允许 loopback。"),
-  taskApiTimeoutMs: z.number().default(3000).description("云端 /task 单页读取超时（毫秒）；云端失败时资格判断 fail closed。"),
+  statePath: z.string().description("JSON file used to persist the per-session mode. Defaults to <DSH_HOME>/profiles/web."),
   taskPageSize: z.number().default(200).description("云端 /task 分页大小（服务端上限 1000）。")
 });
 
 function apply(ctx, config) {
   const manager = ctx?.["sagitta-manager"];
-  let managerApiConfig;
-  if (typeof manager?.getApiConfig === "function") {
-    try {
-      managerApiConfig = manager.getApiConfig();
-    } catch {
-      managerApiConfig = undefined;
-    }
-  }
-  // Keep the manager object for per-request refreshes, and retain the apply
-  // snapshot for startup ordering. Neither path emits credentials.
   ctx.plugin(AutoAdvanceService, {
     ...(config ?? {}),
-    manager,
-    managerApiConfig
+    manager
   });
 }
 

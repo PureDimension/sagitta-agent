@@ -8,6 +8,7 @@ import { SagittaMemoryClient } from "../lib/client.js";
 import { createTaskGate, installTaskGate } from "../lib/task-gate.js";
 import { recallProjectMemory } from "../lib/task-project-memory.js";
 import { pickTask } from "../lib/task-contract.js";
+import { createMockManager } from "./mock-manager.mjs";
 
 const requests = [];
 const agent = { id: "agent-task-v2-smoke" };
@@ -184,12 +185,7 @@ const server = createServer(async (req, res) => {
 
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
-const client = new SagittaMemoryClient({
-  baseUrl: `http://127.0.0.1:${port}`,
-  proxy: "direct",
-  timeoutMs: 2000,
-  auth: { authToken: "task-v2-smoke-token" },
-});
+const client = new SagittaMemoryClient(createMockManager(`http://127.0.0.1:${port}`));
 
 try {
   // need-human：记 / 解 / 跨任务列。

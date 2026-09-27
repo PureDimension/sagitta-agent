@@ -6,12 +6,12 @@ Sagitta 的 Cordis 自主推进插件，包含：
 - `sagittaAutoAdvance` typed RPC；
 - DSH 原生会话标题旁的 `conversation.session.header.actions` async-work 入口：按当前 session/agent 轮询 typed RPC，展示运行中与最近结束（completed/failed/cancelled/expired）工作；
 - 右下角可拖拽悬浮球和任务摘要面板（v0.1.8 交互）。面板顶部从云端 `/need-human?status=open` 汇聚 `need` 类型的“待你处理”和 `notify` 类型的“待你确认”通知；通知可由涟漪点击“确认”直接清账。其后显示项目进度。默认显示圆圈；点击圆圈后圆圈消失并展开面板，点击面板右上角“收起”后面板消失并恢复圆圈。圆圈与面板共用一个屏幕锚点，面板会贴着悬浮球并在拖动和窗口 resize 时限制在视口内；面板高度随内容自适应，任务较多时仅任务列表在面板内部滚动且保留滚动位置。收起/展开只影响界面显示，模式状态会保持。
-- 自主推进资格只使用完整云端 `/task` 快照；云端不可用时不注入、不熄火，面板可显示带 `source=file-stale` 标记的旧文件快照。
+- 自主推进资格和面板任务列表只使用完整云端 `/task` 快照；云端不可用时不注入、不熄火，并保留降级状态等待重试。
 - 自主推进只在本会话已有认领的 `in_progress` 任务时注入短提示，并在每轮前注入当前认领清单；没有认领任务但有 `open` 时只提示可 `task_claim`，全部无可继续任务时自动熄火。
 - 自主推进读取当前 agent 的 `sagitta-async-work` 注册表统计 `kind=codex` 的运行中工作；达到 `codexMaxConcurrent` 时对可能需要 codex 的任务静默等待并定时重检，槽位释放后恢复提示。任务可用 `requires_codex=false` 或 `execution_resource=local/model/agent/human` 显式声明不占 codex 槽位；没有执行资源字段时按保守策略视为可能需要 codex，不改动云端任务契约。
 - 相同任务快照的 owned-task 提示受 `advancePromptCooldownMs`、`advancePromptBackoffFactor`、`advancePromptMaxCooldownMs` 和 `advancePromptMaxInjections` 控制，防止连续回合无限重复注入。
 - 终态工具调用前自动注入在场/离开两态质询；`temp` 任务豁免。`done/blocked`、need-human 的创建和 `task_confirm` 的实际写入由 memory task 工具/Worker 负责；面板仅通过独立 resolve RPC 清除 `notify`，不唤醒 agent；auto-advance 不再强制或解析每轮 `task_round_close`。
-- 文本兜底写回使用 Manager 的 D1 写凭据或成对 Access 凭据，并沿用 `DSH_MEMORY_PROXY`；缺凭据、网络失败或 Worker 拒绝时只进入 degraded/defer，不改变任务状态。工具调用仍由 memory task 工具/Worker 负责写入。
+- 文本兜底写回使用 Manager 的统一 Worker 通道；凭据、连接方式、超时和失败处理均由 Manager 负责。缺凭据、网络失败或 Worker 拒绝时只进入 degraded/defer，不改变任务状态。工具调用仍由 memory task 工具/Worker 负责写入。
 
 停止协议：assistant 消息包含 `【停止自主推进】` 仅在最新完整云端快照显示所有任务均为 `done/blocked` 且没有 pending 时触发；否则保持自主推进并提示仍有未完成任务。云端读取失败不触发停止。
 
@@ -21,7 +21,5 @@ Sagitta 的 Cordis 自主推进插件，包含：
 
 资源/退避配置默认值：`codexMaxConcurrent: 4`、`advancePromptCooldownMs: 30000`、`advancePromptBackoffFactor: 2`、`advancePromptMaxCooldownMs: 300000`、`advancePromptMaxInjections: 3`。`SAGITTA_CODEX_MAX_CONCURRENT` 可作为 `codexMaxConcurrent` 的环境变量回退；实际 codex-dispatch 配置与 auto-advance 配置应保持一致。
 
-模式状态写入 `statePath`，任务文件由后端读取 `tasksPath`；两者显式配置优先。未配置时，
-后端依次使用 `SAGITTA_WORKSPACE`、包含 `TASKS.md` 的兼容工作区候选，最后才使用当前工作
-目录。浏览器只通过 RPC 读取，不能修改文件。部署包会在 profile patch 中写入目标机
-workspace 的绝对路径。
+模式状态写入 `statePath`，显式配置优先；未配置时落在
+`<DSH_HOME>/profiles/web/.sagitta-auto-advance.json`。浏览器只通过 RPC 读取，不能修改文件。

@@ -1,30 +1,42 @@
 # @sagitta/manager
 
-`@sagitta/manager`（Cordis id：`sagitta-manager`）是 Sagitta 的统一配置插件。它把 Worker 运行时 API 地址、Worker 部署元数据与凭据以及 D1 读写凭据注册到 DSH settings，并提供浏览器端插件配置卡片。
+`@sagitta/manager`（Cordis id：`sagitta-manager`）是 Sagitta 唯一的基础设施服务：它注册配置、解析凭据、提供 Worker HTTP 通道，并负责显式触发 Worker 部署。
 
 ## 配置字段
 
-| 字段 | 是否 secret | 用途 |
+| 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `workerApiUrl` | 否 | Sagitta Worker 运行时 API 根地址；memory、task 和 health 从这里派生。 |
-| `cfAccountId` | 否 | Cloudflare 账户 ID；Worker direct PUT 部署元数据。 |
-| `cfScriptName` | 否 | Cloudflare Worker 脚本名；Worker direct PUT 部署元数据。 |
-| `workerUploadToken` | 是 | 仅 updater 用于部署 Worker。 |
-| `d1ReadToken` | 是 | memory recall/list/search 与 task list/get 的读凭据。 |
-| `d1WriteToken` | 是 | memory remember/consolidate/verify 与 task 写操作的写凭据。 |
+| `workerApiUrl` | 空串 | Worker 运行时 API 根地址；请求和部署健康检查时必填。 |
+| `proxy` | `http://127.0.0.1:7897` | HTTP CONNECT 代理；空串表示直连。 |
+| `scriptName` | `sagitta-memory` | Cloudflare Worker 脚本名。 |
+| `cfAccountId` | 空串 | Cloudflare 账户 ID；部署时必填，不查询 memberships。 |
+| `repoPath` | 空串 | 包含 `worker/worker.js` 的仓库路径；空串显式关闭启动时自动部署。 |
+| `codexModel` | `gpt-5.6-luna` | codex 派单默认模型。 |
+| `accessIdRef` | `SAGITTA_ACCESS_ID` | Access Client ID 的凭据引用名，可在设置卡片修改。 |
+| `accessSecretRef` | `SAGITTA_ACCESS_SECRET` | Access Client Secret 的凭据引用名，可在设置卡片修改。 |
+| `uploadTokenRef` | `SAGITTA_UPLOAD_TOKEN` | Cloudflare API Token 的凭据引用名，可在设置卡片修改。 |
 
-六个字段默认都是空字符串。浏览器端会回填两个非 secret 字段，但不会回填 secret；secret 输入框只保留本地草稿，空输入不修改已有值，明确点击“清除”才会调用 `scope.unset`。界面和诊断只显示已配置/未配置状态，不显示 token 明文。
+三个引用名与对应的凭据值都可从设置卡片修改。凭据输入框从空白开始，只显示“已配置/未配置”；实际读写走 credentials domain，明文不会回显。
 
-## 被其他插件读取
-
-其他 Host 插件通过 Cordis service 读取当前值，不应直接读取 `settings.yaml` 或复制 manager 配置：
+## 服务 API
 
 ```js
 const manager = ctx["sagitta-manager"];
-const { workerApiUrl, workerUploadToken, d1ReadToken, d1WriteToken, cfAccountId, cfScriptName } = manager.getApiConfig();
-const status = manager.getPublicStatus();
+await manager.apiConfig();
+await manager.request("/mem/recall", { method: "GET" });
+await manager.deployWorker();
 ```
 
-`getApiConfig()` 只用于同一 DSH 进程内的 memory/updater 等 Host 插件；不要把它原样暴露给 browser remote API。`getPublicStatus()` 是不含 secret 的布尔状态投影。
+`apiConfig()` 返回九个字段：`workerApiUrl`、`proxy`、`scriptName`、`cfAccountId`、`repoPath`、`codexModel`、`accessId`、`accessSecret`、`uploadToken`。后三个值由配置中的引用名异步解析。
 
-memory/task 的具体 token header 与 endpoint 由各自 adapter 决定，manager 不猜测旧的 Cloudflare Access 字段语义。当前 DSH 没有已验证的整树重启桥接，因此“保存并重启”会保存配置并提示 `dsh --profile web` 手动重启。
+`request()` 自动附加 Cloudflare Access 头，按 `proxy` 选择 CONNECT 隧道或直连，并在 HTTP 失败、网络失败或超时时抛错。
+
+## Worker 部署
+
+配置 `repoPath` 后，manager 读取 `<repoPath>/worker/worker.js` 并计算 SHA-256，与 `<dshHome>/profiles/web/.sagitta-deployed.json` 中上次成功部署的 SHA 比较。相同则返回 `{ status: "up-to-date" }`；不同则读取 `worker/reference/deploy.json` 的 `bindings`，以包含 D1 与 secret bindings 的 multipart 上传，回读 `/mem/health` 成功后写入新 SHA，并返回 `{ status: "deployed", sha }`。
+
+`deploy.json` 缺失或没有 `bindings` 数组会直接报错，不会退化为无 bindings 上传。`cfAccountId` 为空也会直接报错。状态文件不存在表示尚未成功部署，属于首次部署的正常状态。
+
+未配置 `repoPath` 时启动自动部署显式关闭，但直接调用 `deployWorker()` 会报错。
+
+浏览器端 `lib/client.js` 是独立的 `dsh.client` bundle，自己渲染九个文本字段与三个凭据控件，不导入 `@deepseek-ai/dsh-client-ui-settings-plugins` 的代码；样式使用 `--dsw-alias-*` 变量。

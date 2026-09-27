@@ -3,49 +3,23 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const source = await readFile(join(fileURLToPath(new URL(".", import.meta.url)), "../lib/index.js"), "utf8");
-const processTreeSource = await readFile(join(fileURLToPath(new URL(".", import.meta.url)), "../lib/process-tree.js"), "utf8");
+const root = join(fileURLToPath(new URL(".", import.meta.url)), "..");
+const source = await readFile(join(root, "lib/index.js"), "utf8");
+const clientSource = await readFile(join(root, "lib/app-server.js"), "utf8");
+
+assert.match(source, /name:\s*"codex_dispatch"/u);
+assert.match(source, /name:\s*"codex_status"/u);
+assert.match(source, /name:\s*"codex_append"/u);
 assert.match(source, /task_id:\s*\{\s*type:\s*"string",\s*required:\s*true/u);
 assert.match(source, /asyncWork\.register\(\{[\s\S]*?taskId:\s*args\.task_id/u);
-assert.match(source, /detached:\s*process\.platform\s*!==\s*"win32"/u);
-assert.doesNotMatch(source, /child\.unref\(\)/u);
-assert.match(source, /service\.cancel\(metadata\.ownerId, workId, metadata\.taskId\)/u);
-assert.match(source, /async-work\/settled/u);
-assert.match(processTreeSource, /taskkill\.exe/u);
-assert.match(processTreeSource, /process\.kill\(-rootPid/u);
-assert.match(source, /ASYNC_WORK_UNAVAILABLE/u);
+// codex_append 与 codex_dispatch 共用 turn/start（有活跃轮次则并入该轮次、否则开新一轮），
+// 因此不再需要 turn/steer —— 断言它彻底退场，而不是断言某个方法被调用。
+assert.doesNotMatch(source, /turn\/steer/u);
+assert.doesNotMatch(source, /args\.workId/u);
+assert.doesNotMatch(source, /CodexWorkRegistry|toLegacyCodexWork|legacyStatus|epochFromIso|cleanupLegacyDetachedCodex|legacyPidsFrom|listActiveWorks|reapStale|getWork|processTracker|markUnavailable|markAvailable/u);
+assert.doesNotMatch(clientSource, /jsonrpc/u);
+assert.match(clientSource, /initialize/u);
+assert.match(clientSource, /healthz/u);
+assert.match(clientSource, /taskkill\.exe/u);
 
-// The repository intentionally does not vendor DSH peer dependencies. When
-// this smoke runs in the installed profile, exercise the adapter facade with a
-// real generic registry; in the source-only checkout, retain the static safety
-// assertions above and report the missing optional host runtime explicitly.
-let adapter;
-try {
-  adapter = await import("../lib/index.js");
-} catch (error) {
-  if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-}
-
-if (adapter) {
-  const { AsyncWorkRegistry } = await import("../../async-work/lib/registry.js");
-  const generic = new AsyncWorkRegistry({ idFactory: (() => { let n = 0; return () => `codex-${++n}`; })() });
-  const facade = new adapter.CodexWorkRegistry({ asyncWork: generic, maxConcurrent: 2 });
-  const work = facade.register("agent-1", {
-    taskId: "task-A",
-    task: "run smoke",
-    model: "smoke-model",
-    timeoutMs: 1000,
-  });
-  assert.equal(work.task_id, "task-A");
-  assert.equal(facade.listActive("agent-1").length, 1);
-  assert.equal(facade.listActive("agent-1", "task-B").length, 0, "task_id must isolate facade queries");
-  assert.equal(facade.markEnded("agent-1", work.work_id, "completed", 0, "task-A").status, "completed");
-  assert.throws(
-    () => new adapter.CodexWorkRegistry().listActive("agent-1"),
-    (error) => error.code === "ASYNC_WORK_UNAVAILABLE"
-  );
-  assert.deepEqual(adapter.cleanupLegacyDetachedCodex([]).ok, true);
-  console.log("codex-dispatch smoke: PASS (task_id adapter binding, isolation, terminal delegation, fail-closed, controlled child assertions)");
-} else {
-  console.log("codex-dispatch smoke: PASS (source-only safety assertions; DSH peer runtime not installed)");
-}
+console.log("codex-dispatch smoke: PASS (three tools, snake_case work_id only, manager model source, unified turn/start append with no turn/steer, no legacy/process-tree/jsonrpc)");

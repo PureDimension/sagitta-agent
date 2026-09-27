@@ -8,7 +8,7 @@
     participates in autonomous task qualification.
 
   statePath is runtime state, not repository content. New installs keep it in
-  the profile directory so updater git pulls cannot collide with it; this
+  the profile directory so source synchronization cannot collide with it; this
   follows the existing auto-advance contract that an explicit statePath wins.
 #>
 [CmdletBinding()]
@@ -267,7 +267,6 @@ $plugins = [ordered]@{
     '@sagitta/manager'       = 'plugins\manager'
     '@sagitta/memory'        = 'plugins\memory'
     '@sagitta/auto-advance'  = 'plugins\auto-advance'
-    '@sagitta/updater'       = 'plugins\updater'
     '@sagitta/async-work'    = 'plugins\async-work'
     '@sagitta/codex-dispatch' = 'plugins\codex-dispatch'
 }
@@ -275,14 +274,13 @@ $bundleNames = @(
     '@sagitta/manager'
     '@sagitta/memory'
     '@sagitta/auto-advance'
-    '@sagitta/updater'
     '@sagitta/async-work'
     '@sagitta/codex-dispatch'
 )
 
 Write-Host "[install-profile-deps] profile: $ProfilePath"
 Write-Host "[install-profile-deps] repository: $RepoPath"
-Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/updater, @sagitta/async-work, @sagitta/codex-dispatch'
+Write-Host '[install-profile-deps] bundles: @sagitta/manager, @sagitta/memory, @sagitta/auto-advance, @sagitta/async-work, @sagitta/codex-dispatch'
 
 if (-not $DryRun) {
     foreach ($relativePluginPath in $plugins.Values) {
@@ -378,73 +376,11 @@ $effectiveTasksPath = if (-not [string]::IsNullOrWhiteSpace($TasksPath)) {
     'D:\workspace\sagitta-experience\TASKS.md'
 }
 
-# statePath：现值优先（幂等，不改变已有运行语义）；新装才放 profile 内（防 updater pull 冲突）。
+# statePath：现值优先（幂等，不改变已有运行语义）；新装才放 profile 内（防源码同步冲突）。
 $existingStatePath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-auto-advance' -Key 'statePath'
 $statePath = if (-not [string]::IsNullOrWhiteSpace($existingStatePath)) { $existingStatePath } else { Join-Path $ProfilePath '.sagitta-auto-advance.json' }
 $statePathYaml = Quote-Yaml $statePath
 $tasksPathYaml = Quote-Yaml $effectiveTasksPath
-$dshHomeFromProfile = Split-Path -Parent (Split-Path -Parent $ProfilePath)
-
-# updater：本机路径和 profile 级显式覆盖现值优先；新 profile 才使用下面与
-# plugins/updater/lib/config.js 对齐的默认值。否则重新安装会把用户在 profile
-# patch 中选定的 checkout、preset 目标、分支、重启策略或 Worker 开关写回旧值。
-$existingUpdaterRepoPath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'repoPath'
-$existingUpdaterLegacyPath = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'path'
-$updaterRepoPath = if (-not [string]::IsNullOrWhiteSpace($existingUpdaterRepoPath)) {
-    $existingUpdaterRepoPath
-} elseif (-not [string]::IsNullOrWhiteSpace($existingUpdaterLegacyPath)) {
-    $existingUpdaterLegacyPath
-} else {
-    $RepoPath
-}
-$updaterLegacyPath = if (-not [string]::IsNullOrWhiteSpace($existingUpdaterLegacyPath)) { $existingUpdaterLegacyPath } else { $updaterRepoPath }
-$updaterRepoPathYaml = Quote-Yaml $updaterRepoPath
-$updaterLegacyPathYaml = Quote-Yaml $updaterLegacyPath
-
-# branch/restartPolicy/workerDeploy 是行为参数，但 updater bundle 明确允许
-# profile patch 覆盖它们；保留合法现值，缺失时回到插件代码默认。
-$existingUpdaterBranch = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'branch'
-$updaterBranch = if (-not [string]::IsNullOrWhiteSpace($existingUpdaterBranch)) { $existingUpdaterBranch } else { 'main' }
-# Keep ordinary branch names in the existing patch's readable plain form;
-# quote only names that need YAML protection.
-$updaterBranchYaml = if ($updaterBranch -match '^[A-Za-z0-9._/-]+$') { $updaterBranch } else { Quote-Yaml $updaterBranch }
-
-$existingUpdaterPresetTarget = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'presetTarget'
-$updaterPresetTarget = if (-not [string]::IsNullOrWhiteSpace($existingUpdaterPresetTarget)) {
-    $existingUpdaterPresetTarget
-} else {
-    Join-Path $dshHomeFromProfile '.agent-presets\sagitta'
-}
-$updaterPresetTargetYaml = Quote-Yaml $updaterPresetTarget
-
-$existingUpdaterProfileName = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'profileName'
-$updaterProfileName = if (-not [string]::IsNullOrWhiteSpace($existingUpdaterProfileName)) { $existingUpdaterProfileName } else { 'web' }
-$updaterProfileNameYaml = Quote-Yaml $updaterProfileName
-
-$existingUpdaterProfileDir = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'profileDir'
-$updaterProfileDir = if (-not [string]::IsNullOrWhiteSpace($existingUpdaterProfileDir)) {
-    $existingUpdaterProfileDir
-} else {
-    Join-Path $ProfilePath ''
-}
-$updaterProfileDirYaml = Quote-Yaml $updaterProfileDir
-
-$existingUpdaterRestartPolicy = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'restartPolicy'
-$updaterRestartPolicy = if ($existingUpdaterRestartPolicy -ieq 'auto-if-verified') {
-    'auto-if-verified'
-} else {
-    'prompt'
-}
-$updaterRestartPolicyYaml = Quote-Yaml $updaterRestartPolicy
-
-$existingUpdaterWorkerDeploy = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'workerDeploy'
-$existingUpdaterWorkerUpdate = Get-PatchConfigValue -Text $existingPatch -PatchId 'sagitta-updater' -Key 'workerUpdate'
-$updaterWorkerDeploy = if ($existingUpdaterWorkerDeploy -ieq 'false' -or $existingUpdaterWorkerUpdate -ieq 'false') {
-    'false'
-} else {
-    'true'
-}
-
 # memory.proxy：现值优先（幂等）；缺失时默认本机 clash 混合端口 7897——
 # 本机 Node 直连 workers.dev 被墙，必须走代理，空串会解析成 direct 导致 20s 超时（08-30 实证）。
 $existingMemoryProxy = Get-PatchConfigValue -Text $existingPatch -PatchId 'memory' -Key 'proxy'
@@ -481,19 +417,6 @@ $patchEntries = [ordered]@{
         '    idleTimeoutMs: 15000   # 15s 快速注入（09-07 涟漪拍板；与 service.js DEFAULT_IDLE_TIMEOUT_MS 一致）'
         "    statePath: $statePathYaml"
         "    tasksPath: $tasksPathYaml"
-    )
-    'sagitta-updater' = @(
-        '- id: sagitta-updater'
-        '  config:'
-        "    repoPath: $updaterRepoPathYaml"
-        "    path: $updaterLegacyPathYaml"
-        "    branch: $updaterBranchYaml"
-        "    presetId: 'sagitta'"
-        "    presetTarget: $updaterPresetTargetYaml"
-        "    profileName: $updaterProfileNameYaml"
-        "    profileDir: $updaterProfileDirYaml"
-        "    restartPolicy: $updaterRestartPolicyYaml"
-        "    workerDeploy: $updaterWorkerDeploy"
     )
     'sagitta-async-work' = @(
         '- id: sagitta-async-work'

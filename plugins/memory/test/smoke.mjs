@@ -1,17 +1,8 @@
 // ============================================================================
 // sagitta-memory — 验收冒烟脚本（test/smoke.mjs）— v1.3
 // ============================================================================
-// 用途：不依赖 DSH 运行环境，用真实 lib/client.js 客户端走全链路，逐条断言。
-// 目标选择（环境变量 DSH_MEMORY_SMOKE_TARGET）：
-//   local（缺省）→ 本地冒烟：node:sqlite 内存库按 schema.sql 建表，构造 D1 兼容
-//                 桩绑定，以**真实 worker.js** 的 fetch 处理器（ES Module default
-//                 export）跑全部端点，经本机 http 桥 + 真实插件客户端走完整链路。
-//                 —— 与线上同一份代码、同一套断言；离线可复现（v1.2 时代也走
-//                 本地桩复刻逻辑的先例，v1.3 直接把桩换成真 worker + D1 适配器，
-//                 不再复刻逻辑）。
-//   online       → 真实线上链路（需已部署 v1.3；线上若仍是 v1.2，v1.3 新断言会
-//                 失败——先由涟漪在 Dashboard 重新粘贴部署，再以
-//                 DSH_MEMORY_SMOKE_TARGET=online 重跑真链路冒烟）。
+// 用途：不依赖 DSH 运行环境，用真实 lib/client.js 客户端经 mock manager
+// 访问本地真实 worker.js，逐条断言；不访问真实线上网络。
 // 覆盖断言（v1.3 机制逐条）：
 //   A. health 200 + env.db/auth_token 全 true
 //   B. 创建 sagitta（缺省 origin）→ captured / score=0 / ack=0（无虚构认可）
@@ -35,8 +26,7 @@
 //   R. supersedes 链：被取代条目标记 superseded 且默认不可召回，显式 status 可查
 //   S. 错误令牌负例 → 可读中文错误（401/302 归一化，v1.2 保留）
 // 安全：全程只打印掩码态（是否配置 + 前2后2），绝不输出明文凭据。
-// 副作用：local 模式为纯内存库无副作用；online 模式会写入几条
-//   tags=[plugin-acceptance] 的冒烟条目（可归档清理）。
+// 副作用：纯内存库无副作用；本地 mock manager 只连接本地 http 桥。
 // ============================================================================
 
 import { readFileSync } from "node:fs";
@@ -44,10 +34,9 @@ import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig, maskTokenSummary } from "../lib/config.js";
 import { SagittaMemoryClient, MemoryApiError } from "../lib/client.js";
+import { createMockManager } from "./mock-manager.mjs";
 
-const TARGET = process.env.DSH_MEMORY_SMOKE_TARGET === "online" ? "online" : "local";
 const WORKER_DIR = fileURLToPath(new URL("../../../worker", import.meta.url));
 const LOCAL_TOKEN = "smoke-local-token-2026"; // 仅本地桩使用的测试令牌，非真实凭据
 
@@ -138,49 +127,28 @@ async function startBridge(workerModule, d1) {
 
 let client;
 let targetNote = "";
-if (TARGET === "local") {
-  // 真实 worker.js（含 export default { fetch }，ES Module；无 import，可安全经 data: URL 载入）
-  const workerCode = readFileSync(path.join(WORKER_DIR, "worker.js"), "utf8");
-  const workerModule = await import("data:text/javascript;base64," + Buffer.from(workerCode).toString("base64"));
-  const database = new DatabaseSync(":memory:");
-  database.exec(readFileSync(path.join(WORKER_DIR, "schema.sql"), "utf8"));
+// 真实 worker.js（含 export default { fetch }，ES Module；无 import，可安全经 data: URL 载入）
+const workerCode = readFileSync(path.join(WORKER_DIR, "worker.js"), "utf8");
+const workerModule = await import("data:text/javascript;base64," + Buffer.from(workerCode).toString("base64"));
+const database = new DatabaseSync(":memory:");
+database.exec(readFileSync(path.join(WORKER_DIR, "schema.sql"), "utf8"));
 
-  const server = await startBridge(workerModule, makeD1(database));
-  globalThis.__SMOKE_SERVER__ = server; // 末尾统一关闭
-  const port = server.address().port;
-  client = new SagittaMemoryClient({
-    baseUrl: `http://127.0.0.1:${port}`,
-    proxy: "direct",
-    envPath: "unused",
-    timeoutMs: 10000,
-    auth: {
-      accessClientId: "",
-      accessClientSecret: "",
-      authToken: LOCAL_TOKEN,
-      accessPresent: false,
-      bearerPresent: true,
-    },
-  });
-  targetNote = `local 桩（真实 worker.js + node:sqlite D1 适配器，http://127.0.0.1:${port}，schema.sql 建表）`;
-  globalThis.__SMOKE_DATABASE__ = database; // local 模式审计断言直接查事件表用；online 模式不提供
-} else {
-  const config = resolveConfig({});
-  const auth = config.auth;
-  console.log("凭据状态（仅掩码）：");
-  console.log(`  Access ID: ${auth.accessPresent ? maskTokenSummary(auth.accessClientId) : "未配置"}`);
-  console.log(`  Access Secret: ${auth.accessPresent ? maskTokenSummary(auth.accessClientSecret) : "未配置"}`);
-  console.log(`  AUTH_TOKEN: ${auth.bearerPresent ? maskTokenSummary(auth.authToken) : "未配置（不发送 Bearer，依赖 Access 服务令牌）"}`);
-  console.log(`  代理: ${config.proxy}  超时: ${config.timeoutMs}ms`);
-  client = new SagittaMemoryClient(config);
-  targetNote = `线上链路（${config.baseUrl}）`;
-}
+const server = await startBridge(workerModule, makeD1(database));
+globalThis.__SMOKE_SERVER__ = server; // 末尾统一关闭
+const port = server.address().port;
+const workerUrl = `http://127.0.0.1:${port}`;
+client = new SagittaMemoryClient(createMockManager(workerUrl, {
+  headers: { authorization: `Bearer ${LOCAL_TOKEN}` },
+}));
+targetNote = `local worker 桩（memory 仅经 mock manager.request，http://127.0.0.1:${port}，schema.sql 建表）`;
+globalThis.__SMOKE_DATABASE__ = database; // 审计断言直接查事件表
 console.log(`冒烟目标：${targetNote}\n`);
 
 // ---- 通用断言工具 -------------------------------------------------------------
 
 const dbRows = (sql, ...params) => {
   const database = globalThis.__SMOKE_DATABASE__;
-  if (!database) return null; // online 模式无审计表访问
+  if (!database) return null;
   return database.prepare(sql).all(...params);
 };
 
@@ -202,7 +170,7 @@ async function expectError(promise, kind) {
   check("A2 health.env.db=true（D1 binding 已注入）", h.env && h.env.db === true, JSON.stringify(h.env));
   check("A3 health.env.auth_token=true（Secret 已注入）", h.env && h.env.auth_token === true, JSON.stringify(h.env));
   const version = h.version || "?";
-  console.log(`  （服务端版本 ${version}${TARGET === "online" && version !== "1.3.0" ? " —— ⚠ 线上仍是 v1.2，以下 v1.3 新断言预期失败；需涟漪 Dashboard 重新粘贴部署 v1.3 后以 online 重跑" : ""}）`);
+  console.log(`  （服务端版本 ${version}）`);
 }
 
 // B. 创建 sagitta（缺省 origin）→ captured / score=0
@@ -366,7 +334,7 @@ let opposeId = null;
   check("O5 事件 explanation 随召回返回（可作解释性 few-shot）", ev && ev.explanation === explanation, ev && ev.explanation);
   check("O6 事件 blind_spot 随召回返回", ev && ev.blind_spot === blindSpot, ev && ev.blind_spot);
   check("O7 linked_delegation_id 关联验证结果", ev && ev.linked_delegation_id === "dlg-smoke-v13", ev && ev.linked_delegation_id);
-  // local 模式：直接查事件表核对落库（online 无表访问，跳过）
+  // 直接查事件表核对落库。
   if (globalThis.__SMOKE_DATABASE__) {
     const rows = dbRows("SELECT event_type, explanation, blind_spot, entry_id FROM validation_events WHERE entry_id = ?", rippleId);
     const validatedRow = (rows || []).find((r2) => r2.event_type === "validated");
@@ -459,37 +427,19 @@ let opposeId = null;
 // S. 错误令牌负例 → 可读中文错误（401/302 归一化，v1.2 保留）
 {
   let bad;
-  if (TARGET === "local") {
-    bad = new SagittaMemoryClient({
-      baseUrl: client.baseUrl,
-      proxy: "direct",
-      envPath: "unused",
-      timeoutMs: 10000,
-      auth: { accessClientId: "", accessClientSecret: "", authToken: "wrong-token-for-smoke", accessPresent: false, bearerPresent: true },
-    });
-  } else {
-    bad = new SagittaMemoryClient(resolveConfig({
-      accessClientId: "bogus-smoke-id",
-      accessClientSecret: "bogus-smoke-secret",
-      authToken: "",
-    }));
-  }
+  bad = new SagittaMemoryClient(createMockManager(workerUrl, {
+    headers: { authorization: "Bearer wrong-token-for-smoke" },
+  }));
   const { error } = await expectError(bad.listEntries("sagitta"), "bad-token");
   const readable = /Access|认证|拦截|令牌|401|302|403/.test(error ? error.message : "");
   check("S1 错误令牌 → 可读中文错误", readable, error ? error.message.slice(0, 160) : "意外成功");
 }
 
 console.log("");
-if (TARGET === "local") {
-  console.log("（local 桩为纯内存库，无线上副作用；审计断言已直接查 validation_events 表核对）");
-} else {
-  const createdIds = [baseId, rippleId, opposeId].filter(Boolean);
-  console.log(`冒烟条目 id：${createdIds.join(", ")}（tags=[plugin-acceptance]，可归档）`);
-  console.log("⚠ 线上为 v1.2 时，v1.3 新断言会失败属预期——请涟漪在 Dashboard 重新粘贴部署 v1.3 后重跑真链路冒烟。");
-}
+console.log("（纯内存 worker 桩，无线上副作用；审计断言已直接查 validation_events 表核对）");
 
-// local 模式下关闭桥服务（释放端口；纯内存库无需清理）
-if (TARGET === "local" && globalThis.__SMOKE_SERVER__) {
+// 关闭桥服务（释放端口；纯内存库无需清理）
+if (globalThis.__SMOKE_SERVER__) {
   globalThis.__SMOKE_SERVER__.close();
 }
 

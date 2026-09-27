@@ -275,3 +275,10 @@
   config:
     fetch: false
     searchTimeoutMs: 60000
+
+# ── sagitta 插件：只有使用本 preset 的会话能看到这些工具 ──────────
+- id: memory
+  name: '@sagitta/memory'
+
+- id: sagitta-codex
+  name: '@sagitta/codex-dispatch'

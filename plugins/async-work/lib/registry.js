@@ -3,10 +3,8 @@ import { randomUUID } from "node:crypto";
 const MIN_TIMEOUT_MS = 1000;
 const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-const DEFAULT_RECENT_LIMIT = 20;
-const DEFAULT_RECENT_TTL_MS = 6 * 60 * 60 * 1000;
-const MAX_RECENT_LIMIT = 1000;
-const MAX_RECENT_TTL_MS = 31 * 24 * 60 * 60 * 1000;
+const RECENT_LIMIT = 20;
+const RECENT_TTL_MS = 6 * 60 * 60 * 1000;
 
 const WORK_STATUSES = Object.freeze([
   "running",
@@ -17,31 +15,24 @@ const WORK_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(WORK_STATUSES.filter((status) => status !== "running"));
 
-/**
- * Errors from the in-memory registry carry HTTP-like status information so
- * model tools and adapters can present a stable, fail-loud contract without
- * coupling the registry to a transport implementation.
- */
 class AsyncWorkError extends Error {
-  constructor(status, code, message) {
+  constructor(code, message) {
     super(message);
     this.name = "AsyncWorkError";
-    this.status = status;
     this.code = code;
   }
 }
 
-function requiredString(value, field) {
+function requireString(value, field) {
   if (typeof value !== "string" || value.trim().length === 0) {
-    throw new AsyncWorkError(422, "INVALID_ASYNC_WORK_FIELD", `${field} 必须是非空字符串`);
+    throw new AsyncWorkError("INVALID_ASYNC_WORK_FIELD", `${field} 必须是非空字符串`);
   }
   return value.trim();
 }
 
-function validateTimeout(value, field = "timeoutMs") {
+function requireTimeout(value, field = "timeoutMs") {
   if (!Number.isInteger(value) || value < MIN_TIMEOUT_MS || value > MAX_TIMEOUT_MS) {
     throw new AsyncWorkError(
-      422,
       "INVALID_ASYNC_WORK_TIMEOUT",
       `${field} 必须是 ${MIN_TIMEOUT_MS} 至 ${MAX_TIMEOUT_MS} 毫秒的整数`
     );
@@ -49,49 +40,26 @@ function validateTimeout(value, field = "timeoutMs") {
   return value;
 }
 
-function normalizeDefaultTimeout(value) {
-  if (value === undefined) return DEFAULT_TIMEOUT_MS;
-  return validateTimeout(value, "defaultTimeoutMs");
-}
-
-function validateRecentLimit(value, field = "recentLimit") {
-  if (!Number.isInteger(value) || value < 0 || value > MAX_RECENT_LIMIT) {
-    throw new AsyncWorkError(
-      422,
-      "INVALID_ASYNC_WORK_RECENT_LIMIT",
-      `${field} 必须是 0 至 ${MAX_RECENT_LIMIT} 的整数`
-    );
-  }
-  return value;
-}
-
-function normalizeRecentLimit(value) {
-  if (value === undefined) return DEFAULT_RECENT_LIMIT;
-  return validateRecentLimit(value);
-}
-
-function validateRecentTtlMs(value, field = "recentTtlMs") {
-  if (!Number.isInteger(value) || value <= 0 || value > MAX_RECENT_TTL_MS) {
-    throw new AsyncWorkError(
-      422,
-      "INVALID_ASYNC_WORK_RECENT_TTL",
-      `${field} 必须是 1 至 ${MAX_RECENT_TTL_MS} 毫秒的整数`
-    );
-  }
-  return value;
-}
-
-function normalizeRecentTtlMs(value) {
-  if (value === undefined) return DEFAULT_RECENT_TTL_MS;
-  return validateRecentTtlMs(value);
-}
-
 function isoTime(epochMs) {
   return new Date(epochMs).toISOString();
 }
 
-function cloneWork(work) {
-  return { ...work };
+/**
+ * 对外传递的是快照，不是副本；这个函数明确定义模块对外暴露的字段集合。
+ */
+function snapshot(work) {
+  return {
+    work_id: work.work_id,
+    task_id: work.task_id,
+    owner_id: work.owner_id,
+    kind: work.kind,
+    desc: work.desc,
+    started_at: work.started_at,
+    timeout_ms: work.timeout_ms,
+    status: work.status,
+    ended_at: work.ended_at,
+    reason: work.reason,
+  };
 }
 
 function settledPayload(work) {
@@ -99,6 +67,7 @@ function settledPayload(work) {
     ownerId: work.owner_id,
     workId: work.work_id,
     taskId: work.task_id,
+    kind: work.kind,
     status: work.status,
     reason: work.reason,
   };
@@ -114,33 +83,26 @@ function settledPayload(work) {
 class AsyncWorkRegistry {
   constructor({
     defaultTimeoutMs,
-    recentLimit,
-    recentTtlMs,
     clock = () => Date.now(),
-    idFactory = () => randomUUID()
+    idFactory = () => randomUUID(),
+    onListenerError = console.error,
   } = {}) {
-    this.defaultTimeoutMs = normalizeDefaultTimeout(defaultTimeoutMs);
-    this.recentLimit = normalizeRecentLimit(recentLimit);
-    this.recentTtlMs = normalizeRecentTtlMs(recentTtlMs);
+    this.defaultTimeoutMs = defaultTimeoutMs === undefined
+      ? DEFAULT_TIMEOUT_MS
+      : requireTimeout(defaultTimeoutMs, "defaultTimeoutMs");
     this.clock = clock;
     this.idFactory = idFactory;
+    this.onListenerError = onListenerError;
     this.byOwner = new Map();
     // Terminal records are retained separately from byOwner so a bounded
     // history survives the normal owner-map cleanup and plugin-dispose
     // settlement. Each entry carries its timestamp privately for TTL pruning.
     this.recentByOwner = new Map();
     this.settledListeners = new Set();
-    this.closed = false;
-  }
-
-  _ensureOpen() {
-    if (this.closed) {
-      throw new AsyncWorkError(410, "ASYNC_WORK_REGISTRY_CLOSED", "async-work 注册表已关闭（进程生命周期已结束）");
-    }
   }
 
   _owner(ownerId) {
-    const normalized = requiredString(ownerId, "ownerId");
+    const normalized = requireString(ownerId, "ownerId");
     let works = this.byOwner.get(normalized);
     if (works === undefined) {
       works = new Map();
@@ -150,8 +112,8 @@ class AsyncWorkRegistry {
   }
 
   _existing(ownerId, workId) {
-    const normalizedOwner = requiredString(ownerId, "ownerId");
-    const normalizedWork = requiredString(workId, "workId");
+    const normalizedOwner = requireString(ownerId, "ownerId");
+    const normalizedWork = requireString(workId, "workId");
     return {
       ownerId: normalizedOwner,
       workId: normalizedWork,
@@ -161,10 +123,9 @@ class AsyncWorkRegistry {
 
   _assertTask(work, taskId) {
     if (taskId === undefined) return;
-    const normalizedTask = requiredString(taskId, "taskId");
+    const normalizedTask = requireString(taskId, "taskId");
     if (work.task_id !== normalizedTask) {
       throw new AsyncWorkError(
-        409,
         "ASYNC_WORK_TASK_MISMATCH",
         `工作 ${work.work_id} 绑定的是 task_id=${work.task_id}，不是 task_id=${normalizedTask}`
       );
@@ -172,29 +133,24 @@ class AsyncWorkRegistry {
   }
 
   _isExpired(work, now = this.clock()) {
-    return work.status === "running" && now - work._startedAtMs >= work.timeout_ms;
+    return work.status === "running" && now - work.startedAtMs >= work.timeout_ms;
   }
 
   _pruneRecent(ownerId, now = this.clock()) {
     const records = this.recentByOwner.get(ownerId);
     if (records === undefined) return [];
-    if (this.recentLimit === 0) {
-      this.recentByOwner.delete(ownerId);
-      return [];
-    }
     const retained = records
-      .filter((record) => now < record.endedAtMs + this.recentTtlMs)
-      .slice(0, this.recentLimit);
+      .filter((record) => now < record.endedAtMs + RECENT_TTL_MS)
+      .slice(0, RECENT_LIMIT);
     if (retained.length === 0) this.recentByOwner.delete(ownerId);
     else this.recentByOwner.set(ownerId, retained);
     return retained;
   }
 
   _rememberRecent(work, endedAtMs = this.clock()) {
-    if (this.recentLimit === 0) return;
     const ownerId = work.owner_id;
     const records = this.recentByOwner.get(ownerId) ?? [];
-    const record = { work: cloneWork(work), endedAtMs };
+    const record = { work: snapshot(work), endedAtMs };
     records.unshift(record);
     this.recentByOwner.set(ownerId, records);
     this._pruneRecent(ownerId, record.endedAtMs);
@@ -210,10 +166,10 @@ class AsyncWorkRegistry {
       try {
         const result = listener({ ...payload });
         if (result !== undefined && result !== null && typeof result.then === "function") {
-          Promise.resolve(result).catch(() => {});
+          Promise.resolve(result).catch((error) => this.onListenerError(error, listener));
         }
-      } catch {
-        // Settlement is already committed; a listener must not break it.
+      } catch (error) {
+        this.onListenerError(error, listener);
       }
     }
     return work;
@@ -222,30 +178,21 @@ class AsyncWorkRegistry {
   /** Register a listener for every transition into a terminal status. */
   onSettled(listener) {
     if (typeof listener !== "function") throw new TypeError("onSettled listener 必须是函数");
-    this._ensureOpen();
     this.settledListeners.add(listener);
     return () => this.settledListeners.delete(listener);
   }
 
   register({ ownerId, taskId, kind = "generic", desc = "", timeoutMs } = {}) {
-    this._ensureOpen();
-    const owner = requiredString(ownerId, "ownerId");
-    const task = requiredString(taskId, "taskId");
-    const normalizedKind = requiredString(kind, "kind");
+    const owner = requireString(ownerId, "ownerId");
+    const task = requireString(taskId, "taskId");
+    const normalizedKind = requireString(kind, "kind");
     if (typeof desc !== "string") {
-      throw new AsyncWorkError(422, "INVALID_ASYNC_WORK_FIELD", "desc 必须是字符串");
+      throw new AsyncWorkError("INVALID_ASYNC_WORK_FIELD", "desc 必须是字符串");
     }
-    const timeout = validateTimeout(timeoutMs === undefined ? this.defaultTimeoutMs : timeoutMs);
+    const timeout = requireTimeout(timeoutMs === undefined ? this.defaultTimeoutMs : timeoutMs);
     const startedAt = this.clock();
     const works = this._owner(owner).works;
-    let workId = String(this.idFactory());
-    let attempts = 0;
-    while (works.has(workId)) {
-      if (++attempts >= 100) {
-        throw new AsyncWorkError(500, "ASYNC_WORK_ID_COLLISION", "无法生成唯一 work_id");
-      }
-      workId = String(this.idFactory());
-    }
+    const workId = String(this.idFactory());
     const work = {
       work_id: workId,
       task_id: task,
@@ -257,16 +204,14 @@ class AsyncWorkRegistry {
       status: "running",
       ended_at: null,
       reason: null,
+      startedAtMs: startedAt,
     };
-    // Keep clock data private to the registry; it is never returned to callers.
-    Object.defineProperty(work, "_startedAtMs", { value: startedAt, writable: true, enumerable: false });
     works.set(workId, work);
-    return cloneWork(work);
+    return snapshot(work);
   }
 
   /** Mark timed-out work expired. Returns the number of records transitioned. */
   reap(ownerId) {
-    if (this.closed) return 0;
     const { works } = this._owner(ownerId);
     const now = this.clock();
     let count = 0;
@@ -281,73 +226,78 @@ class AsyncWorkRegistry {
 
   /** Return only non-expired running work, optionally isolated by task_id. */
   listActive(ownerId, { taskId, task_id: taskIdSnake } = {}) {
-    this._ensureOpen();
     const rawFilterTask = taskId ?? taskIdSnake;
-    const filterTask = rawFilterTask === undefined ? undefined : requiredString(rawFilterTask, "taskId");
+    const filterTask = rawFilterTask === undefined ? undefined : requireString(rawFilterTask, "taskId");
     this.reap(ownerId);
     const { works } = this._owner(ownerId);
-    const active = () => [...works.values()]
+    return [...works.values()]
       .filter((work) => work.status === "running")
       .filter((work) => filterTask === undefined || work.task_id === filterTask)
-      .map(cloneWork);
-    // A clock boundary may be crossed while the list is being built. Reap once
-    // more so the returned contract is never stale-running.
-    this.reap(ownerId);
-    return active();
+      .map(snapshot);
   }
 
   get(ownerId, workId) {
-    this._ensureOpen();
     this.reap(ownerId);
     const work = this._existing(ownerId, workId).work;
-    return work === null ? null : cloneWork(work);
+    return work === null ? null : snapshot(work);
   }
 
-  /** Return newest terminal records for one owner, bounded by count and TTL. */
-  listRecent(ownerId, { limit } = {}) {
-    const normalizedOwner = requiredString(ownerId, "ownerId");
-    const normalizedLimit = limit === undefined ? this.recentLimit : validateRecentLimit(limit, "limit");
+  /** Return newest terminal records for one owner, bounded by the fixed count and TTL. */
+  listRecent(ownerId) {
+    const normalizedOwner = requireString(ownerId, "ownerId");
     const records = this._pruneRecent(normalizedOwner);
-    return records.slice(0, normalizedLimit).map((record) => cloneWork(record.work));
+    return records.map((record) => snapshot(record.work));
   }
 
   _transition(ownerId, workId, status, reason, taskId) {
-    this._ensureOpen();
     this.reap(ownerId);
     const found = this._existing(ownerId, workId);
     if (found.work === null) {
-      throw new AsyncWorkError(404, "ASYNC_WORK_NOT_FOUND", `找不到工作 ${found.workId}`);
+      throw new AsyncWorkError("ASYNC_WORK_NOT_FOUND", `找不到工作 ${found.workId}`);
     }
     this._assertTask(found.work, taskId);
     if (found.work.status !== "running") {
       throw new AsyncWorkError(
-        409,
         "ASYNC_WORK_TERMINAL",
         `工作 ${found.work.work_id} 已处于终态 ${found.work.status}，不能再次变更`
       );
     }
-    return cloneWork(this._end(found.work, status, reason));
+    return snapshot(this._end(found.work, status, reason));
+  }
+
+  settle(ownerId, workId, taskId, action, reason) {
+    const statuses = { complete: "completed", fail: "failed", cancel: "cancelled" };
+    const status = statuses[action];
+    if (status === undefined) {
+      throw new AsyncWorkError("INVALID_ASYNC_WORK_ACTION", "action 必须是 complete、fail 或 cancel");
+    }
+    if (action !== "fail" && reason !== undefined && reason !== null) {
+      throw new AsyncWorkError("INVALID_ASYNC_WORK_REASON", "只有 fail action 可以传 reason");
+    }
+    let normalizedReason = null;
+    if (action === "fail") {
+      if (reason !== undefined && reason !== null && typeof reason !== "string") {
+        throw new AsyncWorkError("INVALID_ASYNC_WORK_REASON", "reason 必须是字符串");
+      }
+      normalizedReason = typeof reason === "string" && reason.trim().length > 0 ? reason.trim() : null;
+    }
+    return this._transition(ownerId, workId, status, normalizedReason, taskId);
   }
 
   complete(ownerId, workId, taskId) {
-    return this._transition(ownerId, workId, "completed", null, taskId);
+    return this.settle(ownerId, workId, taskId, "complete");
   }
 
   fail(ownerId, workId, reason, taskId) {
-    if (reason !== undefined && reason !== null && typeof reason !== "string") {
-      throw new AsyncWorkError(422, "INVALID_ASYNC_WORK_REASON", "reason 必须是字符串");
-    }
-    const normalizedReason = typeof reason === "string" && reason.trim().length > 0 ? reason.trim() : null;
-    return this._transition(ownerId, workId, "failed", normalizedReason, taskId);
+    return this.settle(ownerId, workId, taskId, "fail", reason);
   }
 
   cancel(ownerId, workId, taskId) {
-    return this._transition(ownerId, workId, "cancelled", null, taskId);
+    return this.settle(ownerId, workId, taskId, "cancel");
   }
 
   /** Cancel running records and forget every record for process-scoped dispose. */
   dispose() {
-    if (this.closed) return 0;
     let cancelled = 0;
     const now = this.clock();
     for (const works of this.byOwner.values()) {
@@ -360,7 +310,6 @@ class AsyncWorkRegistry {
     }
     this.byOwner.clear();
     this.settledListeners.clear();
-    this.closed = true;
     return cancelled;
   }
 }
@@ -371,17 +320,9 @@ export {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
-  DEFAULT_RECENT_LIMIT,
-  DEFAULT_RECENT_TTL_MS,
-  MAX_RECENT_LIMIT,
-  MAX_RECENT_TTL_MS,
   TERMINAL_STATUSES,
   WORK_STATUSES,
-  cloneWork,
-  normalizeDefaultTimeout,
-  normalizeRecentLimit,
-  normalizeRecentTtlMs,
-  validateRecentLimit,
-  validateRecentTtlMs,
-  validateTimeout,
+  requireString,
+  requireTimeout,
+  snapshot,
 };

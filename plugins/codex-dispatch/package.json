@@ -2,7 +2,7 @@
   "name": "@sagitta/codex-dispatch",
   "version": "0.2.0",
   "type": "module",
-  "description": "Sagitta codex 派单适配器：受控 codex 子进程委托给通用 async-work 注册表",
+  "description": "Sagitta codex 派单适配器：常驻 codex app-server 会话委托给通用 async-work 注册表",
   "main": "lib/index.js",
   "exports": {
     ".": {
@@ -39,7 +39,7 @@
     }
   },
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/process-tree.js && node --check test/smoke.mjs && node --check test/process-tree.mjs",
-    "smoke": "node test/smoke.mjs && node test/process-tree.mjs"
+    "check": "node --check lib/index.js && node --check lib/app-server.js && node --check test/smoke.mjs && node --check test/app-server.mjs",
+    "smoke": "node test/smoke.mjs && node test/app-server.mjs"
   }
 }
