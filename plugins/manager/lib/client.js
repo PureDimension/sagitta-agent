@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
 
     const name = "sagitta-manager";
     const namespace = "sagitta-manager";
-    const inject = ["slots", "settingsScope"];
+    const inject = ["slots", "settingsScope", "connection", "remote"];
     const fields = [
       { key: "workerApiUrl", label: "Worker API 地址", hint: "Sagitta Worker 运行时 API 根地址。" },
       { key: "proxy", label: "HTTP 代理", hint: "留空表示直连；默认使用本机 7897 端口。" },
