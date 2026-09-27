@@ -23,7 +23,8 @@ function makeContext(config, values, profileDir) {
   };
   const credentials = {
     async resolve(ref) {
-      return values[ref];
+      const value = values[ref];
+      return value === undefined ? undefined : { value, source: "file" };
     }
   };
   const ctx = {
@@ -108,6 +109,9 @@ assert.deepEqual(await requestService.apiConfig(), {
   accessSecret: credentialValues.SMOKE_ACCESS_SECRET,
   uploadToken: credentialValues.SMOKE_UPLOAD_TOKEN
 });
+const emptyCredentialContext = makeContext({ ...requestConfig, accessIdRef: "EMPTY" }, { ...credentialValues, EMPTY: "" });
+await apply(emptyCredentialContext.ctx, requestConfig);
+await assert.rejects(() => emptyCredentialContext.getService().apiConfig(), /credential is empty: EMPTY/);
 console.log("apiConfig returns 9 fields and configurable credential refs: PASS");
 
 const failedDeployContext = makeContext({ ...requestConfig, repoPath: "missing-manager-smoke-repository" }, credentialValues);
