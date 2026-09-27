@@ -91,9 +91,6 @@ const ACK_SIGNALS = ['explicit', 'unobjected', 'oppose'];
 // 三态信号的分值（服务端唯一计分源；oppose 为强负信号）
 const SIGNAL_DELTAS = Object.freeze({ explicit: 2, unobjected: 1, oppose: -3 });
 
-// 设计 §4 v1.3 事件类型（validation_events.event_type）
-const EVENT_TYPES = ['validated', 'replaced', 'archived'];
-
 // 设计 §4 v1.2 遗留：validated 可机检证据四选一 —— v1.3 起 validated 改由事件承载
 // （涟漪拍板：validated 不再由 consolidate 门槛驱动；四选一门槛随之移除，由
 //   blind_spot + 可选 linked_delegation_id 承担审计语义）
@@ -129,18 +126,10 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function corsHeaders() {
-  return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type, CF-Access-Jwt-Assertion',
-  };
-}
-
 function jsonOk(data, status = 200) {
   return new Response(JSON.stringify({ ok: true, data, request_id: crypto.randomUUID() }), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
 }
 
@@ -151,7 +140,7 @@ function jsonError(status, code, message, details = {}) {
     request_id: crypto.randomUUID(),
   }), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
 }
 
@@ -175,15 +164,27 @@ async function readJson(request) {
   }
 }
 
-// JSON 数组字段读写（tags / supersedes / superseded_by 以 TEXT JSON 存储）
-function parseJsonArray(text) {
+// JSON 数组字段读写（tags / supersedes / superseded_by 以 TEXT JSON 存储）。
+// 读侧 fail-loud：存量字段损坏时抛出，由顶层转 500 —— 损坏不是空数组，
+// 静默当空会把真实的数据损坏伪装成"这条没有标签/没有被取代"。
+function parseJsonArray(text, field = 'json') {
   if (!text) return [];
+  let value;
   try {
-    const v = JSON.parse(text);
-    return Array.isArray(v) ? v : [];
+    value = JSON.parse(text);
   } catch (e) {
-    return [];
+    const err = new Error('数据库字段 ' + field + ' 不是合法 JSON：' + e.message);
+    err.httpStatus = 500;
+    err.code = 'CORRUPT_JSON_FIELD';
+    throw err;
   }
+  if (!Array.isArray(value)) {
+    const err = new Error('数据库字段 ' + field + ' 不是 JSON 数组');
+    err.httpStatus = 500;
+    err.code = 'CORRUPT_JSON_FIELD';
+    throw err;
+  }
+  return value;
 }
 
 function stringifyJsonArray(arr) {
@@ -243,9 +244,9 @@ function trustFields(score) {
 function serializeEntry(row) {
   if (!row) return null;
   return Object.assign({}, row, {
-    tags: parseJsonArray(row.tags),
-    supersedes: parseJsonArray(row.supersedes),
-    superseded_by: parseJsonArray(row.superseded_by),
+    tags: parseJsonArray(row.tags, 'tags'),
+    supersedes: parseJsonArray(row.supersedes, 'supersedes'),
+    superseded_by: parseJsonArray(row.superseded_by, 'superseded_by'),
     ...trustFields(row.score),
   });
 }
@@ -318,7 +319,7 @@ function healthHandler(env) {
     env: { db: !!env.DB, auth_token: !!env.AUTH_TOKEN }, // 布尔诊断，不泄密钥
   }), {
     status: 200,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
 }
 
@@ -411,7 +412,7 @@ async function createEntryHandler(db, stream, body) {
     if (!old) {
       return jsonError(400, 'SUPERSEDE_NOT_FOUND', 'supersedes 引用了不存在的条目 id: ' + oldId);
     }
-    const list = parseJsonArray(old.superseded_by);
+    const list = parseJsonArray(old.superseded_by, 'superseded_by');
     if (!list.includes(id)) list.push(id);
     statements.push(
       db.prepare('UPDATE entries SET status = ?, superseded_by = ?, updated = ? WHERE id = ?')
@@ -789,7 +790,7 @@ async function consolidateHandler(db, body) {
       errors.push({ id: oldId, action: 'supersede', reason: 'not_found', message: 'supersedes 引用了不存在的条目' });
       continue;
     }
-    const list = parseJsonArray(old.superseded_by);
+    const list = parseJsonArray(old.superseded_by, 'superseded_by');
     if (supersedingId && !list.includes(supersedingId)) list.push(supersedingId);
     statements.push(
       db.prepare('UPDATE entries SET status = ?, superseded_by = ?, updated = ? WHERE id = ?')
@@ -2461,11 +2462,6 @@ async function handleRequest(request, env) {
   const path = url.pathname;
   const method = request.method;
   const segments = path.split('/').filter(Boolean); // ['mem'|'task', resource, ...]
-
-  // CORS 预检（工具调用多为服务端到服务端，保留以方便调试）
-  if (method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders() });
-  }
 
   // GET /mem/health 不要求认证（部署验收用）；其余端点全部过认证
   if (method === 'GET' && path === '/mem/health') {
