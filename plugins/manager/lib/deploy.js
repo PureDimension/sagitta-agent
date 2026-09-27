@@ -9,17 +9,6 @@ function sourceSha(source) {
   return createHash("sha256").update(source).digest("hex");
 }
 
-function profileDirFrom(ctx, config) {
-  const configured = config.profileDir;
-  const profileDir = configured ?? (typeof ctx?.dshHomePath === "function"
-    ? ctx.dshHomePath("profiles", "web")
-    : undefined);
-  if (typeof profileDir !== "string" || profileDir.trim() === "") {
-    throw new Error("sagitta-manager profile directory is unavailable");
-  }
-  return profileDir;
-}
-
 async function readDeploymentState(statePath) {
   try {
     const state = JSON.parse(await readFile(statePath, "utf8"));
@@ -59,8 +48,7 @@ export async function deployWorker({
   const sourcePath = path.join(config.repoPath, "worker", "worker.js");
   const source = await readFile(sourcePath, "utf8");
   const sha = sourceSha(source);
-  const profileDir = profileDirFrom(ctx, config);
-  const statePath = path.join(profileDir, ".sagitta-deployed.json");
+  const statePath = path.join(ctx.dshHomePath("profiles", "web"), ".sagitta-deployed.json");
   const previous = await readDeploymentState(statePath);
   if (previous?.sha === sha) return { status: "up-to-date" };
 

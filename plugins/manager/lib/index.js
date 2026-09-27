@@ -9,15 +9,16 @@ const namespace = "sagitta-manager";
 const inject = ["settings", "credentials"];
 
 class SagittaManagerService extends Service {
-  constructor(ctx) {
+  // The scope is a constructor argument on purpose: a published service always
+  // has a live settings scope. Registering after `super()` would publish a
+  // service that any later registration failure leaves scope-less but alive.
+  constructor(ctx, scope) {
     super(ctx, name);
-    this.scope = undefined;
+    this.scope = scope;
   }
 
   async apiConfig() {
-    if (this.scope === undefined) throw new Error("sagitta-manager settings scope is unavailable");
     const config = this.scope.get();
-    if (config === undefined) throw new Error("sagitta-manager settings are unavailable");
     const credentials = await resolveCredentials(this.ctx, config);
     return {
       workerApiUrl: config.workerApiUrl,
@@ -33,38 +34,23 @@ class SagittaManagerService extends Service {
   }
 
   async request(path, init) {
-    if (this.scope === undefined) throw new Error("sagitta-manager settings scope is unavailable");
     const config = this.scope.get();
-    if (config === undefined) throw new Error("sagitta-manager settings are unavailable");
     const credentials = await resolveCredentials(this.ctx, config);
     return requestWorker({ ...config, ...credentials }, path, init);
   }
 
   async deployWorker() {
-    if (this.scope === undefined) throw new Error("sagitta-manager settings scope is unavailable");
-    const config = this.scope.get();
-    if (config === undefined) throw new Error("sagitta-manager settings are unavailable");
-    return runWorkerDeployment({ ctx: this.ctx, config });
+    return runWorkerDeployment({ ctx: this.ctx, config: this.scope.get() });
   }
 }
 
 function apply(ctx, config) {
-  const service = new SagittaManagerService(ctx);
-  ctx.effect(() => () => {
-    service.scope = undefined;
-  }, "sagitta-manager: service cleanup");
+  const scope = ctx.settings.register(namespace, Config, { base: config });
+  const service = new SagittaManagerService(ctx, scope);
 
-  return ctx.inject(["settings"], (settingsCtx) => {
-    const scope = settingsCtx.settings.register(namespace, Config, { base: config });
-    service.scope = scope;
-    settingsCtx.effect(() => () => {
-      if (service.scope === scope) service.scope = undefined;
-    }, "sagitta-manager: settings scope cleanup");
-
-    if (scope.get().repoPath === "") return;
-    return service.deployWorker().catch((error) => {
-      ctx.logger.warn("sagitta-manager automatic deployment failed; settings remain available: %s", error.message);
-    });
+  if (scope.get().repoPath === "") return;
+  service.deployWorker().catch((error) => {
+    ctx.logger.warn("sagitta-manager automatic deployment failed; settings remain available: %s", error.message);
   });
 }
 

@@ -9,6 +9,14 @@ import { apply, Config } from "../lib/index.js";
 import { resolveDeployBindings } from "../lib/bindings.js";
 import { deployWorker } from "../lib/deploy.js";
 
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for the background deployment");
+}
+
 function makeContext(config, values, profileDir) {
   let service;
   const settings = {
@@ -118,11 +126,12 @@ const failedDeployContext = makeContext({ ...requestConfig, repoPath: "missing-m
 const deploymentWarnings = [];
 failedDeployContext.ctx.logger.warn = (...args) => deploymentWarnings.push(args);
 await apply(failedDeployContext.ctx, requestConfig);
+await waitFor(() => deploymentWarnings.length === 1);
 assert.equal(deploymentWarnings.length, 1);
 assert.match(deploymentWarnings[0][0], /automatic deployment failed; settings remain available/);
 assert.equal((await failedDeployContext.getService().apiConfig()).workerApiUrl, requestConfig.workerApiUrl);
 await assert.rejects(() => failedDeployContext.getService().deployWorker(), /ENOENT/);
-console.log("startup deployment failure preserves settings; explicit deployment still rejects: PASS");
+console.log("background startup deployment failure preserves settings; explicit deployment still rejects: PASS");
 
 const proxyConnections = [];
 const proxy = net.createServer((socket) => {
