@@ -15,7 +15,7 @@ $repoUrl = if (-not [string]::IsNullOrWhiteSpace($env:SAGITTA_AGENT_REPO_URL)) {
 
 function Ensure-SagittaRepository {
     param([string]$Path, [string]$Url, [switch]$DryRun)
-    $presetSource = Join-Path $Path 'presets\sagitta'
+    $presetSource = Join-Path $Path 'plugins\manager\presets\sagitta'
     if (Test-Path -LiteralPath $Path -PathType Container) {
         if (Test-Path -LiteralPath $presetSource -PathType Container) {
             $gitDir = Join-Path $Path '.git'
@@ -40,7 +40,7 @@ function Ensure-SagittaRepository {
     if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     & git clone --depth 1 $Url $Path
     if ($LASTEXITCODE -ne 0) { throw "Sagitta repository clone failed with exit code $LASTEXITCODE." }
-    if (-not (Test-Path -LiteralPath $presetSource -PathType Container)) { throw "Cloned repository is missing presets/sagitta: $Path" }
+    if (-not (Test-Path -LiteralPath $presetSource -PathType Container)) { throw "Cloned repository is missing plugins/manager/presets/sagitta: $Path" }
 }
 
 if ([string]::IsNullOrWhiteSpace($DshHome)) {
@@ -94,7 +94,7 @@ return [pscustomobject]@{ Status = 'installed'; Dsh = $dshPath; Repository = $Re
 
 function Ensure-SagittaRepository {
     param([string]$Path, [string]$Url, [switch]$DryRun)
-    $presetSource = Join-Path $Path 'presets\sagitta'
+    $presetSource = Join-Path $Path 'plugins\manager\presets\sagitta'
     if (Test-Path -LiteralPath $Path -PathType Container) {
         if (Test-Path -LiteralPath $presetSource -PathType Container) {
             $gitDir = Join-Path $Path '.git'
@@ -118,5 +118,5 @@ function Ensure-SagittaRepository {
     $parent = Split-Path -Parent $Path
     if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     & git clone --depth 1 $Url $Path
-    if (-not (Test-Path -LiteralPath $presetSource -PathType Container)) { throw "Cloned repository is missing presets/sagitta: $Path" }
+    if (-not (Test-Path -LiteralPath $presetSource -PathType Container)) { throw "Cloned repository is missing plugins/manager/presets/sagitta: $Path" }
 }

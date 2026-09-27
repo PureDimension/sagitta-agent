@@ -2,6 +2,15 @@
 
 `@sagitta/manager`（Cordis id：`sagitta-manager`）是 Sagitta 唯一的基础设施服务：它注册配置、解析凭据、提供 Worker HTTP 通道，并负责显式触发 Worker 部署。
 
+## Sagitta 预设安装
+
+预设源位于本包的 `presets/sagitta`。在源码仓库运行
+`pwsh -File scripts/sync-preset.ps1 -RepoPath <仓库路径> -DshHome <DSH_HOME>`，
+将展开路径变量后的预设安装到 `<DSH_HOME>/.agent-presets/sagitta`。
+Profile 的 `agent-presets.config.includeUserRoot` 必须为 `true`（默认值）。
+DSH 0.1.1-rc.2 启动器会覆盖自定义 `roots`，不能只指向本包目录并关闭用户目录扫描。
+同步脚本会保留用户修改；包更新后应再次同步预设。
+
 ## 配置字段
 
 | 字段 | 默认值 | 说明 |

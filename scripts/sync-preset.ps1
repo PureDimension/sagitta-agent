@@ -137,7 +137,10 @@ if ([string]::IsNullOrWhiteSpace($RepoPath)) {
 
 $DshHome = [IO.Path]::GetFullPath($DshHome)
 $RepoPath = [IO.Path]::GetFullPath($RepoPath)
-$sourcePath = Join-Path $RepoPath "presets\$PresetId"
+$sourcePath = Join-Path $RepoPath "plugins\manager\presets\$PresetId"
+if (-not (Test-Path -LiteralPath (Join-Path $sourcePath 'agent.cordis.yml') -PathType Leaf)) {
+    $sourcePath = Join-Path $RepoPath "presets\$PresetId"
+}
 $targetPath = Join-Path $DshHome ".agent-presets\$PresetId"
 $sourceFiles = @('agent.cordis.yml', 'preset.yml')
 $userProfile = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {

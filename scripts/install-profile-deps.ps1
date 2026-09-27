@@ -399,6 +399,7 @@ $patchEntries = [ordered]@{
         '- id: agent-presets'
         '  config:'
         '    default: sagitta'
+        '    includeUserRoot: true'
     )
     'sagitta-manager' = @(
         '- id: sagitta-manager'

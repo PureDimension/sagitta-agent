@@ -17,13 +17,15 @@ function Assert-True {
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "sagitta-preset-smoke-$([Guid]::NewGuid().ToString('N'))"
 $repoPath = Join-Path $tempRoot 'repo'
-$sourceDir = Join-Path $repoPath 'presets\sagitta'
+$sourceDir = Join-Path $repoPath 'plugins\manager\presets\sagitta'
 $dshHome = Join-Path $tempRoot 'dsh-home'
 $targetDir = Join-Path $dshHome '.agent-presets\sagitta'
 $syncScript = Join-Path $PSScriptRoot 'sync-preset.ps1'
 
 try {
     New-Item -ItemType Directory -Force -Path $sourceDir | Out-Null
+    # A leftover legacy directory must not hide the relocated packaged preset.
+    New-Item -ItemType Directory -Force -Path (Join-Path $repoPath 'presets\sagitta') | Out-Null
     $agentSource = @'
 # <SAGITTA_PROJECT_ROOT> <SAGITTA_AGENT_DIR> and <DSH_HOME> are also part of the template contract.
 - id: persona
