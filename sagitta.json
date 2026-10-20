@@ -1,0 +1,15 @@
+{
+  "preset": {
+    "id": "sagitta",
+    "name": "Sagitta",
+    "description": "长期工作伙伴：管理项目、自主推进、积累经验。",
+    "prompt": "presets/sagitta.md"
+  },
+  "plugins": [
+    {
+      "id": "sagitta-memory",
+      "name": "@sagitta/runtime/memory",
+      "config": {}
+    }
+  ]
+}

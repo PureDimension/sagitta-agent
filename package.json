@@ -1,0 +1,18 @@
+{
+  "name": "@sagitta/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "由 Sagitta Updater 加载的预设、提示词与业务插件",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PureDimension/sagitta-agent.git"
+  },
+  "engines": {
+    "dsh": "0.2.1-rc.2"
+  },
+  "exports": {
+    "./memory": "./plugins/memory/index.js"
+  },
+  "files": ["plugins/memory/index.js", "presets/sagitta.md", "sagitta.json"]
+}

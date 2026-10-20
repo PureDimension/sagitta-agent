@@ -1,0 +1,3 @@
+- insert:
+    - id: sagitta-updater
+      name: '@sagitta/updater'
