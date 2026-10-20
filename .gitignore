@@ -1,0 +1,29 @@
+# Local configuration and credentials
+.env*
+*.local
+*.local.*
+*.secret
+*.secret.*
+*.secrets
+*.secrets.*
+*.private
+*.private.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+worker/.dev.vars
+worker/wrangler.toml
+worker/reference/account.json
+worker/reference/env
+
+# Dependencies and generated state
+node_modules/
+dist/
+coverage/
+*.log
+*.bak.*
+*.update-candidate.*
+.sagitta-auto-advance.json

@@ -1,0 +1,121 @@
+# Task API P1 设计草案（拍板⑤ 执行输入）
+
+> 涟漪 2026-08-29 拍板⑤ 的落地草案。涟漪只需确认"照此执行"或指定修改点。
+> 现状基线：TASKS.md 活文件（experience）+ `<SAGITTA_TASKS_FILE>` 模板变量 + auto-advance `tasksPath` + updater 开机 pull。本草案把"任务事实源"从文件迁到 manager-backed API。
+
+---
+
+## 1. 资源模型（D1 `tasks` 表）
+
+```sql
+CREATE TABLE IF NOT EXISTS tasks (
+  id            TEXT PRIMARY KEY,                -- 生成: tsk-YYYYMMDD-<hex6>
+  project       TEXT NOT NULL,                   -- 所属项目（对应 TASKS §1A/1B 分类）
+  title         TEXT NOT NULL,                   -- 条目一行描述
+  acceptance    TEXT DEFAULT '',                 -- markdown checklist；normal 必填，temp 可空
+  status        TEXT NOT NULL DEFAULT 'open',    -- open | in_progress | blocked | waiting | done
+  priority      INTEGER NOT NULL DEFAULT 0,      -- 0 普通 / 1 高 / 2 紧急
+  checkbox      INTEGER NOT NULL DEFAULT 0,      -- 1=该条是涟漪待处理 checkbox
+  stream        TEXT NOT NULL DEFAULT 'company', -- personal-projects | company-projects | sagitta | ripple（对齐记忆四流）
+  body          TEXT DEFAULT '',                 -- 内嵌描述/notes
+  created_at    TEXT NOT NULL,                   -- ISO8601 UTC
+  updated_at    TEXT NOT NULL DEFAULT '',        -- ISO8601 UTC
+  done_at       TEXT DEFAULT '',
+  archived      INTEGER NOT NULL DEFAULT 0,      -- 1=归档（软删，recall 默认排除同 memory 契约）
+  evidence_json TEXT DEFAULT '[]',                -- 结构化证据数组；接口投影为 JSON 数组
+  next_action   TEXT DEFAULT NULL,                -- 下一步；round-close.next 会同步到这里
+  blocked_reason TEXT DEFAULT NULL,
+  blocked_kind  TEXT DEFAULT NULL                 -- need-human | ripple-stop | external | technical
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
+CREATE INDEX IF NOT EXISTS idx_tasks_stream   ON tasks(stream);
+CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
+```
+
+对齐记忆库 v1.3 契约：`id`/`status`/`archived`/`stream` 四语义与 memory 的 `entries` 一致（召回默认排除 archived）；`checkbox` 对应悬浮窗"待处理需求"区块。
+
+### 结构化收口字段
+
+`evidence_json` 在 API 响应和工具投影中是数组，不是原始 TEXT：每项形如
+`{type, path|ref, digest?, summary, at}`。`type` 固定为 `file`、`test`、`command`、`url`、
+`commit`、`log`；`path` 或 `ref` 至少一个，`summary` 和 `at` 必填。PATCH done、round-close
+done 及其 `pending_done` 申请至少需要一项；缺失返回 `TASK_EVIDENCE_REQUIRED`，结构/枚举错误返回
+`INVALID_EVIDENCE`、`INVALID_EVIDENCE_TYPE` 等明确 422 错误码。
+
+`next_action` 可选，PATCH 可设置或传 `null` 清除；round-close 的必填 `next` 会同步写入任务行。
+`blocked_kind` 可选于普通任务字段，但新进入 `blocked`/`pending_blocked` 时与非空
+`blocked_reason` 一起必填，枚举为 `need-human`、`ripple-stop`、`external`、`technical`，缺失返回
+`BLOCKED_KIND_REQUIRED`，非法值返回 `INVALID_BLOCKED_KIND`。旧任务该列为空仍可读，不触发历史数据错误。
+
+### acceptance（验收清单）
+
+`acceptance` 是一个 TEXT 字段，内容为多行 Markdown checklist，每行一个期望目标，例如：
+
+```markdown
+- [ ] API 返回 acceptance
+- [ ] normal 无清单时创建被拒绝
+- [x] 已完成的目标
+```
+
+至少要有一行 `- [ ] 描述`、`- [x] 描述` 或 `- [X] 描述` 才算合法。`normal` 创建时必须提供合法清单；`temp` 可以省略或保存为空。更新 normal 的 acceptance 是整体替换，不能清空或替换成无 checklist 的文本；temp 可以清空。清单是否全部达成由模型对照清单判断，Worker 不维护逐项状态机。
+
+## 2. REST 路由（复用现有 `/mem` 基座与鉴权）
+
+前缀 `/task`（与 `/mem` 平级，同一 Worker）：
+
+| 方法 | 路径 | 用途 | 需要的 D1 token |
+|---|---|---|---|
+| GET  | `/task?project=&stream=&status=` | 列表（默认排除 archived；status 过滤可选） | read |
+| POST | `/task` | 新建（body: project/title/acceptance/status/priority/checkbox/stream/body/evidence_json/next_action） | write |
+| GET  | `/task/{id}` | 单条 | read |
+| PATCH| `/task/{id}` | 更新 status/priority/body/title/checkbox/acceptance/evidence_json/next_action/blocked_reason/blocked_kind（部分更新） | write |
+| DELETE| `/task/{id}` | 软删 → archived=1（不真删，保审计） | write |
+| POST | `/task/search` | 关键词 LIKE（与 /mem/search 同风格） | read |
+
+响应与 memory 同构：`{ok:true, data:{...}}` / `{ok:false, error:{code,message}}`（中文指引风格一致）。
+
+### round-close 与渲染约定
+
+`POST /task/{id}/round-close` 的 `progress`、`next`、`round_id`、`action` 仍是必填；`next` 会写入
+`next_action`。`evidence_json` 与 `blocked_kind` 可选于协议字段，但 `action=done` 至少要有一条
+证据，`action=blocked` 必须有 `blocked_reason + blocked_kind`。`expected_updated_at` 对 done/blocked
+可以省略：Worker 会把本次读取到的当前 `updated_at` 用作条件；调用方显式提供旧值时仍返回
+`TASK_VERSION_CONFLICT`。memory 插件为兼容旧 Worker，在省略时先 GET 当前任务再发送版本号。
+
+任务投影含 `updated_at/evidence_json/next_action/blocked_kind`。memory 的 `task_list` 与 `task_search`
+文本还显示证据数量/类型，并派生 `▸可推进`、`⏳等人(open need)`、`⛔阻塞`、`✅终态`、`⏸waiting`
+（pending 另标 `⏳待确认`）；这些标注不新增数据库状态列。
+
+## 3. 鉴权与 manager 契约（无新配置）
+
+- 复用 manager 四字段：`workerApiUrl`（根）+ `d1ReadToken`（读类 GET/search）+ `d1WriteToken`（写类 POST/PATCH/DELETE）。
+- 发送形态沿用 memory 现有 `buildAuthHeaders`（Bearer read/write 分流，拍板①结论后统一）。
+- **零新配置字段**——涟漪第 5 条的三个 API 已全覆盖。
+
+## 4. 接入改造（涟漪第 6 条：task 直接从 manager 读 API）
+
+| 组件 | 改动 |
+|---|---|
+| auto-advance service | `tasksPath` 文件模式保留为 fallback；新增 `apiUrl` 模式：读 `ctx['sagitta-manager'].getApiConfig()` → workerApiUrl+d1Read/d1Write → `GET /task?checkbox=1&status=open` 拉待处理需求。`taskFallback: true` 已有：API 不可达/未配置时回退文件 |
+| updater | 无改动（它只同步 preset/插件/worker；task API 是数据面，不做数据面推数据） |
+| 记忆 manager | 无改动（memory 已接 manager） |
+
+## 5. TASKS.md 退场时序（涟漪第 7 条衔接）
+
+- **阶段 C1（过渡）**：API 上线 + auto-advance 优先 API、文件 fallback；TASKS.md 继续可编辑（persona 指令改"任务从 API 拉，TASKS.md 仅作离线导出/归档"）。
+- **阶段 C2（归档）**：C1 稳定运行 N 天后，TASKS.md 降级为只读归档导出（`export-tasks.ps1`：D1 tasks → TASKS.md 格式），`tasksPath`/`<SAGITTA_TASKS_FILE>` 从模板移除。**涟漪确认 C2 时机**（建议：API 连续 7 天无故障后）。
+
+## 6. worker 参考实现改动点
+
+- `worker/worker.js`：新增 `/task` 路由块（复用 `/mem` 的 JSON 解析/D1 绑定/错误壳）+ `tasks` 表 DDL 放 `worker/schema.sql`（同库追加 CREATE TABLE IF NOT EXISTS tasks）。
+- 迁移人工 gate（同现有纪律：updater 不隐式执行 DDL）。
+
+## 7. 验收
+
+1. `node --check` worker.js；`/task` 路由冒烟（本地 HTTP 桩 + mock manager，双侧 read/write Bearer 断言）
+2. auto-advance smoke：API 可用 → 需求来自 API；API 不可用 → fallback 文件（两态断言）
+3. 远端：真机部署后 `curl /task?stream=sagitta` 返回 `{ok:true,data:[]}`
+
+## 涟漪最小拍板动作
+
+> 说一句："**照 task-api-p1.md 执行，C1 过渡、C2 等 7 天无故障再定**" 即可；要改资源字段/路由前缀则在回复里点名。

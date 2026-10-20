@@ -1,0 +1,6 @@
+# @sagitta/auto-advance bundle layer.
+# The profile only needs to list this package as a bundle; this patch mounts
+# the host service and the matching web client entry in the Cordis tree.
+- insert:
+    - id: sagitta-auto-advance
+      name: '@sagitta/auto-advance'

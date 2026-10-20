@@ -1,0 +1,4 @@
+# @sagitta/manager bundle composition.
+- insert:
+    - id: sagitta-manager
+      name: '@sagitta/manager'

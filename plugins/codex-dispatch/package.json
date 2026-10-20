@@ -1,0 +1,45 @@
+{
+  "name": "@sagitta/codex-dispatch",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Sagitta codex 派单适配器：常驻 codex app-server 会话委托给通用 async-work 注册表",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./lib/*": "./lib/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "test",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "peerDependencies": {
+    "@sagitta/async-work": "^0.1.0",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@sagitta/async-work": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/app-server.js && node --check test/smoke.mjs && node --check test/app-server.mjs",
+    "smoke": "node test/smoke.mjs && node test/app-server.mjs"
+  }
+}

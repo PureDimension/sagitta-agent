@@ -1,0 +1,1112 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import { test } from "node:test";
+
+const workerCode = readFileSync(new URL("../worker.js", import.meta.url), "utf8");
+const schema = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+const worker = await import("data:text/javascript;base64," + Buffer.from(workerCode).toString("base64"));
+
+// D1 兼容适配器：包含 prepare/bind/first/all/run/batch；batch 用 SQLite 事务复刻 D1 原子批处理。
+function makeD1(database, { onPrepare, failBatch = false } = {}) {
+  function statement(sql, params = []) {
+    const execute = (method) => database.prepare(sql)[method](...params);
+    return {
+      bind(...bound) { return statement(sql, bound); },
+      first: async () => execute("get") ?? null,
+      all: async () => ({ results: execute("all") }),
+      run: async () => {
+        const result = execute("run");
+        return { meta: { changes: Number(result.changes) } };
+      },
+    };
+  }
+  return {
+    prepare(sql) {
+      onPrepare?.(sql);
+      return statement(sql);
+    },
+    async batch(statements) {
+      if (failBatch) throw new Error("synthetic batch failure");
+      database.exec("BEGIN");
+      try {
+        const results = [];
+        for (const prepared of statements) results.push(await prepared.run());
+        database.exec("COMMIT");
+        return results;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+}
+
+async function call(workerEnv, method, path, { token, body, headers } = {}) {
+  const headersObj = {};
+  if (token !== undefined) headersObj.Authorization = "Bearer " + token;
+  if (body !== undefined) headersObj["Content-Type"] = "application/json";
+  if (headers) Object.assign(headersObj, headers);
+  const request = new Request("https://worker.test" + path, {
+    method,
+    headers: headersObj,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const response = await worker.default.fetch(request, workerEnv);
+  return { status: response.status, body: await response.json() };
+}
+
+// 认领测试的调用方标识：X-Agent-Id 头（缺省 'unknown'；task-ownership-p2 §4.1）
+const agentA = { headers: { "X-Agent-Id": "agent-A" } };
+const agentB = { headers: { "X-Agent-Id": "agent-B" } };
+const normalAcceptance = "- [ ] smoke acceptance";
+const evidence = [{ type: "test", path: "worker/test/smoke.mjs", summary: "Worker smoke 验证通过", at: "2026-09-20T00:00:00.000Z" }];
+const blockedKind = "external";
+
+test("/task CRUD, filters, LIKE search, soft delete, and read/write Bearer split", async () => {
+  const database = new DatabaseSync(":memory:");
+  database.exec(schema);
+  const env = {
+    DB: makeD1(database),
+    AUTH_TOKEN: "legacy-auth-smoke-token",
+    D1_READ_TOKEN: "smoke-read-token",
+    D1_WRITE_TOKEN: "smoke-write-token",
+  };
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  let result = await call(env, "GET", "/task");
+  assert.equal(result.status, 401);
+  assert.equal(result.body.ok, false);
+
+  result = await call(env, "GET", "/task", write);
+  assert.equal(result.status, 403, "write Bearer must not read task data");
+  result = await call(env, "GET", "/task", read);
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data.items, []);
+
+  result = await call(env, "POST", "/task", { ...read, body: { project: "alpha", title: "read must fail" } });
+  assert.equal(result.status, 403, "read Bearer must not write task data");
+
+  result = await call(env, "POST", "/task", {
+    ...write,
+    body: {
+      project: "alpha",
+      title: "Ship task API",
+      acceptance: normalAcceptance,
+      status: "open",
+      priority: 1,
+      checkbox: true,
+      stream: "company-projects",
+      body: "unique-task-search-keyword",
+    },
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.body.ok, true);
+  const first = result.body.data;
+  assert.match(first.id, /^tsk-\d{8}-[0-9a-f]{6}$/);
+  assert.equal(first.project, "alpha");
+  assert.equal(first.kind, "normal");
+  assert.equal(first.acceptance, normalAcceptance);
+  assert.equal(first.status, "open");
+  assert.equal(first.priority, 1);
+  assert.equal(first.checkbox, 1);
+  assert.equal(first.archived, 0);
+  assert.equal(first.done_at, null);
+
+  result = await call(env, "POST", "/task", {
+    ...write,
+    body: {
+      project: "beta",
+      title: "Blocked follow-up",
+      acceptance: normalAcceptance,
+      status: "open",
+      stream: "sagitta",
+      body: "another task",
+    },
+  });
+  assert.equal(result.status, 201);
+  const second = result.body.data;
+
+  result = await call(env, "GET", "/task/" + first.id, read);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.id, first.id);
+  assert.equal(result.body.data.acceptance, normalAcceptance);
+
+  result = await call(env, "GET", "/task?project=alpha&stream=company-projects&status=open&checkbox=1", read);
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [first.id]);
+
+  result = await call(env, "PATCH", "/task/" + first.id, {
+    ...write,
+    body: { status: "in_progress", priority: 2, title: "Ship task API now", checkbox: false, body: "patched body" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "in_progress");
+  assert.equal(result.body.data.priority, 2);
+  assert.equal(result.body.data.title, "Ship task API now");
+  assert.equal(result.body.data.checkbox, 0);
+  assert.equal(result.body.data.body, "patched body");
+
+  result = await call(env, "POST", "/task/search", { ...read, body: { query: "patched body" } });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [first.id]);
+
+  result = await call(env, "POST", "/task/search", { ...write, body: { query: "patched body" } });
+  assert.equal(result.status, 403, "write Bearer must not use read search route");
+
+  result = await call(env, "DELETE", "/task/" + first.id, { token: env.D1_READ_TOKEN });
+  assert.equal(result.status, 403);
+  result = await call(env, "DELETE", "/task/" + first.id, write);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.archived, 1);
+
+  result = await call(env, "GET", "/task", read);
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [second.id]);
+  result = await call(env, "POST", "/task/search", { ...read, body: { query: "patched body" } });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data.items, []);
+
+  result = await call(env, "GET", "/task/" + first.id, read);
+  assert.equal(result.status, 200, "soft-deleted task remains addressable by id");
+  assert.equal(result.body.data.archived, 1);
+  assert.equal(database.prepare("SELECT COUNT(*) AS total FROM tasks WHERE id = ?").get(first.id).total, 1);
+});
+
+function taskEnv({ database = new DatabaseSync(":memory:"), legacy = false, legacyNeedHuman = false, failBatch = false, onPrepare } = {}) {
+  if (legacy) {
+    database.exec(`CREATE TABLE tasks (
+      id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open', priority INTEGER NOT NULL DEFAULT 0,
+      checkbox INTEGER NOT NULL DEFAULT 0, stream TEXT NOT NULL DEFAULT 'company',
+      body TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
+      done_at TEXT DEFAULT '', archived INTEGER NOT NULL DEFAULT 0
+    )`);
+    if (legacyNeedHuman) {
+      database.exec(`CREATE TABLE task_need_human (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, content TEXT NOT NULL,
+        suggestion TEXT, status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL,
+        resolved_at TEXT, resolved_by TEXT
+      )`);
+    }
+  } else {
+    database.exec(schema);
+  }
+  return {
+    database,
+    env: {
+      DB: makeD1(database, { failBatch, onPrepare }),
+      AUTH_TOKEN: "legacy-auth-smoke-token",
+      D1_READ_TOKEN: "smoke-read-token",
+      D1_WRITE_TOKEN: "smoke-write-token",
+    },
+  };
+}
+
+test("task acceptance is required for normal, optional for temp, and returned by list/search/detail", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  let result = await call(env, "POST", "/task", { ...write, body: { project: "acceptance", title: "missing acceptance" } });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "ACCEPTANCE_REQUIRED");
+
+  result = await call(env, "POST", "/task", {
+    ...write,
+    body: { project: "acceptance", title: "checklist task", acceptance: "- [ ] first target\n- [x] shipped target" },
+  });
+  assert.equal(result.status, 201);
+  const normal = result.body.data;
+  assert.equal(normal.acceptance, "- [ ] first target\n- [x] shipped target");
+
+  result = await call(env, "GET", "/task", read);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.items.find((item) => item.id === normal.id).acceptance, normal.acceptance);
+  result = await call(env, "GET", "/task/" + normal.id, read);
+  assert.equal(result.body.data.acceptance, normal.acceptance);
+  result = await call(env, "POST", "/task/search", { ...read, body: { query: "checklist task" } });
+  assert.equal(result.body.data.items.find((item) => item.id === normal.id).acceptance, normal.acceptance);
+
+  result = await call(env, "PATCH", "/task/" + normal.id, { ...write, body: { acceptance: "" } });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "ACCEPTANCE_REQUIRED");
+  result = await call(env, "PATCH", "/task/" + normal.id, { ...write, body: { acceptance: "plain text" } });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "ACCEPTANCE_FORMAT");
+
+  result = await call(env, "POST", "/task", { ...write, body: { kind: "temp", title: "empty temp" } });
+  assert.equal(result.status, 201);
+  assert.equal(result.body.data.acceptance, "");
+});
+
+test("A1 blocked task field patch regression: status, reason, and ordinary fields stay writable", async () => {
+  const { env } = taskEnv();
+  const write = { token: env.D1_WRITE_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "acceptance", title: "A1 blocked patch", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+  result = await call(env, "PATCH", "/task/" + task.id, {
+    ...write, body: { status: "blocked", blocked_reason: "先决外部依赖", blocked_kind: "external" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "blocked");
+  result = await call(env, "PATCH", "/task/" + task.id, {
+    ...write,
+    body: {
+      blocked_reason: "新的外部依赖说明",
+      title: "A1 blocked patch revised",
+      priority: 1,
+      body: "blocked body update",
+      acceptance: "- [ ] revised acceptance",
+    },
+  });
+  assert.equal(result.status, 200, "blocked-only PATCH must not enter terminal SQL branch");
+  assert.equal(result.body.data.status, "blocked");
+  assert.equal(result.body.data.blocked_reason, "新的外部依赖说明");
+  assert.equal(result.body.data.blocked_kind, "external");
+  assert.equal(result.body.data.title, "A1 blocked patch revised");
+  assert.equal(result.body.data.priority, 1);
+  assert.equal(result.body.data.body, "blocked body update");
+});
+
+test("A2 round-close uses current version when expected_updated_at is omitted and rejects stale versions", async () => {
+  const { env } = taskEnv();
+  const write = { token: env.D1_WRITE_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "acceptance", title: "A2 implicit version", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const implicit = result.body.data;
+  result = await call(env, "POST", "/task/" + implicit.id + "/round-close", {
+    ...write,
+    body: { agent_id: "a2", round_id: "implicit-done", action: "done", progress: "完成", next: "等待确认", evidence_json: evidence },
+  });
+  assert.equal(result.status, 200, "done round-close may omit expected_updated_at");
+  assert.equal(result.body.data.pending_status, "pending_done");
+
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "acceptance", title: "A2 stale version", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const stale = result.body.data;
+  result = await call(env, "POST", "/task/" + stale.id + "/round-close", {
+    ...write,
+    body: { agent_id: "a2", round_id: "stale-update", action: "update", progress: "推进", next: "继续", },
+  });
+  assert.equal(result.status, 200);
+  result = await call(env, "POST", "/task/" + stale.id + "/round-close", {
+    ...write,
+    body: { agent_id: "a2", round_id: "stale-done", action: "done", progress: "完成", next: "等待确认", evidence_json: evidence, expected_updated_at: stale.updated_at },
+  });
+  assert.equal(result.status, 409, "provided stale expected_updated_at must remain optimistic-lock protected");
+  assert.equal(result.body.error.code, "TASK_VERSION_CONFLICT");
+});
+
+test("B1 structured evidence gates done and is projected", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "acceptance", title: "B1 evidence", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+  assert.deepEqual(task.evidence_json, []);
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "TASK_EVIDENCE_REQUIRED");
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "done", evidence_json: evidence } });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data.evidence_json, evidence);
+  result = await call(env, "GET", "/task", read);
+  assert.deepEqual(result.body.data.items.find((item) => item.id === task.id).evidence_json, evidence);
+});
+
+test("B2 next_action is synchronized by round-close and task list exposes derived actionability", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "acceptance", title: "B2 actionability", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write, body: { agent_id: "b2", round_id: "action", action: "update", progress: "已推进", next: "执行下一步" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.next_action, "执行下一步");
+  result = await call(env, "GET", "/task", read);
+  const item = result.body.data.items.find((entry) => entry.id === task.id);
+  assert.equal(item.next_action, "执行下一步");
+});
+
+test("B3 blocked_kind is required for new blocked transitions while legacy null remains readable", async () => {
+  const legacy = taskEnv({ legacy: true });
+  const read = { token: legacy.env.D1_READ_TOKEN };
+  const write = { token: legacy.env.D1_WRITE_TOKEN };
+  let result = await call(legacy.env, "GET", "/task", read);
+  assert.equal(result.status, 200);
+  const legacyId = "tsk-legacy-blocked-kind";
+  legacy.database.prepare(
+    "INSERT INTO tasks (id, project, title, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(legacyId, "legacy", "legacy blocked", "blocked", 0, 0, "company", "", "2026-09-20T00:00:00.000Z", "2026-09-20T00:00:00.000Z", "", 0, "legacy reason");
+  result = await call(legacy.env, "GET", "/task/" + legacyId, read);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.blocked_kind, null);
+  result = await call(legacy.env, "POST", "/task", {
+    ...write, body: { project: "legacy", title: "new blocked", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  result = await call(legacy.env, "PATCH", "/task/" + result.body.data.id, {
+    ...write, body: { status: "blocked", blocked_reason: "需要分类" },
+  });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "BLOCKED_KIND_REQUIRED");
+  result = await call(legacy.env, "POST", "/task", {
+    ...write, body: { project: "legacy", title: "pending blocked kind", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  result = await call(legacy.env, "POST", "/task/" + result.body.data.id + "/round-close", {
+    ...write,
+    body: { agent_id: "b3", round_id: "missing-kind", action: "blocked", progress: "阻塞", next: "等待分类", blocked_reason: "需要分类" },
+  });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "BLOCKED_KIND_REQUIRED");
+});
+
+test("task migration is re-entrant and fails closed when D1 batch fails", async () => {
+  let alterCount = 0;
+  let needHumanTypeAlterCount = 0;
+  const legacy = taskEnv({ legacy: true, legacyNeedHuman: true, onPrepare(sql) {
+    if (/^ALTER TABLE tasks ADD COLUMN/.test(sql)) alterCount += 1;
+    if (/^ALTER TABLE task_need_human ADD COLUMN type /.test(sql)) needHumanTypeAlterCount += 1;
+  }});
+  const read = { token: legacy.env.D1_READ_TOKEN };
+  const legacyId = "tsk-20260830-legacy";
+  legacy.database.prepare(
+    "INSERT INTO tasks (id, project, title, status, priority, checkbox, stream, body, created_at, updated_at, done_at, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(legacyId, "legacy", "legacy task", "open", 0, 0, "company", "old body", "2026-08-30T00:00:00.000Z", "2026-08-30T00:00:00.000Z", "", 0);
+  legacy.database.prepare(
+    "INSERT INTO task_need_human (id, task_id, content, suggestion, status, created_at, resolved_at, resolved_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("nh-20260830-old", legacyId, "legacy need-human", null, "open", "2026-08-30T00:00:00.000Z", null, null);
+  let result = await call(legacy.env, "GET", "/task", read);
+  assert.equal(result.status, 200);
+  assert.equal(needHumanTypeAlterCount, 1, "existing task_need_human must gain type exactly once");
+  assert.equal(legacy.database.prepare("SELECT type FROM task_need_human WHERE id = ?").get("nh-20260830-old").type, "need");
+  // blocked_reason + pending_status（既有）+ kind（v2）+ owner_agent_id/claimed_at/claim_token/lease_seconds（task-ownership-p2 §3）
+  assert.equal(alterCount, 11);
+  result = await call(legacy.env, "GET", "/task/" + legacyId, read);
+  assert.equal(result.body.data.body, "old body");
+  assert.equal(result.body.data.kind, "normal");
+  assert.equal(result.body.data.pending_status, null);
+  assert.equal(result.body.data.claim_state, "unclaimed", "legacy task without owner must read as unclaimed");
+  result = await call(legacy.env, "PATCH", "/task/" + legacyId, { token: legacy.env.D1_WRITE_TOKEN, body: { body: "updated old body" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.body, "updated old body");
+  result = await call(legacy.env, "GET", "/task", read);
+  assert.equal(result.status, 200);
+  assert.equal(alterCount, 11, "second migration must not issue duplicate ALTER TABLE");
+  assert.equal(needHumanTypeAlterCount, 1, "second migration must not issue duplicate type ALTER TABLE");
+  const taskColumns = legacy.database.prepare("PRAGMA table_info(tasks)").all().map((row) => row.name);
+  for (const column of ["blocked_reason", "pending_status", "kind", "acceptance", "evidence_json", "next_action", "blocked_kind", "owner_agent_id", "claimed_at", "claim_token", "lease_seconds"]) {
+    assert.ok(taskColumns.includes(column), "missing tasks column " + column);
+  }
+  const eventColumns = legacy.database.prepare("PRAGMA table_info(task_events)").all().map((row) => row.name);
+  for (const column of ["event_id", "task_id", "agent_id", "event_type", "round_id", "action", "progress", "next", "blocked_reason", "pending_status", "confirmation_id", "expected_updated_at", "payload_json", "created_at"]) {
+    assert.ok(eventColumns.includes(column), "missing task_events column " + column);
+  }
+  const needHumanColumns = legacy.database.prepare("PRAGMA table_info(task_need_human)").all().map((row) => row.name);
+  for (const column of ["id", "task_id", "content", "suggestion", "type", "status", "created_at", "resolved_at", "resolved_by"]) {
+    assert.ok(needHumanColumns.includes(column), "missing task_need_human column " + column);
+  }
+
+  const broken = taskEnv({ failBatch: true });
+  result = await call(broken.env, "GET", "/task", { token: broken.env.D1_READ_TOKEN });
+  assert.equal(result.status, 503);
+  assert.equal(result.body.error.code, "TASK_SCHEMA_UNAVAILABLE");
+  assert.ok(result.body.request_id);
+});
+
+test("v3 task kind, need-human lifecycle, done gate, and blocked transitions", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  // temp 可无根创建；默认任务列表隐藏，显式 kind=temp 可见。
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { kind: "temp", title: "temporary unrooted task" },
+  });
+  assert.equal(result.status, 201);
+  const temp = result.body.data;
+  assert.equal(temp.kind, "temp");
+  assert.equal(temp.project, "");
+  result = await call(env, "GET", "/task", read);
+  assert.ok(!result.body.data.items.some((item) => item.id === temp.id));
+  result = await call(env, "GET", "/task?kind=temp", read);
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [temp.id]);
+  result = await call(env, "POST", "/task/" + temp.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task?include_temp=1", { ...read, ...agentA });
+  assert.ok(result.body.data.items.some((item) => item.id === temp.id), "own claimed temp must be available to auto-advance");
+  result = await call(env, "GET", "/task?kind=temp&owner=me", { ...read, ...agentA });
+  assert.deepEqual(result.body.data.items.map((item) => item.id), [temp.id]);
+  result = await call(env, "GET", "/task?kind=temp&owner=me", { ...read, ...agentB });
+  assert.deepEqual(result.body.data.items, []);
+
+  // type=need 在申请 done 时即被拦截，不生成 pending_done；type=notify 不阻塞 done。
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v2", title: "done gate", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const gated = result.body.data;
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { content: "非法类型", type: "question" },
+  });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "INVALID_NEED_HUMAN_TYPE");
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { content: "请确认是否保留旧接口", suggestion: "建议保留兼容层" },
+  });
+  assert.equal(result.status, 201);
+  const needHuman = result.body.data;
+  assert.match(needHuman.id, /^nh-\d{8}-[0-9a-f]+$/);
+  assert.equal(needHuman.type, "need");
+  assert.equal(needHuman.status, "open");
+  result = await call(env, "GET", "/need-human?status=open", read);
+  assert.equal(result.body.data.items.find((item) => item.id === needHuman.id).type, "need");
+  result = await call(env, "GET", "/task/" + gated.id, read);
+  assert.equal(result.body.data.open_need_human, true);
+  assert.equal(result.body.data.open_need_human_count, 1);
+  assert.equal(result.body.data.open_notify_count, 0);
+  result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done" } });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
+  assert.match(result.body.error.message, /可标 blocked 或先 resolve need-human/);
+  assert.equal(result.body.error.details.task.pending_status, null, "need-human 拦截不得生成 pending_done");
+
+  result = await call(env, "POST", "/task/" + gated.id + "/round-close", {
+    ...write,
+    body: {
+      agent_id: "smoke-agent", round_id: "need-open-done", action: "done",
+      progress: "实现已完成", next: "等待 need-human",
+      evidence_json: evidence,
+      expected_updated_at: result.body.error.details.task.updated_at,
+    },
+  });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_NEED_HUMAN_OPEN");
+  assert.equal(result.body.error.details.task.pending_status, null, "round-close 拦截不得生成 pending_done");
+
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { type: "notify", content: "已部署可验证" },
+  });
+  assert.equal(result.status, 201);
+  const notifyHuman = result.body.data;
+  assert.equal(notifyHuman.type, "notify");
+  result = await call(env, "GET", "/task/" + gated.id, read);
+  assert.equal(result.body.data.open_need_human, true);
+  assert.equal(result.body.data.open_need_human_count, 1);
+  assert.equal(result.body.data.open_notify_count, 1);
+
+  result = await call(env, "POST", "/task/need-human/" + needHuman.id + "/resolve", {
+    ...write, body: { resolve_kind: "abandoned", target: "in_progress" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.type, "need");
+  result = await call(env, "GET", "/task/" + gated.id, read);
+  assert.equal(result.body.data.open_need_human, false);
+  assert.equal(result.body.data.open_need_human_count, 0);
+  assert.equal(result.body.data.open_notify_count, 1);
+
+  // 普通 PATCH done 直落终态；多挂的第二条 need 仍阻止 target=done。
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { type: "need", content: "确认全部 need 后才能收口" },
+  });
+  assert.equal(result.status, 201);
+  const secondNeedHuman = result.body.data;
+  result = await call(env, "POST", "/task/" + gated.id + "/need-human", {
+    ...write, body: { type: "need", content: "第三条 need" },
+  });
+  assert.equal(result.status, 201);
+  const thirdNeedHuman = result.body.data;
+  result = await call(env, "POST", "/task/need-human/" + secondNeedHuman.id + "/resolve", {
+    ...write,
+    body: { resolved_by: "ripple", target: "in_progress" },
+  });
+  assert.equal(result.status, 200);
+  result = await call(env, "PATCH", "/task/" + gated.id, { ...write, body: { status: "done", evidence_json: evidence } });
+  assert.equal(result.status, 409, "open need must block direct PATCH done");
+  result = await call(env, "POST", "/task/need-human/" + thirdNeedHuman.id + "/resolve", {
+    ...write, body: { resolved_by: "ripple", target: "done", evidence_json: evidence },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "done");
+  result = await call(env, "GET", "/need-human?status=open", read);
+  assert.ok(!result.body.data.items.some((item) => item.id === needHuman.id));
+  assert.ok(!result.body.data.items.some((item) => item.id === secondNeedHuman.id));
+  assert.ok(!result.body.data.items.some((item) => item.id === thirdNeedHuman.id));
+  assert.ok(result.body.data.items.some((item) => item.id === notifyHuman.id && item.type === "notify"));
+  result = await call(env, "POST", "/task/need-human/" + notifyHuman.id + "/resolve", {
+    ...write, body: { resolved_by: "ripple", target: "done", evidence_json: evidence },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.type, "notify");
+
+  // blocked 任务可直接 PATCH open/in_progress/done；resolve target 负责显式流转。
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v2", title: "blocked reopen", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const blocked = result.body.data;
+  result = await call(env, "PATCH", "/task/" + blocked.id, {
+    ...write, body: { status: "blocked", blocked_reason: "等待涟漪决定", blocked_kind: blockedKind },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "blocked");
+  assert.equal(result.body.data.pending_status, null);
+  const nhBodies = ["补充业务背景", "确认是否继续"];
+  const nhIds = [];
+  for (const content of nhBodies) {
+    result = await call(env, "POST", "/task/" + blocked.id + "/need-human", { ...write, body: { content } });
+    assert.equal(result.status, 201);
+    nhIds.push(result.body.data.id);
+  }
+  result = await call(env, "POST", "/task/need-human/" + nhIds[0] + "/resolve", { ...write, body: { target: "blocked", blocked_kind: blockedKind } });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + blocked.id, read);
+  assert.equal(result.body.data.status, "blocked");
+  result = await call(env, "POST", "/task/need-human/" + nhIds[1] + "/resolve", { ...write, body: { resolved_by: "sagitta", target: "open" } });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + blocked.id, read);
+  assert.equal(result.body.data.status, "open");
+  assert.equal(result.body.data.blocked_reason, null);
+
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v2", title: "in progress need-human", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const progressing = result.body.data;
+  result = await call(env, "POST", "/task/" + progressing.id + "/need-human", { ...write, body: { content: "请补充一个参数" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, body: { target: "in_progress" } });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + progressing.id, read);
+  assert.equal(result.body.data.status, "in_progress");
+});
+
+test("v3 need-human resolve target supports four states and is free to another caller", async () => {
+  const { env } = taskEnv();
+  const write = { token: env.D1_WRITE_TOKEN };
+  const read = { token: env.D1_READ_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v3", title: "resolve targets", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "选择 open" } });
+  const openNeed = result.body.data;
+  result = await call(env, "POST", "/task/need-human/" + openNeed.id + "/resolve", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "resolved");
+  result = await call(env, "GET", "/task/" + task.id, read);
+  assert.equal(result.body.data.status, "open");
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "继续执行" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, ...agentB, body: { target: "in_progress" } });
+  assert.equal(result.status, 200);
+  result = await call(env, "GET", "/task/" + task.id, read);
+  assert.equal(result.body.data.status, "in_progress");
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "外部依赖阻塞" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, ...agentB, body: { target: "blocked", blocked_kind: blockedKind } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "blocked");
+  assert.equal(result.body.data.task.blocked_reason, "外部依赖阻塞");
+
+  result = await call(env, "POST", "/task/" + task.id + "/need-human", { ...write, body: { content: "最终收口" } });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", { ...write, ...agentB, body: { target: "done", evidence_json: evidence } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "done");
+  assert.match(result.body.data.task.done_at, /^20/);
+});
+
+test("notify resolve never changes task status, done_at, or claim", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "v3", title: "notify must be informational", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const progressing = result.body.data;
+  result = await call(env, "POST", "/task/" + progressing.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  result = await call(env, "POST", "/task/" + progressing.id + "/need-human", {
+    ...write, body: { type: "notify", content: "可安排验证" },
+  });
+  const progressingNotify = result.body.data;
+  result = await call(env, "POST", "/task/need-human/" + progressingNotify.id + "/resolve", {
+    ...write, ...agentB, body: {},
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.target, null);
+  assert.equal(result.body.data.task.status, "in_progress");
+  assert.equal(result.body.data.task.claim_state, "claimed");
+  result = await call(env, "GET", "/task/" + progressing.id, { ...read, ...agentA });
+  assert.equal(result.body.data.status, "in_progress");
+  assert.equal(result.body.data.claim_state, "mine");
+
+  result = await call(env, "PATCH", "/task/" + progressing.id, {
+    ...write, ...agentA, body: { status: "done", evidence_json: evidence },
+  });
+  assert.equal(result.status, 200);
+  const doneAt = result.body.data.done_at;
+  result = await call(env, "POST", "/task/" + progressing.id + "/need-human", {
+    ...write, body: { type: "notify", content: "终态通知" },
+  });
+  result = await call(env, "POST", "/task/need-human/" + result.body.data.id + "/resolve", {
+    ...write, body: {},
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.task.status, "done");
+  assert.equal(result.body.data.task.done_at, doneAt);
+});
+
+test("pending invariants, terminal create rejection, PATCH whitelist, and confirm idempotency", async () => {
+  const { env } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  for (const body of [
+    { project: "p", title: "bad", status: "done" },
+    { project: "p", title: "bad", status: "blocked" },
+    { project: "p", title: "bad", pending_status: "pending_done" },
+    { project: "p", title: "bad", done_at: "client" },
+  ]) {
+    const result = await call(env, "POST", "/task", { ...write, body });
+    assert.equal(result.status, 422);
+    assert.equal(result.body.error.code, "TASK_CREATE_TERMINAL_FORBIDDEN");
+    assert.ok(result.body.request_id);
+  }
+
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "direct done", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+  assert.equal(result.status, 201);
+
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "done", evidence_json: evidence } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
+  assert.match(result.body.data.done_at, /^20/);
+
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "round close confirm", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const roundTask = result.body.data;
+  result = await call(env, "POST", "/task/" + roundTask.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "legacy-pending", action: "done", progress: "完成", next: "等待确认", evidence_json: evidence, expected_updated_at: roundTask.updated_at },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "in_progress");
+  assert.equal(result.body.data.pending_status, "pending_done");
+  assert.equal(result.body.data.done_at, null);
+  const confirmationId = result.body.data.confirmation_id;
+  const pendingVersion = result.body.data.updated_at;
+  assert.match(confirmationId, /^cnf-/);
+
+  result = await call(env, "PATCH", "/task/" + roundTask.id, { ...write, body: { status: "open" } });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_PENDING_CONFLICT");
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { pending_status: null } });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "TASK_PATCH_FIELD_FORBIDDEN");
+
+  result = await call(env, "PATCH", "/task/" + roundTask.id, { ...write, body: { title: "still pending" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, "pending_done");
+  assert.equal(result.body.data.confirmation_id, confirmationId);
+
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: "stale", confirmation_id: confirmationId },
+  });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_VERSION_CONFLICT");
+
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_blocked", expected_updated_at: pendingVersion, confirmation_id: confirmationId },
+  });
+  assert.equal(result.status, 409);
+
+  const current = await call(env, "GET", "/task/" + roundTask.id, read);
+  const confirmExpected = current.body.data.updated_at;
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: confirmExpected, confirmation_id: confirmationId },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
+  assert.match(result.body.data.done_at, /^20/);
+
+  const acceptedVersion = result.body.data.updated_at;
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: confirmExpected, confirmation_id: confirmationId },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.idempotent, true);
+  result = await call(env, "POST", "/task/" + roundTask.id + "/confirm", {
+    ...write,
+    body: { decision: "reopen", expected_pending: "pending_done", expected_updated_at: acceptedVersion, confirmation_id: confirmationId },
+  });
+  assert.equal(result.status, 409, "same confirmation with different content must conflict");
+});
+
+test("blocked transitions, round-close atomic audit and idempotency", async () => {
+  const { env, database } = taskEnv();
+  const write = { token: env.D1_WRITE_TOKEN };
+  let result = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "blocked me", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  const task = result.body.data;
+
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "blocked" } });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "TASK_BLOCKED_REASON_REQUIRED");
+  result = await call(env, "PATCH", "/task/" + task.id, {
+    ...write, body: { status: "blocked", blocked_reason: "等待外部系统", blocked_kind: blockedKind },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, null);
+  assert.equal(result.body.data.status, "blocked");
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "open" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "open");
+  assert.equal(result.body.data.blocked_reason, null);
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, body: { status: "in_progress" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "in_progress");
+
+  const finalBlocked = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "accept blocked", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  result = await call(env, "PATCH", "/task/" + finalBlocked.body.data.id, {
+    ...write, body: { status: "blocked", blocked_reason: "等待涟漪确认", blocked_kind: blockedKind },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "blocked");
+  assert.equal(result.body.data.pending_status, null);
+  result = await call(env, "PATCH", "/task/" + finalBlocked.body.data.id, {
+    ...write, body: { status: "done", evidence_json: evidence },
+  });
+  assert.equal(result.status, 200, "blocked→done must be a direct terminal transition");
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
+
+  const roundBlocked = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "round blocked", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  result = await call(env, "POST", "/task/" + roundBlocked.body.data.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-blocked", action: "blocked", progress: "遇到阻塞", next: "等待确认", blocked_reason: "等待涟漪确认", blocked_kind: blockedKind, expected_updated_at: roundBlocked.body.data.updated_at },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, "pending_blocked");
+  result = await call(env, "POST", "/task/" + roundBlocked.body.data.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_blocked", expected_updated_at: result.body.data.updated_at, confirmation_id: result.body.data.confirmation_id },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "blocked");
+  assert.equal(result.body.data.blocked_reason, "等待涟漪确认");
+
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-1", action: "update", progress: "完成第一轮", next: "继续实现" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.idempotent, false);
+  const firstRoundVersion = result.body.data.updated_at;
+  assert.equal(result.body.data.body, "", "round-close must not overwrite tasks.body");
+  assert.equal(result.body.data.last_progress, "完成第一轮");
+  assert.equal(result.body.data.last_next, "继续实现");
+  const eventCount = () => database.prepare("SELECT COUNT(*) AS total FROM task_events WHERE task_id = ? AND event_type = 'round_close'").get(task.id).total;
+  assert.equal(eventCount(), 1);
+
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-1", action: "update", progress: "完成第一轮", next: "继续实现" },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.idempotent, true);
+  assert.equal(eventCount(), 1);
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-1", action: "update", progress: "不同内容", next: "继续实现" },
+  });
+  assert.equal(result.status, 409);
+
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-2", action: "done", progress: "完成", next: "等待确认", evidence_json: evidence, expected_updated_at: "stale" },
+  });
+  assert.equal(result.status, 409);
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-2", action: "done", progress: "完成", next: "等待确认", evidence_json: evidence, expected_updated_at: firstRoundVersion },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, "pending_done");
+  const doneRound = result.body.data;
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-2", action: "done", progress: "完成", next: "等待确认", evidence_json: evidence, expected_updated_at: firstRoundVersion },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.idempotent, true);
+  result = await call(env, "POST", "/task/" + task.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-3", action: "update", progress: "不应写入", next: "先确认" },
+  });
+  assert.equal(result.status, 409);
+  result = await call(env, "POST", "/task/" + task.id + "/confirm", {
+    ...write,
+    body: { decision: "accept", expected_pending: "pending_done", expected_updated_at: doneRound.updated_at, confirmation_id: doneRound.confirmation_id },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+
+  const open = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "bad close", acceptance: normalAcceptance, status: "open" },
+  });
+  result = await call(env, "POST", "/task/" + open.body.data.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-open", action: "update", progress: "x", next: "y" },
+  });
+  assert.equal(result.status, 422);
+  result = await call(env, "POST", "/task/" + open.body.data.id + "/round-close", {
+    ...write,
+    body: { agent_id: "agent-main", round_id: "round-open", action: "blocked", progress: "x", next: "y" },
+  });
+  assert.equal(result.status, 422);
+  assert.equal(result.body.error.code, "BLOCKED_REASON_REQUIRED");
+});
+
+test("task claim lifecycle: atomic claim, token privacy, PATCH guard, takeover after expiry, release, terminal release", async () => {
+  const { env, database } = taskEnv();
+  const read = { token: env.D1_READ_TOKEN };
+  const write = { token: env.D1_WRITE_TOKEN };
+
+  // 建一个 open 任务：claim_state=unclaimed，创建响应不下发 claim_token/owner_agent_id
+  let result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "claim me", acceptance: normalAcceptance } });
+  assert.equal(result.status, 201);
+  const task = result.body.data;
+  assert.equal(task.claim_state, "unclaimed");
+  assert.ok(!("owner_agent_id" in task), "owner_agent_id must never appear in responses");
+  assert.ok(!("claim_token" in task), "claim_token must not appear in create response");
+
+  // A 认领 open 任务 → in_progress + mine（对 A 的读取投影）+ token 唯一下发一次
+  result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.data.status, "in_progress");
+  assert.equal(result.body.data.claim_state, "mine");
+  assert.ok(typeof result.body.data.claim_token === "string" && result.body.data.claim_token.length > 0);
+  assert.match(result.body.data.claim_token, /^clm-/);
+  assert.ok(!("owner_agent_id" in result.body.data), "owner_agent_id must never appear in claim response");
+  const tokenA = result.body.data.claim_token;
+
+  // 同 owner 重启/丢失本地 token 后重复认领 → 续租恢复；B 仍受保护
+  for (const [who, expected] of [[agentA, 200], [agentB, 409]]) {
+    result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...who, body: {} });
+    assert.equal(result.status, expected);
+    if (expected === 409) assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
+  }
+
+  // claim_state 对调用方感知：A=mine，B/无头=claimed；owner_agent_id 永不下发
+  result = await call(env, "GET", "/task/" + task.id, { ...read, ...agentA });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+  assert.ok(!("owner_agent_id" in result.body.data));
+  result = await call(env, "GET", "/task/" + task.id, { ...read, ...agentB });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "claimed");
+
+  // claim_token 只在 claim 响应：列表/详情不下发；owner_agent_id 永不下发
+  result = await call(env, "GET", "/task/" + task.id, read);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "claimed");
+  assert.ok(!("claim_token" in result.body.data), "claim_token must not appear in detail response");
+  assert.ok(!("owner_agent_id" in result.body.data));
+  result = await call(env, "GET", "/task", read);
+  const item = result.body.data.items.find((i) => i.id === task.id);
+  assert.equal(item.claim_state, "claimed");
+  assert.ok(!("claim_token" in item), "claim_token must not appear in list response");
+  assert.ok(!("owner_agent_id" in item));
+  result = await call(env, "GET", "/task", { ...read, ...agentA });
+  const mineItem = result.body.data.items.find((i) => i.id === task.id);
+  assert.equal(mineItem.claim_state, "mine");
+  assert.ok(!("owner_agent_id" in mineItem));
+
+  // PATCH in_progress 防绕过认领：B 直接 PATCH → 409；owner A → 允许
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentB, body: { status: "in_progress" } });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentA, body: { status: "in_progress", title: "owner patch ok" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+
+  // 非 owner 即使带旧 token 也不能释放；owner 可无 token 释放
+  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, ...agentB, body: { claim_token: "clm-not-the-token" } });
+  assert.equal(result.status, 403);
+  assert.equal(result.body.error.code, "TASK_CLAIM_OWNER_MISMATCH");
+
+  // 正确 token 释放 → open + unclaimed + 可被 B 重新认领（token 更换）
+  result = await call(env, "POST", "/task/" + task.id + "/release", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "open");
+  assert.equal(result.body.data.claim_state, "unclaimed");
+  assert.ok(!("claim_token" in result.body.data));
+  result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+  const tokenB = result.body.data.claim_token;
+  assert.notEqual(tokenB, tokenA);
+
+  // 租约过期接管：把 claimed_at 拨回 25h 前（> 默认 24h 租约）→ 读取视为 unclaimed，可被 A 接管
+  database.prepare("UPDATE tasks SET claimed_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 25 * 3600 * 1000).toISOString(), task.id);
+  result = await call(env, "GET", "/task/" + task.id, read);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "unclaimed", "expired lease must read as unclaimed");
+  result = await call(env, "GET", "/task/" + task.id, { ...read, ...agentA });
+  assert.equal(result.body.data.claim_state, "unclaimed", "expired owner lease must not read as mine");
+  result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200, "expired claim can be taken over by another caller");
+  assert.equal(result.body.data.claim_state, "mine");
+  const tokenTakeover = result.body.data.claim_token;
+  assert.notEqual(tokenTakeover, tokenB, "takeover must issue a fresh token");
+
+  // 普通 PATCH done 直落终态并自动释放 owner；done 不可再认领
+  result = await call(env, "PATCH", "/task/" + task.id, { ...write, ...agentA, body: { status: "done", evidence_json: evidence } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.pending_status, null);
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.claim_state, "unclaimed", "PATCH 终态自动释放 owner");
+  result = await call(env, "POST", "/task/" + task.id + "/claim", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 409, "done 终态任务不可认领");
+  assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
+
+  // 存量 in_progress 无 owner → 视为未认领，可认领（task-ownership-p2 §7 旧数据）
+  result = await call(env, "POST", "/task", {
+    ...write, body: { project: "p", title: "legacy in_progress", acceptance: normalAcceptance, status: "in_progress" },
+  });
+  assert.equal(result.status, 201);
+  const legacyProgress = result.body.data;
+  assert.equal(legacyProgress.claim_state, "unclaimed");
+  result = await call(env, "POST", "/task/" + legacyProgress.id + "/claim", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+
+  // PATCH 到 waiting 自动释放 owner（waiting/blocked 不占用，设计 §7）；
+  // waiting 不在认领条件内（仅 open / in_progress 可认领）→ 409，回 open 后可认领
+  result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "waiting release", acceptance: normalAcceptance } });
+  const waitTask = result.body.data;
+  result = await call(env, "POST", "/task/" + waitTask.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+  result = await call(env, "PATCH", "/task/" + waitTask.id, { ...write, ...agentA, body: { status: "waiting" } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "waiting");
+  assert.equal(result.body.data.claim_state, "unclaimed", "PATCH 到 waiting 自动释放 owner");
+  assert.ok(!("claim_token" in result.body.data));
+  result = await call(env, "POST", "/task/" + waitTask.id + "/claim", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 409, "waiting 状态不在认领条件内");
+  result = await call(env, "PATCH", "/task/" + waitTask.id, { ...write, ...agentB, body: { status: "open" } });
+  assert.equal(result.status, 200);
+  result = await call(env, "POST", "/task/" + waitTask.id + "/claim", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 200, "waiting→open 后可被重新认领");
+  assert.equal(result.body.data.claim_state, "mine");
+
+  // 缺省调用方标识：不带 X-Agent-Id → 'unknown'，仍可认领
+  result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "no header claim", acceptance: normalAcceptance } });
+  const noHeaderTask = result.body.data;
+  result = await call(env, "POST", "/task/" + noHeaderTask.id + "/claim", { ...write, body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "claimed");
+  result = await call(env, "GET", "/task/" + noHeaderTask.id, read);
+  assert.ok(!("owner_agent_id" in result.body.data));
+
+  // lease_seconds 校验：非法值 422（非整数 / 0 / 超上限 604800）
+  result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "lease validation", acceptance: normalAcceptance } });
+  const leaseTask = result.body.data;
+  for (const bad of ["abc", 0, -1, 604801, 1.5]) {
+    result = await call(env, "POST", "/task/" + leaseTask.id + "/claim", { ...write, body: { lease_seconds: bad } });
+    assert.equal(result.status, 422, "lease_seconds=" + bad + " must be rejected");
+    assert.equal(result.body.error.code, "INVALID_LEASE_SECONDS");
+  }
+
+  // lease_seconds 持久化：claim 传 3600 → 行内 lease_seconds=3600（租约内），读取 claim_state=mine
+  result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "lease persist", acceptance: normalAcceptance } });
+  const persistTask = result.body.data;
+  result = await call(env, "POST", "/task/" + persistTask.id + "/claim", { ...write, ...agentA, body: { lease_seconds: 3600 } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+  let row = database.prepare("SELECT lease_seconds FROM tasks WHERE id = ?").get(persistTask.id);
+  assert.equal(row.lease_seconds, 3600, "claim 的 lease_seconds 必须持久化到行");
+  // 释放后 lease_seconds 一并清空
+  result = await call(env, "POST", "/task/" + persistTask.id + "/release", {
+    ...write, ...agentA, body: {},
+  });
+  assert.equal(result.status, 200);
+  row = database.prepare("SELECT lease_seconds, owner_agent_id, claimed_at, claim_token FROM tasks WHERE id = ?").get(persistTask.id);
+  assert.equal(row.lease_seconds, null, "release 必须清空 lease_seconds");
+  assert.equal(row.owner_agent_id, null);
+  assert.equal(row.claimed_at, null);
+  assert.equal(row.claim_token, null);
+
+  // 短租约任务：租约内他人不可认领（409），过期后（拨回 claimed_at 越过租约）可接管
+  result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "short lease takeover", acceptance: normalAcceptance } });
+  const shortTask = result.body.data;
+  result = await call(env, "POST", "/task/" + shortTask.id + "/claim", { ...write, ...agentA, body: { lease_seconds: 5 } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.claim_state, "mine");
+  const shortToken = result.body.data.claim_token;
+  row = database.prepare("SELECT lease_seconds FROM tasks WHERE id = ?").get(shortTask.id);
+  assert.equal(row.lease_seconds, 5);
+  // 租约内（5s 未过）：B 认领 → 409；读取仍 claimed
+  result = await call(env, "POST", "/task/" + shortTask.id + "/claim", { ...write, ...agentB, body: {} });
+  assert.equal(result.status, 409, "租约内（短租约未过期）他人不可认领");
+  assert.equal(result.body.error.code, "TASK_ALREADY_CLAIMED");
+  result = await call(env, "GET", "/task/" + shortTask.id, read);
+  assert.equal(result.body.data.claim_state, "claimed");
+  // 过期：claimed_at 拨回 10s 前（> 5s 租约）→ 读取 unclaimed，B 可接管（新 token）
+  database.prepare("UPDATE tasks SET claimed_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 10 * 1000).toISOString(), shortTask.id);
+  result = await call(env, "GET", "/task/" + shortTask.id, read);
+  assert.equal(result.body.data.claim_state, "unclaimed", "短租约过期后读取视为未认领");
+  result = await call(env, "GET", "/task/" + shortTask.id, { ...read, ...agentA });
+  assert.equal(result.body.data.claim_state, "unclaimed", "短租约过期后 owner 也不能读为 mine");
+  result = await call(env, "POST", "/task/" + shortTask.id + "/claim", { ...write, ...agentB, body: { lease_seconds: 3600 } });
+  assert.equal(result.status, 200, "短租约过期后可被他人接管");
+  assert.equal(result.body.data.claim_state, "mine");
+  assert.notEqual(result.body.data.claim_token, shortToken, "接管必须发放新 token");
+  row = database.prepare("SELECT lease_seconds, owner_agent_id FROM tasks WHERE id = ?").get(shortTask.id);
+  assert.equal(row.lease_seconds, 3600, "接管后按新调用方租约持久化");
+  // 普通 PATCH done 清空 lease_seconds，无 confirm
+  result = await call(env, "PATCH", "/task/" + shortTask.id, { ...write, ...agentB, body: { status: "done", evidence_json: evidence } });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "done");
+  assert.equal(result.body.data.pending_status, null);
+  row = database.prepare("SELECT lease_seconds, owner_agent_id, claim_token FROM tasks WHERE id = ?").get(shortTask.id);
+  assert.equal(row.lease_seconds, null, "终态确认必须清空 lease_seconds");
+  assert.equal(row.owner_agent_id, null);
+  assert.equal(row.claim_token, null);
+
+  // 未传 lease_seconds → 行内 NULL（用全局默认 24h），读取/接管按默认租约判定
+  result = await call(env, "POST", "/task", { ...write, body: { project: "p", title: "default lease null", acceptance: normalAcceptance } });
+  const defaultTask = result.body.data;
+  result = await call(env, "POST", "/task/" + defaultTask.id + "/claim", { ...write, ...agentA, body: {} });
+  assert.equal(result.status, 200);
+  row = database.prepare("SELECT lease_seconds FROM tasks WHERE id = ?").get(defaultTask.id);
+  assert.equal(row.lease_seconds, null, "未传 lease_seconds 时行内为 NULL（全局默认 24h）");
+});
