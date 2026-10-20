@@ -6,7 +6,7 @@
 
 ```sh
 npm install --global @deepseek-ai/dsh@0.2.1-rc.2
-dsh plugin --profile web add ./plugins/updater
+dsh plugin --profile web add file:./plugins/updater
 dsh web
 ```
 

@@ -14,5 +14,5 @@
   "exports": {
     "./memory": "./plugins/memory/index.js"
   },
-  "files": ["plugins/memory/index.js", "presets/sagitta.md", "sagitta.json"]
+  "files": ["plugins/memory/index.js", "plugins/memory/package.json", "presets/sagitta.md", "sagitta.json"]
 }
