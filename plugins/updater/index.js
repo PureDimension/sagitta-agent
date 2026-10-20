@@ -15,7 +15,7 @@ const repository = 'https://github.com/PureDimension/sagitta-agent.git';
 
 export default class Updater {
   static inject = ['agentPresets'];
-  static Config = z.object({ branch: z.string().default('main') });
+  static Config = z.object({ branch: z.string().default('stable') });
 
   constructor(ctx, config) {
     this.ctx = ctx;
