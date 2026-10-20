@@ -1,0 +1,19 @@
+{
+  "name": "@sagitta/updater",
+  "version": "0.1.0",
+  "private": true,
+  "description": "启动时更新 Sagitta，再注册其预设；Updater 自身手动安装。",
+  "type": "module",
+  "engines": { "dsh": "0.2.1-rc.2" },
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "cordis.patch.yml", "README.md"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "dependencies": { "js-yaml": "4.3.2", "@deepseek-ai/schemastery": "~3.18.5" },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/cordis-plugin-include": "~1.0.10",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-web-app": "0.2.1-rc.2"
+  }
+}
