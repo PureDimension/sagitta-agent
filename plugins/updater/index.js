@@ -33,7 +33,8 @@ export default class Updater {
         ...(proxy ? { https_proxy: proxy, http_proxy: proxy, npm_config_proxy: proxy, npm_config_https_proxy: proxy } : {}) };
       const run = async (command, args) => {
         try {
-          return (await exec(command, args, { cwd: directory, env, timeout: 120000,
+          const commandArgs = command === 'git' && proxy ? ['-c', `http.proxy=${proxy}`, ...args] : args;
+          return (await exec(command, commandArgs, { cwd: directory, env, timeout: 120000,
             maxBuffer: 1048576, windowsHide: true })).stdout.trim();
         } catch (error) {
           throw new Error(`${command} ${args[0]} failed (${error.code ?? error.signal}); check network/proxy or local checkout`);
