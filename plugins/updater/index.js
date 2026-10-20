@@ -66,7 +66,7 @@ export default class Updater {
       });
       ctx.logger.info('Sagitta prepared from GitHub commit %s', commit);
     } catch (error) {
-      ctx.logger.error('Sagitta startup failed: %s', error.message);
+      console.error('Sagitta startup failed: %s', error.message);
     }
   }
 }
