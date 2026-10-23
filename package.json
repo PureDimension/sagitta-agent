@@ -12,7 +12,19 @@
     "dsh": "0.2.1-rc.2"
   },
   "exports": {
-    "./memory": "./plugins/memory/index.js"
+    "./database": {
+      "types": "./shared/dist/database.d.ts",
+      "default": "./shared/dist/database.js"
+    },
+    "./memory": "./plugins/memory/dist/index.js"
   },
-  "files": ["plugins/memory/index.js", "plugins/memory/package.json", "presets/sagitta.md", "sagitta.json"]
+  "scripts": {
+    "build:shared": "tsc -p shared/tsconfig.json",
+    "build": "npm run build:shared && tsc -p plugins/memory/tsconfig.json && tsc -p plugins/task/tsconfig.json",
+    "check": "npm run build:shared && tsc -p plugins/memory/tsconfig.json --noEmit && tsc -p plugins/task/tsconfig.json --noEmit",
+    "test:database": "npm run build && node --test tests/database.test.js tests/task-repository.test.js"
+  },
+  "dependencies": { "pg": "8.23.1" },
+  "devDependencies": { "typescript": "5.9.3", "@types/node": "22.20.5", "@types/pg": "8.23.1" },
+  "files": ["shared/dist", "plugins/memory/dist", "plugins/memory/package.json", "plugins/task/dist", "plugins/task/migrations", "presets/sagitta.md", "sagitta.json"]
 }

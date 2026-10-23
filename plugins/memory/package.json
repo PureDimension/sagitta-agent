@@ -3,6 +3,6 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./index.js",
+  "exports": "./dist/index.js",
   "engines": { "dsh": "0.2.1-rc.2" }
 }
