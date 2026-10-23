@@ -1,0 +1,26 @@
+name: sagitta-hindsight-local
+
+services:
+  hindsight:
+    image: ghcr.nju.edu.cn/vectorize-io/hindsight:1.0.0@sha256:a88678c038b0e4340822b02a5efc566c56d8176b5bffa731bc433fd37f978e4c
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:9999:9999"
+    env_file:
+      - .env.local
+    environment:
+      HINDSIGHT_API_WORKER_ID: sagitta-hindsight-local
+      HINDSIGHT_CP_DATAPLANE_API_URL: http://127.0.0.1:8888
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    shm_size: 1gb
+    mem_limit: 3g
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hindsight-data:

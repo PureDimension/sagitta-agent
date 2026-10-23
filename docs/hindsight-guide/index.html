@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hindsight 1.0.0 中文界面对照手册</title>
+<style>
+:root{--ink:#263343;--muted:#607080;--line:#dce3e8;--blue:#225da7;--paper:#fff;--back:#f5f7fa}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:90px}body{margin:0;background:var(--back);color:var(--ink);font:16px/1.75 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}header{padding:30px 34px;background:#eaf1f9;border-bottom:1px solid var(--line)}header h1{margin:0 0 12px;font-size:29px;font-weight:700}header p{margin:8px 0;max-width:1050px}.meta{color:var(--muted);font-size:14px}.toolbar{position:sticky;top:0;z-index:10;background:rgba(245,247,250,.97);padding:12px 28px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}input{min-width:100px;max-width:680px;flex:1;padding:10px 12px;border:1px solid #acbdcf;border-radius:7px;font:inherit;background:white}button{padding:9px 12px;border:1px solid #b7c5d4;border-radius:7px;background:white;color:var(--ink);font:14px system-ui;cursor:pointer}button:hover{background:#eaf1f9}.layout{display:grid;grid-template-columns:250px minmax(0,1fr);max-width:1530px;margin:auto;gap:24px;padding:24px}aside{position:sticky;top:83px;max-height:calc(100vh - 108px);overflow:auto;font-size:14px;padding-right:12px;align-self:start}aside a{display:block;padding:5px 7px;border-left:2px solid transparent}aside a:hover{border-left-color:var(--blue);background:#eaf1f9;text-decoration:none}main{min-width:0}details.chapter{margin-bottom:15px;background:var(--paper);border:1px solid var(--line);border-radius:9px;overflow:hidden;scroll-margin-top:95px}summary{padding:17px 20px;cursor:pointer;font-size:20px;font-weight:650;background:#fff}details[open]>summary{border-bottom:1px solid var(--line)}.chapter-body{padding:0 18px 16px}.intro{color:#45596a;margin:15px 0}.source{font-size:13px;color:var(--muted);margin:16px 0 0}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:15px}th,td{border:1px solid var(--line);padding:12px 13px;text-align:left;vertical-align:top;overflow-wrap:anywhere}th{background:#f1f5fa;font-weight:650}th:nth-child(1){width:23%}th:nth-child(2){width:29%}th:nth-child(3){width:35%}th:nth-child(4){width:13%}td:nth-child(1){font-weight:600}td:nth-child(4){font-size:13px;color:#526678}tr:nth-child(even){background:#fbfcfe}code{font:13px/1.6 ui-monospace,SFMono-Regular,monospace;background:#edf2f7;padding:1px 3px;border-radius:3px}footer{max-width:1250px;margin:25px auto 50px;padding:0 25px;color:var(--muted);font-size:14px}.reading{padding:18px 20px;background:white;border:1px solid var(--line);border-radius:9px;margin-bottom:20px}.reading strong{color:#1d4e86}#count{font-size:13px;color:var(--muted);min-width:90px}tr[hidden],details[hidden]{display:none}@media(max-width:1000px){.layout{grid-template-columns:1fr;padding:14px}aside{position:static;max-height:230px;background:white;border:1px solid var(--line);padding:12px;border-radius:8px}.toolbar{padding:10px 12px;flex-wrap:wrap}header{padding:22px 18px}table{min-width:760px}summary{font-size:18px}#count{display:none}}@media print{body{background:white}.toolbar,aside{display:none}.layout{display:block;max-width:none;padding:0}header{padding:15px}details.chapter{break-inside:auto}summary{font-size:19px}.chapter-body{display:block!important}table{font-size:11px}tr{break-inside:avoid}footer{font-size:11px}}
+</style></head><body>
+<header><h1>Hindsight 1.0.0 中文界面对照手册</h1>
+<p>按顺序理解：<strong>关键词 → 每个页面 → 每项配置 → 运行时分工</strong>。用你正在看的界面名称搜索，可直接跳到对应解释。</p>
+<p class="meta">核对日期：2026-10-16 · 运行版本：1.0.0 · 29 章 · 401 个说明条目 · 51 项逐库配置完整覆盖</p>
+<p class="meta">依据：本机运行界面、运行 API、v1.0.0 标签的前端与配置源码。本文为说明文档，本次整理未调整演示库的配置、记忆或规则。</p></header>
+<div class="toolbar"><input id="search" type="search" aria-label="搜索手册" placeholder="搜索界面名或字段，例如：使命、范围、批大小、refresh、retain_mission"><button id="clear">清除</button><button id="expand">全部展开</button><button id="collapse">只看目录</button><span id="count"></span></div>
+<div class="layout"><aside aria-label="手册目录"><strong>阅读目录</strong>
+<a href="#terms">1. 先读：界面关键词</a>
+<a href="#map">2. 把对象串起来：一份材料会走到哪里</a>
+<a href="#global">3. 全局导航、所有记忆库与新建记忆库</a>
+<a href="#home">4. 首页</a>
+<a href="#memories">5. 记忆页面与记忆详情</a>
+<a href="#knowledge">6. 知识库 → 知识页</a>
+<a href="#models">7. 知识库 → 心智模型</a>
+<a href="#refresh-options">8. 页面与心智模型：全部刷新选项</a>
+<a href="#tags">9. 标签匹配与观察范围：同一个词出现在不同地方</a>
+<a href="#recall">10. Recall：所有输入与结果面板</a>
+<a href="#reflect">11. Reflect：所有输入与结果面板</a>
+<a href="#documents">12. 文档页面、详情及数据导入导出</a>
+<a href="#entities">13. 实体页面</a>
+<a href="#add-document">14. 添加文档：每项输入</a>
+<a href="#overview">15. 记忆库配置 → 概览、指令和后台操作</a>
+<a href="#config-basics">16. 配置页通用规则：先理解保存与继承</a>
+<a href="#config-retain">17. 配置 → Retain：每项含义</a>
+<a href="#config-labels">18. 配置 → 实体标签：展开后的每一项</a>
+<a href="#config-observations">19. 配置 → 观察：每项含义</a>
+<a href="#config-reflect">20. 配置 → 反思：每项含义</a>
+<a href="#config-rest">21. 配置 → 其余每项：页面、客户端、隐私、召回和模型</a>
+<a href="#defense">22. 记忆库配置 → 记忆防护</a>
+<a href="#webhooks">23. 记忆库配置 → Webhooks：每一项</a>
+<a href="#audit">24. 记忆库配置 → 审计日志</a>
+<a href="#llm">25. 记忆库配置 → LLM Requests</a>
+<a href="#all-fields">26. 附录：当前版本全部 51 项逐库配置</a>
+<a href="#service">27. 附录：当前本地服务配置与少量预览中的服务级字段</a>
+<a href="#examples">28. 四个实际阅读与维护例子</a>
+<a href="#sagitta">29. 与未来 sagitta-memory 的分工</a>
+</aside><main><div class="reading"><strong>建议先看前三章。</strong>随后打开与你当前页面对应的一章。表格最后一列是结合 Sagitta 的管理建议；它与 Hindsight 自带权限的范围分别说明。<br>本手册覆盖当前控制台页面与折叠表单，服务端数百个部署变量只列本次环境直接涉及的项目。技术字段完整名单见“51 项逐库配置”。</div>
+<details class="chapter" id="terms" open><summary>1. 先读：界面关键词</summary><div class="chapter-body"><p class="intro">以下词义以当前开源版 Hindsight 1.0.0 为准。全文用“归纳认识”解释 Observation，用“专题答案”解释 Mental Model。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>Control Plane / 控制台</td><td>供人查看、调试和管理记忆的网页。</td><td>你正在打开的 9999 端口。API、后台 worker 和数据库承担实际处理。</td><td>了解即可</td></tr>
+<tr class="item"><td>Bank / 记忆库</td><td>一套隔离的记忆空间，内部包含文档、事实、归纳认识、实体、页面和配置。</td><td>项目 A 和项目 B 使用不同 Bank 时，检索和整理分别在各自库内进行。</td><td>Agent 管普通库；默认库由我们保护</td></tr>
+<tr class="item"><td>Document / 文档</td><td>一次提交的来源材料，可是一段对话、一份文本或一个文件。</td><td>把一轮工作的记录作为一份文档；document_id 用来持续定位这份材料。</td><td>系统记录，Agent 可提交和维护</td></tr>
+<tr class="item"><td>Chunk / 分块</td><td>为处理长材料，将一份文档切出的片段。</td><td>分块大小常按字符计；原文档和提取事实仍有来源关联。</td><td>系统处理</td></tr>
+<tr class="item"><td>Memory / Fact / 记忆单元／事实</td><td>从材料中提取的一条可独立检索的信息。</td><td>“Lin 因回调故障推迟发布。”这里“事实”表示一种记录类型，其真实性仍取决于来源和提取。</td><td>Agent 可读取和纠正</td></tr>
+<tr class="item"><td>World / 世界事实</td><td>关于外部人物、项目、环境等的信息。</td><td>“用户说项目将在周五发布”属于外部信息；仍应保留“用户说”这个来源。</td><td>自动分类</td></tr>
+<tr class="item"><td>Experience / 经历</td><td>从记忆库所代表主体的视角记录其行动和交互。</td><td>“我安排了一个验证任务。”编码技巧、管理经验都可能出现在多种记忆类型里。</td><td>自动分类</td></tr>
+<tr class="item"><td>Observation / 观察／归纳认识</td><td>把相关事实综合后形成、可随新证据修订的认识。</td><td>若干次工作结果共同支持“该项目发布前应验证回调”；结论带有来源。</td><td>后台维护，Agent 使用</td></tr>
+<tr class="item"><td>Consolidation / 整合／整理</td><td>把事实与已有归纳认识对照，创建、修订或移除归纳认识的过程。</td><td>新事实写入以后可以自动排队整理。</td><td>系统自动</td></tr>
+<tr class="item"><td>Mental Model / 心智模型／专题答案</td><td>围绕一个固定问题生成并保存的答案。</td><td>问题是“团队如何交接工作？”；保存一份可刷新答案。这里指内容对象。</td><td>Agent 维护问题与范围</td></tr>
+<tr class="item"><td>Knowledge Page / 知识页</td><td>带目录位置的专题答案，正文通常是 Markdown 文档。</td><td>“项目交接手册”页面，按设定问题从库中记忆持续生成。</td><td>Agent 维护主题、依据和刷新</td></tr>
+<tr class="item"><td>Source Query / 源查询</td><td>生成或刷新专题答案时要回答的问题。</td><td>“目前已确认哪些发布约定？说明适用范围和例外。”它决定页面讨论什么。</td><td>Agent 可维护</td></tr>
+<tr class="item"><td>Retain / 保留／写入</td><td>接收材料，进行提取、存储、建立检索数据。</td><td>点击添加文档或调用写入 API 都会进入这类流程。</td><td>系统自动记录＋Agent 主动写入</td></tr>
+<tr class="item"><td>Recall / 召回</td><td>寻找与问题相关的记忆，返回材料供调用方使用。</td><td>“找出上次发布失败的原因。”主要返回记忆和来源。</td><td>Agent 与自动 hook 使用</td></tr>
+<tr class="item"><td>Reflect / 反思／分析</td><td>Hindsight 内部模型边查询记忆边分析，再生成回答。</td><td>“根据过去几次交付，下一次应该注意什么？”它会调用模型，产生耗时和费用。</td><td>Agent 按需使用</td></tr>
+<tr class="item"><td>Entity / 实体</td><td>材料中提到的人、项目、工具、地点或概念。</td><td>“Lin”“Bluebird”“登录回调”。共同实体有助于关联记忆。</td><td>系统提取</td></tr>
+<tr class="item"><td>Graph / 图谱／关系图</td><td>记忆及其实体、语义、时间、因果关联构成的检索结构。</td><td>从“延期”关联到“回调故障”；星座布局是这部分数据的可视化。</td><td>系统维护</td></tr>
+<tr class="item"><td>Tag / 标签</td><td>附在记忆上的字符串，可用于筛选。</td><td>project:bluebird、kind:decision。标签名称及其一致性由使用方维护。</td><td>插件统一，必要时 Agent 选择</td></tr>
+<tr class="item"><td>Entity Label / 实体标签</td><td>让提取器按预设字段识别分类值。</td><td>规定 stage 只能取 planning / testing / released；识别结果可额外保存为普通标签。</td><td>我们配置词表</td></tr>
+<tr class="item"><td>Scope / 范围</td><td>在这里常指一组标签共同确定的 observation 整理分区。</td><td>同一 Bank 内 [project:A] 和 [project:A,session:1] 是不同的范围。</td><td>插件统一</td></tr>
+<tr class="item"><td>Shared / Global / 共享／全局</td><td>在 observation 范围语境中，表示同一 Bank 内的无标签范围。</td><td>共享范围可将来自不同会话标签的事实放到一起归纳。跨 Bank 的经验转移另由使用方调度。</td><td>插件配置</td></tr>
+<tr class="item"><td>Metadata / 元数据</td><td>记录来源、标识等附加键值信息。</td><td>source: task-123。一般记忆筛选主要通过 tags；metadata 不自动等价于标签过滤。</td><td>插件自动补充</td></tr>
+<tr class="item"><td>Context / 上下文</td><td>一段材料发生的背景说明。</td><td>“这是一次失败发布后的复盘。”它和模型本轮上下文窗口是两个不同位置的内容。</td><td>写入时可选</td></tr>
+<tr class="item"><td>Mission / 使命</td><td>对某个后台操作的自然语言指导。</td><td>提取使命、整理使命、Reflect 使命分别作用于三个环节；后文分别解释。</td><td>我们审查和配置</td></tr>
+<tr class="item"><td>Directive / 指令</td><td>在 Hindsight 的 Reflect 提示中应用的规则。</td><td>“区分明确要求和推测”。主 Agent 的授权检查由 Sagitta 执行层实施。</td><td>我们管理</td></tr>
+<tr class="item"><td>Strategy / 策略</td><td>预先命名的一套局部处理配置。</td><td>写入策略控制如何提取；整合策略控制匹配范围如何归纳。</td><td>我们定义，Agent 按需要选择</td></tr>
+<tr class="item"><td>Trigger / 触发器</td><td>规定什么时候执行一次页面或专题答案刷新。</td><td>整理后刷新、按 cron 刷新、手动刷新。</td><td>系统策略，Agent 可申请刷新</td></tr>
+<tr class="item"><td>Cron / 定时表达式</td><td>用“分 时 日 月 周”五个位置描述计划。</td><td>0 3 * * * 是每天 UTC 03:00，也就是北京时间 11:00。</td><td>我们配置或批准预设</td></tr>
+<tr class="item"><td>Budget / 预算</td><td>本次检索或分析允许投入多大工作量。</td><td>Recall 的高预算探索更多候选；Reflect 的高预算允许更多分析步骤。</td><td>Agent 在上限内选择</td></tr>
+<tr class="item"><td>Token / 令牌</td><td>模型计算输入输出长度的单位。</td><td>与汉字数、字符数没有固定一对一关系。分块大小 3000 指字符，max_tokens 指令牌。</td><td>系统预算</td></tr>
+<tr class="item"><td>Embedding / 向量</td><td>把文本转成数字表示，用于寻找含义相近的内容。</td><td>提问措辞与原文不完全相同时，向量检索可能仍能找到原文。</td><td>我们配置模型</td></tr>
+<tr class="item"><td>Reranker / 重排序器</td><td>对已找到的候选，再判断它们与当前问题的相关程度。</td><td>将多个检索分支合并的候选重新排序。结果仍受模型能力影响。</td><td>我们配置</td></tr>
+<tr class="item"><td>RRF / 排名融合</td><td>按各检索分支中的排名合并候选的一种方法。</td><td>某条记忆同时被多个分支排在前面，就可能获得更高融合分。</td><td>系统处理</td></tr>
+<tr class="item"><td>Proof Count / 证据数量</td><td>归纳认识背后关联了多少来源事实。</td><td>重复记录可能并不独立；这个数量本身不能验证结论，也不等于经验成效评分。</td><td>查看依据时参考</td></tr>
+<tr class="item"><td>Score / 分数</td><td>当前查询下的排序信号。</td><td>Recall 的相关性分数用来排候选；不能当成事实为真的概率。</td><td>诊断使用</td></tr>
+<tr class="item"><td>Fresh / Stale / 已同步／已过期</td><td>根据范围内记忆写入与页面读取进度判断是否有待处理更新。</td><td>已同步表示跟上了系统记录的更新进度；内容准确性仍需看证据。</td><td>系统状态</td></tr>
+<tr class="item"><td>Operation / 后台操作</td><td>一次可查询进度的任务。</td><td>写入、整理、刷新页面、导入等可能分别产生任务。</td><td>系统跟踪</td></tr>
+<tr class="item"><td>Trace / 追踪</td><td>某次检索、分析或刷新怎样得出结果的记录。</td><td>看它查了什么、用了哪些材料、消耗多少 token。</td><td>诊断使用</td></tr>
+<tr class="item"><td>Webhook / 事件通知</td><td>指定事件发生后，服务向一个地址发送通知。</td><td>写入完成、整理完成；自动注入仍由 Sagitta 的 hook 决定。</td><td>系统接入</td></tr>
+<tr class="item"><td>MCP / 工具协议</td><td>Agent 连接外部工具的一种协议入口。</td><td>Hindsight 也有 HTTP API；MCP 工具白名单只约束 MCP 入口。</td><td>接入层维护</td></tr>
+<tr class="item"><td>Override / Inherited / 覆盖／继承</td><td>当前库单独设置一个值，或继续使用上级默认值。</td><td>恢复继承会清除局部覆盖；其结果可能是启用，也可能是禁用。</td><td>我们配置</td></tr>
+<tr class="item"><td>BM25／全文搜索</td><td>利用词项匹配寻找文本的检索分支。</td><td>当前本地 native 后端使用 PostgreSQL 全文能力；UI 有时以 BM25 泛称该分支。</td><td>了解即可</td></tr>
+<tr class="item"><td>JSON／JSON Schema</td><td>JSON 是键值和列表构成的数据格式；Schema 描述允许的字段与类型。</td><td>结构化输出模式可要求一个对象包含“结论”和“依据”字段。</td><td>开发配置</td></tr>
+<tr class="item"><td>Upsert／重新摄入</td><td>同一 ID 已存在时更新，否则新增。</td><td>重写相同 document_id 会按写入模式处理原有材料。</td><td>来源管理</td></tr>
+<tr class="item"><td>VLM／视觉模型</td><td>能够读取图片等视觉输入的模型。</td><td>文字模型和文件文字解析器并不自动获得视觉理解能力。</td><td>我们配置</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://hindsight.vectorize.io/faq" target="_blank" rel="noopener">官方说明</a></p>
+</div></details>
+<details class="chapter" id="map"><summary>2. 把对象串起来：一份材料会走到哪里</summary><div class="chapter-body"><p class="intro">一份来源材料进入某个 Bank，分块并提取事实；事实之间建立关联，后台归纳 observation；预先设置问题的专题答案和页面再从这些知识中生成。图结构横跨可检索记忆。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>文档 → 分块 → 事实</td><td>保留材料与从中提取的信息之间的来源关系。</td><td>一段对话可能提取多条事实；一次写入成功也可能提取出零条事实。</td><td>自动执行</td></tr>
+<tr class="item"><td>事实 → Observation</td><td>积累支持、反对或补充材料，增量修订认识。</td><td>新认识能被召回，也可以用于页面整理。</td><td>自动执行</td></tr>
+<tr class="item"><td>Observation → 知识页</td><td>由源查询决定主题，将相关认识整理为可阅读文档。</td><td>默认知识页只读 observation，采用增量刷新，并排除其他专题答案。</td><td>自动执行；主题由使用方设置</td></tr>
+<tr class="item"><td>Graph 与各层关系</td><td>关联可以帮助检索找到相邻的记忆和相关证据。</td><td>关系由提取与相似度等过程建立，需要保留对来源可靠性的判断。</td><td>自动维护</td></tr>
+<tr class="item"><td>Bank 与以上对象</td><td>上述内容全部处在所属 Bank 的边界内。</td><td>“主库＋项目库”联合召回由未来 sagitta-memory 分别查询后组合。</td><td>插件与 Agent 管路由</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://hindsight.vectorize.io/faq" target="_blank" rel="noopener">官方说明</a></p>
+</div></details>
+<details class="chapter" id="global"><summary>3. 全局导航、所有记忆库与新建记忆库</summary><div class="chapter-body"><p class="intro">顶部选择的是当前操作目标；切换 Bank 后，本次网页检索、配置和文档管理都作用于所选库。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>所有记忆库／顶部选择器</td><td>查看库列表，或切换当前库。</td><td>列表中的记忆数量是数据规模，不代表记忆能力或成熟度。</td><td>Agent 可管理普通库</td></tr>
+<tr class="item"><td>搜索记忆库</td><td>按库标识或名称定位库。</td><td>用于库越来越多时找到项目库。</td><td>日常使用</td></tr>
+<tr class="item"><td>库名称、ID、最近活动、创建时间</td><td>名称供人辨认，ID 供 API 稳定定位；两种时间分别表示活动和建立时间。</td><td>改显示名称与修改底层 ID 是不同操作。</td><td>Agent 可命名与描述普通库</td></tr>
+<tr class="item"><td>复选框／批量删除</td><td>选择多个库后执行批量操作。</td><td>删除 Bank 会移除该库数据，属于管理操作。</td><td>人工管理</td></tr>
+<tr class="item"><td>创建新记忆库</td><td>填库 ID 和显示名称，建立隔离空间。</td><td>项目 ID 应稳定，跨会话继续用同一项目库。</td><td>Agent 在既定模板下创建</td></tr>
+<tr class="item"><td>从模板导入／模板清单</td><td>以 JSON 应用 Bank 配置、专题答案和指令等初始设置。</td><td>导入的是配置模板；完整历史数据有单独的导入导出入口。</td><td>我们维护模板</td></tr>
+<tr class="item"><td>添加文档</td><td>向当前 Bank 提交文本、文件或组合内容。</td><td>完整字段见“添加文档”章节。</td><td>Agent 可写入</td></tr>
+<tr class="item"><td>展开侧边栏、深浅色、切换语言、GitHub</td><td>导航显示、界面外观、显示语言和上游源码入口。</td><td>切换 UI 中文只改变界面文字，embedding/reranker 模型另行配置。</td><td>界面偏好</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/banks-overview.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="home"><summary>4. 首页</summary><div class="chapter-body"><p class="intro">首页主要展示状态与入口。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>记忆星座图</td><td>将一部分记忆节点及关联画成星座；可缩放、平移、悬停、点击。</td><td>首页有显示数量上限；完整检查进入“记忆”。节点布局、亮度和连线密度用于观察结构。</td><td>查看即可</td></tr>
+<tr class="item"><td>查看全部</td><td>跳到相应完整列表。</td><td>星座图旁的查看全部进入记忆页；知识页和文档各有自己的入口。</td><td>导航</td></tr>
+<tr class="item"><td>暂停、全屏、分享</td><td>控制图的动画、显示方式，或导出 SVG 图像。</td><td>图像导出保存的是可视化，不等同于导出数据库。</td><td>查看即可</td></tr>
+<tr class="item"><td>知识页、最近文档</td><td>最近维护的生成页面、最近写入的来源材料。</td><td>页面和原始文档分别展示。</td><td>查看即可</td></tr>
+<tr class="item"><td>记忆、文档、链接数量</td><td>记录个数、来源材料个数、关联规模。</td><td>数量增长能反映数据进入系统，质量应通过具体召回和依据判断。</td><td>查看即可</td></tr>
+<tr class="item"><td>记忆构成／链接类型</td><td>按世界、经历、观察分类记忆；按时间、语义、实体、因果分类关系。</td><td>分类占比展示现状，没有必须达到的理想比例。</td><td>查看即可</td></tr>
+<tr class="item"><td>1h—90d；摄入／提及／发生时间</td><td>按观察窗口和选定时间字段看记录分布。</td><td>摄入是何时进库；提及是何时被说起；发生是事情本身何时发生。</td><td>查看即可</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/home-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="memories"><summary>5. 记忆页面与记忆详情</summary><div class="chapter-body"><p class="intro">这是检查“系统到底记住了什么”的主要入口；页面中的筛选和 Recall 的相关性检索用途不同。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>世界／经历／观察</td><td>切换要查看的记忆类型。</td><td>检查提取错误看世界／经历；检查总结是否跑偏看观察。</td><td>日常检查</td></tr>
+<tr class="item"><td>文本筛选、标签筛选</td><td>按已存文本或标签缩小列表。</td><td>用于查全某一标签下的条目；与一句问题的语义召回不同。</td><td>日常使用</td></tr>
+<tr class="item"><td>有效／已失效</td><td>查看当前参与召回的记录，或审计归档中的失效记录。</td><td>已失效仍保留，可恢复。</td><td>Agent 可申请纠正</td></tr>
+<tr class="item"><td>表格、时间线、星座视图</td><td>同一批数据的三种展示。</td><td>表格看字段；时间线看事件顺序；星座看关联。缺少事件时间的记忆可能只在表格可见。</td><td>查看即可</td></tr>
+<tr class="item"><td>观察范围、按范围分组</td><td>查看 observation 属于哪个标签组合。</td><td>可判断是否因会话标签过细而产生许多相似但隔离的总结。</td><td>插件配置；人工检查</td></tr>
+<tr class="item"><td>正文、上下文、实体、标签、元数据</td><td>分别展示记住的内容、材料背景、涉及对象、筛选标签和附加来源信息。</td><td>正文可能是从原文改写出的提取结果。</td><td>Agent 读取</td></tr>
+<tr class="item"><td>发生时间、提及时间、创建时间</td><td>分别是事件日期、记录中提到该信息的时间、写入数据库的时间。</td><td>排查“过去说的”“现在有效的”时，要看时间字段及正文条件。</td><td>Agent 读取</td></tr>
+<tr class="item"><td>源记忆／证据数量</td><td>归纳认识背后的事实及其数量。</td><td>点查看向下追溯；核对不同来源是否实际独立。</td><td>Agent 与人工核对</td></tr>
+<tr class="item"><td>分块／文档</td><td>打开提取这一事实时的原始片段或完整材料。</td><td>用于发现提取遗漏上下文、条件、否定等情况。</td><td>Agent 按需展开</td></tr>
+<tr class="item"><td>历史</td><td>观察内容历次归纳更新的记录。</td><td>展示派生认识如何变；单条事实的完整版本保留能力应按具体接口判断。</td><td>诊断使用</td></tr>
+<tr class="item"><td>创建来源／整合来源</td><td>跳到产生这条记录的模型调用信息。</td><td>用于看提取或整理环节使用了什么材料。</td><td>诊断使用</td></tr>
+<tr class="item"><td>整理 → 编辑</td><td>纠正原始事实文字、上下文、类型、发生起止日期、实体等。</td><td>会更新相关索引，并使受影响的派生 observation 重新整理；原始文档保留原样。</td><td>Agent 可维护事实</td></tr>
+<tr class="item"><td>整理 → 失效／恢复／原因</td><td>将错误或不再适用的事实移出当前召回，保留原因；需要时恢复。</td><td>重新提取原文会重新产生事实，可能覆盖事实层的人工修订；应同时判断是否需要修正文档。</td><td>Agent 可维护，审计记录由系统保留</td></tr>
+<tr class="item"><td>归纳认识的纠正</td><td>先检查支持事实，纠正错误来源，再申请重新整理。</td><td>观察作为派生结果，普通事实编辑接口只支持 world / experience。</td><td>Agent 按来源维护</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/data-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="knowledge"><summary>6. 知识库 → 知识页</summary><div class="chapter-body"><p class="intro">这里的“知识库”是一个 Bank 内的页面目录；另一个 Bank 是另一套独立记忆空间。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>知识页／心智模型两个标签页</td><td>前者按文件夹组织文档，后者管理独立专题答案。</td><td>知识页底层也对应一个心智模型，所以同一底层对象可能在相关管理视图出现。</td><td>日常使用</td></tr>
+<tr class="item"><td>新建文件夹、名称、父级文件夹</td><td>组织页面目录。</td><td>“管理经验／发布经验”只是文档位置；文件夹本身不决定源记忆筛选范围。</td><td>Agent 管理</td></tr>
+<tr class="item"><td>新建知识页、名称、源查询</td><td>设定一个持续整理的问题，创建生成页面。</td><td>“项目目前有哪些未决问题？区分用户确认与推测。”</td><td>Agent 管理</td></tr>
+<tr class="item"><td>搜索与标签筛选</td><td>定位生成的页面；可按已有标签筛选。</td><td>这是页面搜索入口；事实召回另在 Recall。</td><td>Agent 使用</td></tr>
+<tr class="item"><td>目录／图视图、共享标签关联</td><td>目录按文件夹展示；图按页面共享标签关联展示。</td><td>页面标签也可能限定其读取的记忆；单纯为了好看而随意加标签可能把来源筛空。</td><td>理解后使用</td></tr>
+<tr class="item"><td>正文与自动维护标记</td><td>正文由生成流程维护；标记表示采用相应的自动维护方式。</td><td>要看是否已过期或刷新失败，另检查状态。</td><td>Agent 阅读</td></tr>
+<tr class="item"><td>页面生成依据与源查询</td><td>查看整理时回答的问题，以及相关来源和底层模型信息。</td><td>用于判断页面为什么写成这样。</td><td>Agent 核对</td></tr>
+<tr class="item"><td>编辑</td><td>修改页面名称、源查询、位置等定义。</td><td>界面维护的是页面定义，正文随后按这些定义重新生成。</td><td>Agent 管理</td></tr>
+<tr class="item"><td>心智模型选项</td><td>打开这篇页面的刷新、范围、预算等设置。</td><td>完整解释见“页面与心智模型全部选项”。</td><td>Agent 用预设；我们管上限</td></tr>
+<tr class="item"><td>手动刷新、状态、刷新诊断</td><td>申请重建内容，查看刷新是否完成及使用了哪些依据。</td><td>任务受理、正文生成完成和已追上全部新资料是不同状态。</td><td>Agent 申请；系统运行</td></tr>
+<tr class="item"><td>删除页面／文件夹</td><td>移除对应页面对象或目录树节点。</td><td>删除前看确认范围；与删除来源记忆分开。</td><td>人工或限定管理能力</td></tr>
+<tr class="item"><td>导出知识包</td><td>导出页面目录与生成内容。</td><td>便于阅读、迁移整理文档；完整记忆数据迁移另有导出入口。</td><td>人工管理</td></tr>
+<tr class="item"><td>高级搜索：搜索／树、查询、上限、JSON</td><td>调试页面检索与目录 API，查看服务器原始结果。</td><td>是开发调试入口，普通使用可走页面搜索。</td><td>调试使用</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/knowledge-base-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="models"><summary>7. 知识库 → 心智模型</summary><div class="chapter-body"><p class="intro">普通心智模型默认按需刷新、完整生成；知识页有更偏文档维护的默认值。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>列表／表格／详情</td><td>按名称、ID、源查询、刷新时间等查看保存的专题答案。</td><td>一个模型可以回答“我与用户目前的协作约定是什么”。</td><td>Agent 管理</td></tr>
+<tr class="item"><td>添加、名称、可选 ID、源查询、最大令牌数</td><td>定义专题答案的身份、问题和内容长度。</td><td>最大令牌数是生成内容的预算；源查询决定主题。</td><td>Agent 在预算范围内管理</td></tr>
+<tr class="item"><td>选项</td><td>规定何时刷新、怎么改写、读取哪些材料和高级预算。</td><td>完整字段见下一章。</td><td>Agent 使用受控预设</td></tr>
+<tr class="item"><td>手动刷新</td><td>提交一次生成任务。</td><td>对有内容的模型按 full / delta 设置刷新；首次或源查询改变时可完整生成。</td><td>Agent 可申请</td></tr>
+<tr class="item"><td>已读至、最近刷新、下次刷新、已过期</td><td>分别表示已纳入资料的时间位置、生成时间、下一触发时机和是否有更新待处理。</td><td>刚刷新过的页面也可能因随后写入而变为过期。</td><td>系统状态</td></tr>
+<tr class="item"><td>刷新失败后已暂停／重试中</td><td>后台可能先重试；最终失败后自动刷新可暂停，成功的手动刷新可恢复。</td><td>应查看任务和失败原因，避免一直使用旧内容。</td><td>系统监控；Agent 可反馈</td></tr>
+<tr class="item"><td>清除内容</td><td>保留对象定义，移除已生成正文，下一次刷新从头生成。</td><td>用于重新合成专题答案；来源事实另行保存。</td><td>管理与修复</td></tr>
+<tr class="item"><td>删除模型</td><td>移除定义和保存的专题答案。</td><td>知识页关联的模型应连同目录关系在相应页面入口管理。</td><td>限定管理</td></tr>
+<tr class="item"><td>详情中的配置、历史、来源、追踪</td><td>查看设置、生成依据与版本演变。</td><td>追踪是否保留受开关和保留策略影响。</td><td>诊断使用</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/mental-models-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="refresh-options"><summary>8. 页面与心智模型：全部刷新选项</summary><div class="chapter-body"><p class="intro">这套表单既用于单个专题答案，也用于 Bank 的“新知识页默认设置”。页面级设置作用于该页面；Bank 默认设置主要给之后新建的页面提供初始值。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>名称／ID／源查询</td><td>定义对象身份与生成问题。</td><td>源查询改变后，下一次生成可能完整重建。</td><td>Agent 维护主题</td></tr>
+<tr class="item"><td>最大令牌数</td><td>限制生成正文的内容预算。</td><td>与本次检索读多少资料分开；正文太短可能省略重要条件。</td><td>Agent 在上限内选择</td></tr>
+<tr class="item"><td>何时刷新：有新记忆时</td><td>在相关 observation 整理之后触发自动刷新。</td><td>有新资料进入该范围才推动更新；服务和 worker 要处于运行状态。</td><td>系统策略</td></tr>
+<tr class="item"><td>何时刷新：按计划</td><td>按 cron 检查并刷新过期内容。</td><td>通常没有相关变化会跳过生成；按计划和整理后自动触发是两个替代选项。</td><td>系统策略</td></tr>
+<tr class="item"><td>何时刷新：仅手动</td><td>通过界面或 API 主动要求时刷新。</td><td>适合低频使用、需要精确控制开销的专题。</td><td>Agent 按需申请</td></tr>
+<tr class="item"><td>Cron 表达式与预设</td><td>每小时、每天、每周等计划，使用 UTC。</td><td>0 3 * * * 对应北京时间每天 11:00；界面可预览后续触发时间。</td><td>我们设置</td></tr>
+<tr class="item"><td>最小刷新间隔（秒）</td><td>两次自动刷新至少隔多久；窗口内多次触发合并成一次待执行任务。</td><td>留空继承；0 表示无间隔下限；显式手动刷新可立即运行。</td><td>我们定预算</td></tr>
+<tr class="item"><td>如何重写：增量 delta</td><td>在已有正文上做局部更新，尽量保留未变化部分。</td><td>首次生成或源查询改变时可能转为完整生成。</td><td>通常先用页面默认值</td></tr>
+<tr class="item"><td>如何重写：完全重写 full</td><td>每次从检索到的材料重新生成全文。</td><td>有利于重新组织，但文字和结构可能发生更大变化。</td><td>依用途选择</td></tr>
+<tr class="item"><td>读取什么：事实类型</td><td>选择世界事实、经历、归纳认识中的哪些作为来源。</td><td>普通模型默认可读全部；知识页默认读 observation。</td><td>Agent 用预设</td></tr>
+<tr class="item"><td>标签</td><td>限定本专题覆盖的记忆来源，并影响其在 Reflect 中的可见范围。</td><td>给页面新增一个源材料没有的标签，可能导致生成“没有资料”。</td><td>插件统一标签，Agent 可选已有值</td></tr>
+<tr class="item"><td>标签匹配</td><td>决定任意、全部、严格或完全匹配，详见标签章节。</td><td>页面有标签时默认采用 all_strict；不同入口默认值可能不同。</td><td>插件给出预设</td></tr>
+<tr class="item"><td>排除所有心智模型</td><td>刷新时只从事实／归纳认识获取依据，跳过其他生成答案和页面。</td><td>有助于减少生成摘要互相引用形成循环支持。知识页默认启用。</td><td>通常保留知识页默认值</td></tr>
+<tr class="item"><td>高级：排除心智模型 ID</td><td>只跳过指定的生成答案。</td><td>适用于允许引用部分专题、排除某份有问题的旧总结。</td><td>高级维护</td></tr>
+<tr class="item"><td>高级：包含分块</td><td>检索时把原始片段一起提供给刷新流程。</td><td>可看到更多上下文，同时增加输入长度。留空继承。</td><td>按材料需要设置</td></tr>
+<tr class="item"><td>高级：召回最大 token 数</td><td>刷新内部召回返回的事实材料预算。</td><td>调大能带入更多候选材料，也增加模型输入成本。</td><td>我们定上限</td></tr>
+<tr class="item"><td>高级：召回分块最大 token 数</td><td>给原始片段的独立长度预算。</td><td>在需要核对原文时使用，和事实预算分别设置。</td><td>我们定上限</td></tr>
+<tr class="item"><td>高级：观察最大令牌数</td><td>刷新分析时，一次观察检索允许带入的文字预算。</td><td>越小越省上下文，也可能缺少相关认识。</td><td>我们定预算</td></tr>
+<tr class="item"><td>高级：观察实体</td><td>是否附上 observation 关联的规范实体名称。</td><td>能帮助识别别名所指对象，但增加上下文占用。</td><td>按实测设置</td></tr>
+<tr class="item"><td>高级：刷新预算 low / mid / high</td><td>控制本次生成允许的检索分析步数。</td><td>当前实现按服务迭代上限缩放：低约减半、中保持、高约加倍；实际调用可提前结束。</td><td>Agent 在上限内选择</td></tr>
+<tr class="item"><td>高级：标签组 JSON</td><td>用 and / or / not 等组合更复杂的筛选条件。</td><td>适合“项目 A 且（决策或结果）”。有复合表达式时按该表达式限定来源。</td><td>插件生成，普通 AI 使用简化条件</td></tr>
+<tr class="item"><td>高级：结构化输出模式</td><td>要求额外返回满足指定 JSON 结构的结果。</td><td>如列出 decision、evidence、open_questions；适合程序读取。</td><td>我们定义结构</td></tr>
+<tr class="item"><td>高级：保留刷新追踪</td><td>保存最近一次刷新怎样检索和修改的诊断信息。</td><td>有助于检查后台整理；不是无限期保留全部模型对话。</td><td>调试时启用</td></tr>
+<tr class="item"><td>构建模式：可视化／代码</td><td>用字段编辑器或 JSON Schema 定义输出结构。</td><td>字段名、说明、类型、必填；对象可嵌套，数组需定义元素。复杂结构用代码模式。</td><td>接口设计与调试</td></tr>
+<tr class="item"><td>取消、应用、保存、恢复继承</td><td>取消放弃本次表单；应用把结构填回上层；保存向服务提交；恢复继承清除局部设置。</td><td>部分对话框有独立保存按钮，应以具体界面状态判断是否已写入。</td><td>人工使用</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/mental-model-trigger-fields.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="tags"><summary>9. 标签匹配与观察范围：同一个词出现在不同地方</summary><div class="chapter-body"><p class="intro">标签筛选决定“查哪些记录”；observation_scopes 决定“哪些记录放在一起形成归纳认识”。它们都使用标签，但承担不同职责。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>any / 任意（含未标记）</td><td>匹配任意所列标签，并允许无标签记忆参与。</td><td>查 A 或 B 时，无标签记录也可能返回。</td><td>查询时选择</td></tr>
+<tr class="item"><td>all / 全部（含未标记）</td><td>要求带标签的候选满足全部所列标签，同时允许无标签记录。</td><td>需要“严格属于项目 A”时应考虑严格模式。</td><td>查询时选择</td></tr>
+<tr class="item"><td>any_strict / 任意（严格）</td><td>至少匹配一个所列标签，排除无标签记录。</td><td>A 或 B；空标签记录被排除。</td><td>查询时选择</td></tr>
+<tr class="item"><td>all_strict / 全部（严格）</td><td>同时拥有全部所列标签，排除无标签记录；可以有其他标签。</td><td>指定 project:A 与 kind:decision，只取同时包含两者的记录。</td><td>页面有标签时的默认行为</td></tr>
+<tr class="item"><td>exact / 完全匹配</td><td>候选标签集合与指定集合完全相同。</td><td>[A,B] 不匹配 [A,B,C]；空集合可选择无标签范围。</td><td>高级查询</td></tr>
+<tr class="item"><td>标签组 JSON</td><td>将多个标签条件组合为布尔表达式。</td><td>用于比任意／全部更复杂的范围；各入口按其 schema 使用。</td><td>插件或调试</td></tr>
+<tr class="item"><td>观察范围：Combined</td><td>把本次文档全部标签合成一个范围。</td><td>标签 A、B → [A,B]。这是 API 未指定范围时的默认方式。</td><td>插件统一</td></tr>
+<tr class="item"><td>观察范围：按标签 per_tag</td><td>每个标签单独形成范围。</td><td>A、B → [A] 和 [B]，可能为同一材料形成多份归纳。</td><td>插件统一</td></tr>
+<tr class="item"><td>观察范围：所有组合</td><td>为标签的每个非空子集建立范围。</td><td>A、B → [A]、[B]、[A,B]；标签增多时范围数量增长很快。</td><td>按明确需要启用</td></tr>
+<tr class="item"><td>观察范围：共享 shared</td><td>统一归到本 Bank 的无标签范围，原始事实仍可保留来源标签。</td><td>即使 session:1 与 session:2 不同，也可参与同一范围的归纳。</td><td>适合跨会话归纳，需结合范围设计</td></tr>
+<tr class="item"><td>观察范围：自定义</td><td>明确列出要参与整理的标签组合。</td><td>界面每行一个范围，行内用逗号列标签。</td><td>高级配置</td></tr>
+<tr class="item"><td>实体标签勾选“+ 标签”</td><td>将模型识别的分类值同时写成可筛选的普通标签。</td><td>实体分类识别与检索筛选由此关联；应检查实际提取值。</td><td>我们配置</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-selector.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="recall"><summary>10. Recall：所有输入与结果面板</summary><div class="chapter-body"><p class="intro">这个页面主要用于试查和诊断。它操作当前 Bank，返回检索到的材料。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>问题输入框／召回</td><td>提交一次查询。</td><td>如“蓝鸟项目为什么推迟发布？”</td><td>Agent 主动查询；系统自动召回</td></tr>
+<tr class="item"><td>类型：世界、经历、观察</td><td>选择要搜索的记忆层。</td><td>查原始事件可包含事实；查总结可包含 observation；UI 要求至少选一种。</td><td>按查询需要</td></tr>
+<tr class="item"><td>预算：低、中、高</td><td>控制各检索分支探索的候选数量。</td><td>提高会扩大搜索工作量；更好的结果要通过查询实测。</td><td>Agent 选档</td></tr>
+<tr class="item"><td>选项 → 最大令牌数</td><td>返回记忆正文的整体长度预算。</td><td>当前测试界面默认 4096；后端内部默认预算可能不同。</td><td>插件控总量</td></tr>
+<tr class="item"><td>查询日期</td><td>解释“上周”等相对时间所用的参照点。</td><td>不填通常以现在为准。</td><td>需要历史视角时指定</td></tr>
+<tr class="item"><td>分块</td><td>把事实对应的原始片段也返回。</td><td>追溯语境时使用，会增加响应大小。</td><td>按需展开</td></tr>
+<tr class="item"><td>实体</td><td>附带实体名称及相应实体观察信息。</td><td>帮助理解别名、对象之间的联系。</td><td>按需返回</td></tr>
+<tr class="item"><td>标签、标签匹配</td><td>按标签条件缩小查询范围。</td><td>默认 any 会允许无标签材料；严格筛选见标签章节。</td><td>插件统一</td></tr>
+<tr class="item"><td>时间范围：开始、结束</td><td>为时间检索分支直接指定一个优先时间窗口。</td><td>它影响排序，范围外记录仍可能从语义、文本或图分支返回；两端都填才生效，按 UTC 解析。</td><td>按需使用</td></tr>
+<tr class="item"><td>结果数量、耗时、访问节点数</td><td>本次查询的规模、用时和检索工作量。</td><td>用于调预算和性能；节点数本身不能说明准确性。</td><td>诊断</td></tr>
+<tr class="item"><td>结果卡片</td><td>展示记忆文字、类型、时间、标签、实体、来源及分数。</td><td>打开来源可继续读原文或事实依据。</td><td>日常使用</td></tr>
+<tr class="item"><td>结果分数／相关度</td><td>当前检索排序信号。</td><td>分数随查询、分支、重排变化；不要据此把记忆判定为真实或经验有效。</td><td>诊断</td></tr>
+<tr class="item"><td>追踪 → 并行检索</td><td>查看语义、关键词、图关系和时间等分支各自找到什么。</td><td>排查一条材料为何漏掉，或哪个分支引入噪声。</td><td>诊断</td></tr>
+<tr class="item"><td>追踪 → RRF 融合</td><td>把不同分支结果按排名合并。</td><td>融合分通常很小，与重排分的尺度不同。</td><td>诊断</td></tr>
+<tr class="item"><td>追踪 → 综合评分／重排／最终结果</td><td>查看融合后如何重排，以及时间、时效等信号怎样影响排序。</td><td>结构相关的结果也可能被重排序器压低，需看具体查询。</td><td>诊断</td></tr>
+<tr class="item"><td>JSON</td><td>显示接口原始返回。</td><td>适配器开发时可核对结果、来源、截断信息与 trace。</td><td>开发调试</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/search-debug-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="reflect"><summary>11. Reflect：所有输入与结果面板</summary><div class="chapter-body"><p class="intro">这里运行的是 Hindsight 自己的检索分析流程。Sagitta 可以把结果作为有来源的辅助材料继续判断。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>问题输入框／反思</td><td>提出一个需要依据记忆回答的问题。</td><td>“根据此前的失败记录，这次发布前应检查什么？”</td><td>Agent 按需调用</td></tr>
+<tr class="item"><td>预算：低、中、高</td><td>允许内部 Agent 搜索与推理的步数档位。</td><td>与 Recall 的候选预算含义不同；高档一般会带来更多调用和等待。</td><td>Agent 在上限内选择</td></tr>
+<tr class="item"><td>事实类型</td><td>允许内部 Agent 使用世界、经历和观察中的哪些。</td><td>不选表示不对这三类施加类型限制。</td><td>按问题需要</td></tr>
+<tr class="item"><td>最大令牌数</td><td>生成回答的长度预算。</td><td>这是回答预算；检索材料预算另有配置。</td><td>插件控制</td></tr>
+<tr class="item"><td>包含来源</td><td>返回回答所使用的记忆与生成答案。</td><td>便于检查结论依据。</td><td>建议验证阶段保留</td></tr>
+<tr class="item"><td>包含工具</td><td>返回内部检索工具调用的追踪。</td><td>方便知道它是否真正查到了对应材料。</td><td>调试时保留</td></tr>
+<tr class="item"><td>结构化输出模式／构建模式</td><td>让回答额外以约定字段返回。</td><td>如 conclusion、evidence；结构约束仍需检查返回是否符合。</td><td>我们定义，Agent 使用</td></tr>
+<tr class="item"><td>标签／标签匹配</td><td>限定检索的记忆范围，并影响带标签 Directives 的适用范围。</td><td>无标签的全局指令始终适用；各规则按后端实现加载。</td><td>插件统一</td></tr>
+<tr class="item"><td>排除心智模型</td><td>跳过已有专题答案和知识页，只从事实与 observation 分析。</td><td>用于对照是否受到旧摘要误导。</td><td>按需对照</td></tr>
+<tr class="item"><td>排除心智模型 ID</td><td>只排除指定的生成答案。</td><td>保留其他专题的可用性。</td><td>高级查询</td></tr>
+<tr class="item"><td>回答／结构化输出</td><td>展示模型给出的结论与相应字段。</td><td>回答仍需要与来源、当前任务条件一起判断。</td><td>Agent 使用</td></tr>
+<tr class="item"><td>依据：指令、心智模型、观察、世界、经历</td><td>分别列出参与本次回答的对象。</td><td>来源为空时，要检查是否实际利用了记忆。</td><td>核对依据</td></tr>
+<tr class="item"><td>追踪：迭代、工具输入输出、LLM 调用</td><td>展示本次分析如何搜索和生成。</td><td>可排查循环搜索、查错范围、读取陈旧页面等问题。</td><td>诊断</td></tr>
+<tr class="item"><td>输入／输出 token、工具调用／LLM 调用数</td><td>本次分析的消耗。</td><td>用于比较“直接 recall”与“先 reflect”是否值得。</td><td>我们评估成本</td></tr>
+<tr class="item"><td>JSON／原始响应</td><td>完整接口返回。</td><td>少量旧字段可能只为兼容保留；当前常规 Reflect 重点是回答与依据，经验写入有独立 retain 流程。</td><td>开发调试</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/think-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="documents"><summary>12. 文档页面、详情及数据导入导出</summary><div class="chapter-body"><p class="intro">文档是记忆的来源。阅读文档能核对提取和总结是否保留了原话中的条件。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>搜索、标签、日期范围、时间轴字段</td><td>按材料内容、来源标签和首次添加／最后更新时间筛选。</td><td>此处日期筛选用于限制文档列表；与 Recall 的时间排序窗口分开。</td><td>日常检查</td></tr>
+<tr class="item"><td>列：文档、更新时间、大小、记忆单元</td><td>展示材料身份、最近变化、文本长度和提取条数。</td><td>条数为零可能表示尚在处理，或没有提取到值得保存的事实。</td><td>检查写入效果</td></tr>
+<tr class="item"><td>导入中／更新中／待转换</td><td>来源文件或更新任务还在后台处理。</td><td>先看操作状态，再判断是否丢数据。</td><td>系统状态</td></tr>
+<tr class="item"><td>详情：文档 ID、时间、文本长度、记忆组成</td><td>一份材料的身份与提取结果概览。</td><td>ID 用来更新同一文档，随意复用可能替换旧材料。</td><td>插件生成稳定 ID</td></tr>
+<tr class="item"><td>Retain 参数／标签／观察范围／元数据</td><td>展示这份材料当时怎样被提交和分组。</td><td>排查提取策略或范围配置为什么生效。</td><td>诊断</td></tr>
+<tr class="item"><td>原始文本／分块</td><td>分别查看完整材料与处理片段。</td><td>未启用原文保存时，只能看到保留下来的派生内容。</td><td>Agent 按需展开</td></tr>
+<tr class="item"><td>保留追踪／模型调用</td><td>查看提取过程中实际模型输入、输出和产生的事实。</td><td>用于判断错误来自材料、提示词还是模型。</td><td>诊断</td></tr>
+<tr class="item"><td>编辑正文 → 保存</td><td>以同一文档 ID 重新 Retain，替换或重新处理旧事实。</td><td>这会改变来源记忆及其派生认识；与只编辑一条提取事实不同。</td><td>Agent 维护来源时使用</td></tr>
+<tr class="item"><td>附件标记</td><td>原文内的附件引用，形如 ⟦hs-att:…⟧。</td><td>编辑时保留标记会保留相关附件引用；删去标记可能移除该附件。</td><td>有附件时注意</td></tr>
+<tr class="item"><td>删除文档</td><td>删除该来源材料及其提取记忆，并处理相关派生关系。</td><td>属于数据管理操作。</td><td>限定管理</td></tr>
+<tr class="item"><td>导出：包含观察／包含知识库</td><td>下载可迁移的数据包；可选择是否携带派生观察和生成页面。</td><td>文档传输包通常不含向量，目标库按自己的模型重新生成向量。</td><td>人工迁移</td></tr>
+<tr class="item"><td>从 ZIP 导入</td><td>导入 Hindsight 自己导出的数据包。</td><td>PDF、Word 等普通文件使用“添加文档 → 上传文件”。</td><td>人工迁移</td></tr>
+<tr class="item"><td>导入冲突：跳过／替换／新 ID</td><td>处理目标库已经存在的同 ID 文档。</td><td>跳过保留旧内容；替换覆盖；新 ID 将两份都留下。</td><td>人工决定</td></tr>
+<tr class="item"><td>导出／导入任务状态与下载</td><td>大数据传输在后台进行，完成后获取文件或统计。</td><td>已提交与已完成分开。</td><td>系统跟踪</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/documents-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="entities"><summary>13. 实体页面</summary><div class="chapter-body"><p class="intro">这个页面检查“记忆围绕哪些对象建立了关联”。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>列表／关系</td><td>列表按实体看统计；关系图看实体在相同记忆中共同出现。</td><td>实体共现表示被同一条记忆提到；具体关系含义仍要读记忆正文。</td><td>检查与导航</td></tr>
+<tr class="item"><td>名称、提及次数、首次／最近出现</td><td>实体的规范名称及关联记忆的统计。</td><td>高频对象可能形成枢纽，未必都对某次查询有用。</td><td>诊断</td></tr>
+<tr class="item"><td>图的大小、亮度、时效颜色</td><td>编码共现规模或最近共现时间等展示信号。</td><td>这些是可视化属性，具体含义以该图图例为准。</td><td>查看即可</td></tr>
+<tr class="item"><td>搜索／刷新</td><td>定位对象并重新读取当前数据。</td><td>刷新页面数据与重新生成实体知识是不同操作。</td><td>日常使用</td></tr>
+<tr class="item"><td>实体详情：ID、次数、时间线</td><td>追溯与该实体有关的记忆。</td><td>可检查不同名字是否被错误合并或同一对象是否拆成多个。</td><td>Agent 可间接通过来源核对</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/entities-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="add-document"><summary>14. 添加文档：每项输入</summary><div class="chapter-body"><p class="intro">这个对话框是手动写入入口。以后自动记录会由插件补充大部分技术字段。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>文本／上传文件</td><td>选择直接提交文字，或由解析器处理文件。</td><td>支持文本文档、办公文件等；扫描内容需要可用的 OCR 解析能力。</td><td>Agent 写入的一部分</td></tr>
+<tr class="item"><td>文本／内容块</td><td>纯文本输入，或将文字与附件按顺序组合。</td><td>内容块中的视觉附件需要模型支持相应输入；解析整份 PDF 是另一条处理路径。</td><td>按材料选择</td></tr>
+<tr class="item"><td>内容块添加、删除、上移、下移</td><td>组织文字和附件在材料中的先后位置。</td><td>位置会影响模型理解上下文。</td><td>按需使用</td></tr>
+<tr class="item"><td>提取方法：标准</td><td>使用默认的 MarkItDown 等本地解析方式提取文字。</td><td>界面说“免费”指该解析步骤通常没有额外解析服务费，后续 LLM 提取仍可能计费。</td><td>系统配置默认</td></tr>
+<tr class="item"><td>提取方法：增强 Iris</td><td>使用配置的外部解析服务处理复杂排版、扫描或图像。</td><td>需要对应服务凭据并可能收费；本地 DeepSeek 密钥不自动提供 Iris。</td><td>我们配置</td></tr>
+<tr class="item"><td>文件列表／每文件元数据</td><td>为不同文件设定自己的 ID、标签、日期等信息。</td><td>每个文件可形成独立文档；文件上传处理始终是后台任务。</td><td>插件自动补充</td></tr>
+<tr class="item"><td>上下文</td><td>解释材料来自哪种场景。</td><td>“本次失败复盘记录，结论尚待验证。”有助于正确提取。</td><td>Agent 可填写</td></tr>
+<tr class="item"><td>事件日期</td><td>为材料提供时间参照。</td><td>让“今天”“下周”等时间表述有参照，仍要区分提及与实际发生时间。</td><td>插件默认、必要时 Agent 指定</td></tr>
+<tr class="item"><td>文档 ID</td><td>给来源一个稳定标识。</td><td>相同 ID 重写可替换或更新；追加还是替换取决于调用模式。</td><td>插件管理</td></tr>
+<tr class="item"><td>策略</td><td>选择已存在的命名写入策略。</td><td>例如一套处理工作日志、一套处理资料；未指定时采用库默认策略。</td><td>Agent 从预设中选择</td></tr>
+<tr class="item"><td>在后台处理（异步）</td><td>文本写入先返回任务，后台再提取和存储。</td><td>同步等待写入完成，仍可能有后续 observation 和页面任务。</td><td>插件统一</td></tr>
+<tr class="item"><td>标签</td><td>为材料及提取事实设定可筛选标识。</td><td>这些标签也可能影响默认 observation 范围。</td><td>插件统一</td></tr>
+<tr class="item"><td>观察范围</td><td>确定这些事实怎样参与归纳；Combined、按标签、所有组合、共享、自定义。</td><td>详细例子见标签章节；会话标签和经验归纳范围应分别考虑。</td><td>插件配置</td></tr>
+<tr class="item"><td>来源 → 元数据</td><td>额外保存来源键值，每行 key: value。</td><td>任务 ID、来源系统等；通常不直接作为 recall 筛选条件。</td><td>插件自动补充</td></tr>
+<tr class="item"><td>来源 → 实体提示</td><td>提供一些对象名字，与自动识别结果共同使用。</td><td>适合明确项目名、人物别名；对象解析仍受后端策略影响。</td><td>必要时指定</td></tr>
+<tr class="item"><td>添加／上传／取消</td><td>提交处理或放弃当前表单。</td><td>上传完成后仍需查看转换、提取和整理任务状态。</td><td>日常使用</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-selector.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="overview"><summary>15. 记忆库配置 → 概览、指令和后台操作</summary><div class="chapter-body"><p class="intro">概览侧重查看处理进度。改变处理规则进入“配置”，查看模型怎样处理进入“LLM Requests”。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>记忆存储／构成／链接类型</td><td>与首页类似的数据量和分类统计。</td><td>用来判断是否有数据以及大致结构。</td><td>查看即可</td></tr>
+<tr class="item"><td>整合：完成、待处理、失败、最近时间</td><td>事实是否已被 observation 整理流程处理。</td><td>整理完成表示这批数据走过流程，结论质量仍须读结果与依据。</td><td>系统监控</td></tr>
+<tr class="item"><td>心智模型：已同步／已过期</td><td>生成答案是否跟上其来源范围中的新资料。</td><td>页面刷新与 observation 整理是不同阶段。</td><td>系统监控</td></tr>
+<tr class="item"><td>后台操作列表／类型筛选／状态筛选／刷新</td><td>查看写入、批量写入、整理、页面刷新、导入导出等任务。</td><td>一个业务动作可能对应多个后台任务。</td><td>系统处理，Agent 看简化状态</td></tr>
+<tr class="item"><td>pending / processing / completed / failed / cancelled</td><td>分别是排队、执行、完成、失败、取消。</td><td>“已受理”通常意味着已排队；具体下一阶段可能还未完成。</td><td>系统状态</td></tr>
+<tr class="item"><td>任务详情／阶段／processed 与 total／子任务</td><td>展示内部阶段、进度、错误和子批次。</td><td>父批次完成情况与其子任务可分别检查。</td><td>诊断</td></tr>
+<tr class="item"><td>取消／重试／删除任务记录</td><td>取消尚未完成的任务、重试失败任务、清理结束的操作记录。</td><td>删除任务记录与删除原文或记忆是不同操作；取消能否中止进行中的模型调用取决于执行阶段。</td><td>系统或人工维护</td></tr>
+<tr class="item"><td>指令列表／添加／编辑／删除</td><td>为 Reflect 配置需要遵守的规则。</td><td>正文作用于记忆服务内部分析，主 Agent 的强制授权检查由宿主实现。</td><td>我们配置</td></tr>
+<tr class="item"><td>指令名称／规则正文／标签</td><td>名称方便识别，正文进入分析提示，标签限定适用查询范围。</td><td>空标签表示全局规则；带标签规则随本次 Reflect 的范围匹配。</td><td>我们审查</td></tr>
+<tr class="item"><td>操作 → 运行整合</td><td>立即申请处理待整理事实。</td><td>正常已开启自动整理时，主要用于导入后、积压或手动控制场景。</td><td>Agent 可申请</td></tr>
+<tr class="item"><td>操作 → 恢复整合</td><td>使失败的整理事实重新有机会被处理。</td><td>先看失败原因；与重试单个后台 operation 的入口不同。</td><td>维护修复</td></tr>
+<tr class="item"><td>操作 → 清除观察</td><td>删除派生 observation，来源事实继续保留，可后续重建。</td><td>会暂时影响依赖这些认识的查询和页面。</td><td>人工维护</td></tr>
+<tr class="item"><td>操作 → 重置配置</td><td>清除 Bank 的自定义配置覆盖，回到上级默认。</td><td>它处理配置；记忆内容另行保存。</td><td>人工维护</td></tr>
+<tr class="item"><td>操作 → 导出模板</td><td>导出规则、配置和生成对象定义等模板。</td><td>配置模板与完整运行数据导出分开。</td><td>人工维护</td></tr>
+<tr class="item"><td>操作 → 克隆记忆库</td><td>建立一个独立副本；可选择记忆、配置和历史。</td><td>复制配置也可能复制 Webhook 地址；副本之后独立演进。</td><td>人工管理</td></tr>
+<tr class="item"><td>操作 → 删除记忆库</td><td>删除这个隔离空间及其中数据。</td><td>默认受保护 Bank 的限制需要未来插件落实。</td><td>人工或明确限定的管理能力</td></tr>
+<tr class="item"><td>运行状况／LLM 连通性</td><td>向服务使用的模型发起实际检查。</td><td>当前部署关闭了额外 LLM 健康探测入口；核心功能已通过独立写入与查询验证。</td><td>调试时启用</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-operations-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="config-basics"><summary>16. 配置页通用规则：先理解保存与继承</summary><div class="chapter-body"><p class="intro">当前页面每个分区通常有自己的“保存更改”。更改一个分区后，应看该分区的保存状态。记忆防护页使用自动保存，单独说明。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>服务器默认值／继承</td><td>使用上级的生效值。</td><td>服务器默认现在启用，继承也启用；上级将来改变后该库会跟随。</td><td>先保持默认</td></tr>
+<tr class="item"><td>库级覆盖</td><td>当前 Bank 固定设置一个值。</td><td>需要项目库行为与默认模板不同才设覆盖。</td><td>我们配置</td></tr>
+<tr class="item"><td>恢复继承值</td><td>删除本 Bank 对该字段或分区的覆盖。</td><td>它与“关闭功能”是不同含义。</td><td>我们配置</td></tr>
+<tr class="item"><td>留空、0、-1</td><td>分别可能表示继承、零、无限制或其他特殊值，按每个字段解释。</td><td>例如最小刷新间隔 0 是不设频率下限；观察上限 -1 是无限制。</td><td>按字段说明使用</td></tr>
+<tr class="item"><td>三种使命</td><td>Retain 决定挑什么信息；观察使命决定怎么归纳；Reflect 使命决定怎样分析回答。</td><td>Retain 使命补充默认规则；观察使命和自定义提取规则可以替换内置部分。</td><td>核心规则由我们审查</td></tr>
+<tr class="item"><td>配置修改与历史数据</td><td>许多设置控制之后的处理。</td><td>换提取模式后，旧文档需重新处理才会重新提取；现有页面也有自己的刷新状态。</td><td>按影响范围安排迁移</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-config-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="config-retain"><summary>17. 配置 → Retain：每项含义</summary><div class="chapter-body"><p class="intro">这个分区决定从材料中记住哪些信息；它不会决定 DSH 在什么时候把材料提交过来。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>默认策略</td><td>调用方没有指定 strategy 时采用哪套写入设置。</td><td>命名策略可以用于不同材料类型；未定义时用默认设置。</td><td>我们设模板，Agent 可选预设</td></tr>
+<tr class="item"><td>默认／添加策略／策略名称</td><td>创建可复用的一套局部提取设置。</td><td>命名 daily-log 后可在写入时选择；名称应与调用方一致。</td><td>我们维护</td></tr>
+<tr class="item"><td>策略内的继承与覆盖</td><td>命名策略只改需要不同的项，其他项沿用默认。</td><td>删除策略前应检查谁还在引用它。</td><td>我们维护</td></tr>
+<tr class="item"><td>提取模式：简洁 concise</td><td>选择较值得长期保存的信息。</td><td>噪声通常少些，但可能遗漏你希望保留的细节。</td><td>初始可保留</td></tr>
+<tr class="item"><td>提取模式：详尽 verbose</td><td>更积极保留细节。</td><td>材料更多、提取调用输出更长；仍受模型能力和提示限制。</td><td>通过样本比较后决定</td></tr>
+<tr class="item"><td>提取模式：逐字 verbatim</td><td>将每个分块的原文作为一条记忆，模型仍可提取相关元信息。</td><td>更接近保留原话；检索单位也变得更大。</td><td>特定资料用途</td></tr>
+<tr class="item"><td>提取模式：分块 chunks</td><td>直接以分块保存文字，跳过 LLM 事实提取。</td><td>自动实体能力与 observation／Reflect 的可用性还取决于服务配置。</td><td>特定资料或无 LLM 测试</td></tr>
+<tr class="item"><td>提取模式：自定义 custom</td><td>使用自行编写的事实提取说明。</td><td>有明确提取目标时可用；需要用测试样本检查遗漏与误提取。</td><td>我们审查</td></tr>
+<tr class="item"><td>自定义提取提示词</td><td>custom 模式下替换默认提取规则的内容。</td><td>普通模式下此字段不作为该模式的提取规则。</td><td>我们审查</td></tr>
+<tr class="item"><td>分块大小</td><td>长材料按多少字符切分，当前默认 3000。</td><td>块更小可能拆散因果上下文；块更大则单次输入更长。</td><td>先默认，按材料调试</td></tr>
+<tr class="item"><td>结构化分块大小</td><td>允许一条完整对话轮次或 JSONL 记录保持完整的更大字符限额。</td><td>留空沿用普通分块大小；适合避免一条记录被中途截开。</td><td>我们配置</td></tr>
+<tr class="item"><td>使命</td><td>说明这个库特别需要保留什么。</td><td>可写“保留明确约定、决策依据与实际结果，保留适用条件”。补充内置规则。</td><td>我们审查</td></tr>
+<tr class="item"><td>自由形式实体</td><td>允许识别词表之外的人、项目、工具等对象。</td><td>关闭后主要依赖配置的实体标签；完全未设词表时会失去很多实体关联。</td><td>初始保留启用</td></tr>
+<tr class="item"><td>实体标签／添加标签</td><td>预设希望提取的分类字段。</td><td>例如 outcome 为 success / failure；具体嵌套项见下一章。</td><td>我们维护词表</td></tr>
+<tr class="item"><td>测试 retain 提取</td><td>提交样本，查看模型会提取什么；不会写入正式记忆，但会实际调用模型。</td><td>用同一份带例外、纠正、猜测的对话比较不同设置。</td><td>调试使用</td></tr>
+<tr class="item"><td>测试器：提示词／测试数据／策略／运行／结果</td><td>看实际发给模型的消息顺序，输入测试材料和策略，检查事实、实体、时间、分块和用时。</td><td>可见文字变化与保存到库配置的动作分开；以界面保存提示为准。</td><td>调试使用</td></tr>
+<tr class="item"><td>提示词预览：区块／原文／编辑／保存</td><td>显示内置指令、库配置、实体规则等怎样组合成最终提示。</td><td>预览中的一些编辑可以保存真实配置；部分项属于服务级。</td><td>我们调试和审查</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-config-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="config-labels"><summary>18. 配置 → 实体标签：展开后的每一项</summary><div class="chapter-body"><p class="intro">实体标签提供一套由我们定义的提取结构。初始可以留空，先观察自由实体和默认提取是否足够。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>字段名／key</td><td>分类维度的稳定名称。</td><td>如 outcome、stage；会形成 key:value 形式的实体名称。</td><td>我们定义</td></tr>
+<tr class="item"><td>描述／提取器提示：提取什么</td><td>告诉模型从材料中找哪种信息。</td><td>“本次验证的实际结果，忽略尚未执行的预期。”</td><td>我们定义</td></tr>
+<tr class="item"><td>类型：单值 value</td><td>在固定候选中选一个值。</td><td>stage 选 planning、testing 或 released。</td><td>我们定义</td></tr>
+<tr class="item"><td>类型：多值 multi-values</td><td>可从固定候选中选多个值。</td><td>issues 选 callback、login、database 中适用的多个。</td><td>我们定义</td></tr>
+<tr class="item"><td>类型：文本 text</td><td>让模型写一个开放文本值。</td><td>值很灵活，但近义表述可能分散成多个名称。</td><td>按实际需要</td></tr>
+<tr class="item"><td>类型：多文本 multi-text</td><td>从材料提取多个开放值。</td><td>如一个事物的别名、简称和正式名称。</td><td>按实际需要</td></tr>
+<tr class="item"><td>类型：映射 map</td><td>把一个字段展开为多级子字段。</td><td>person 内有 name、role；系统会将路径和值展开成标签实体。</td><td>高级结构</td></tr>
+<tr class="item"><td>候选值／值描述／何时选择此值</td><td>指定允许的枚举及其含义。</td><td>failure 只用于已观察到失败结果；定义清楚能减少分类混乱。</td><td>我们定义</td></tr>
+<tr class="item"><td>可选 optional</td><td>允许材料未提供信息时跳过该字段。</td><td>强制字段会促使模型尽力给值；缺乏信息的材料需要测试其行为。</td><td>一般优先允许缺失</td></tr>
+<tr class="item"><td>+ 标签／同时存为 Tag</td><td>识别出的分类值还写入普通 tags。</td><td>之后可以按 outcome:failure 筛选记忆；也会影响采用标签的整理范围。</td><td>插件和词表协同设计</td></tr>
+<tr class="item"><td>添加字段／值、删除、嵌套字段</td><td>编辑结构及候选。</td><td>规则变化通常主要影响后续提取；旧材料需要安排重新处理。</td><td>我们维护</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/entity-labels-editor.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="config-observations"><summary>19. 配置 → 观察：每项含义</summary><div class="chapter-body"><p class="intro">这里控制从事实中形成持续认识。界面的“启用观察”开关控制该能力；独立的自动整合开关在 API 中另有字段。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>启用观察</td><td>允许这个 Bank 产生和维护 observation。</td><td>关闭会停止该库的观察整理，包括手动整理；事实仍可保存和召回。</td><td>我们配置</td></tr>
+<tr class="item"><td>LLM 批大小</td><td>一次整理模型调用放入多少条新事实，当前为 8。</td><td>它控制批处理粒度；对话多久提交一次由 Sagitta 插件决定。</td><td>先默认</td></tr>
+<tr class="item"><td>整合策略／默认／添加策略</td><td>为不同标签范围设不同的整理任务和上限。</td><td>例如通用管理范围偏重长期方法，项目范围保留阶段决策。</td><td>我们定义</td></tr>
+<tr class="item"><td>策略名称</td><td>方便识别这套范围规则。</td><td>名称本身不成为一种记忆类型。</td><td>我们定义</td></tr>
+<tr class="item"><td>适用范围：添加规则、标签、全部／恰好</td><td>定义哪些 observation scope 使用该策略，可用标签模式匹配。</td><td>一条规则里的标签要共同匹配；规则之间任意一条成立即可。</td><td>我们定义</td></tr>
+<tr class="item"><td>优先级、前移、后移</td><td>多个策略都匹配时，排在最前的策略生效。</td><td>策略之间不相互拼接；匹配策略的空项退回“默认”。</td><td>我们定义</td></tr>
+<tr class="item"><td>匹配范围数／已由更早策略处理</td><td>预览现有范围会落到哪套策略。</td><td>没有现有匹配也可能对未来新数据生效；检查是否规则写错。</td><td>调试</td></tr>
+<tr class="item"><td>使命</td><td>说明应归纳什么、保留哪些条件。</td><td>它可以替换内置整理规则，和 Retain 的补充使命作用不同。</td><td>我们审查</td></tr>
+<tr class="item"><td>每个范围的最大观察数</td><td>限定一个 scope 最多保留多少条派生认识，当前 -1 表示无限制。</td><td>有限上限会影响整理时如何合并和保留内容；它不是质量保证或遗忘策略的完整替代。</td><td>我们实测后设置</td></tr>
+<tr class="item"><td>来源事实最大 Token 数</td><td>整理时给历史 observation 携带的支持事实总预算，当前 4096。</td><td>用于核对旧认识，避免只看总结；更大消耗更多上下文。</td><td>我们定预算</td></tr>
+<tr class="item"><td>每条观察的来源事实最大 Token 数</td><td>每条旧 observation 的支持事实各有一个子预算，当前 256。</td><td>避免单条观察的许多证据占满总预算；必要时调大。</td><td>我们定预算</td></tr>
+<tr class="item"><td>策略里的同名设置</td><td>只针对匹配范围覆盖使命、观察上限和来源事实预算。</td><td>留空按默认处理。</td><td>我们配置</td></tr>
+<tr class="item"><td>预览提示词</td><td>查看默认规则、使命和本次材料怎样组合。</td><td>需要用真实样本检查逻辑与输出。</td><td>调试</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-config-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="config-reflect"><summary>20. 配置 → 反思：每项含义</summary><div class="chapter-body"><p class="intro">本分区改变 Hindsight 内部分析的视角和检索材料；Sagitta 主模型自身的角色与权限在宿主中设置。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>使命</td><td>说明内部分析者的角色、目标、回答依据与表达要求。</td><td>例如要求明确引用记录，区分结论的适用条件。</td><td>我们审查</td></tr>
+<tr class="item"><td>反思默认选项 → 观察最大令牌数</td><td>普通 Reflect 的观察搜索在未另行指定时使用的材料预算。</td><td>控制每次带入多少归纳认识。单个模型刷新有自己的一套 trigger 设置，应在那里核对。</td><td>我们配置</td></tr>
+<tr class="item"><td>反思默认选项 → 观察实体</td><td>是否附上观察对应的规范实体名。</td><td>有助于别名理解，增加文字量；默认项仍可由具体调用覆盖。</td><td>我们配置</td></tr>
+<tr class="item"><td>怀疑度 1—5</td><td>在提示中引导分析时偏信任或偏质疑。</td><td>3 为中间倾向；更高数值不会自动验证来源真假。</td><td>先默认</td></tr>
+<tr class="item"><td>字面度 1—5</td><td>引导分析更重原话，或更愿意结合语境解释。</td><td>需要比较实际输出是否保留用户意思。</td><td>先默认</td></tr>
+<tr class="item"><td>共情度 1—5</td><td>引导分析时对情感和人际背景的关注程度。</td><td>它影响 Reflect 的回答风格与解释，和完整人格系统分开。</td><td>先默认</td></tr>
+<tr class="item"><td>预览提示词／恢复继承／保存</td><td>看内部模型最终收到的指令，管理本库覆盖。</td><td>普通分区和弹出的默认选项各有保存动作。</td><td>我们维护</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-config-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="config-rest"><summary>21. 配置 → 其余每项：页面、客户端、隐私、召回和模型</summary><div class="chapter-body"><p class="intro">这一章覆盖主配置页余下分区；页面默认触发器打开后完整字段在“全部刷新选项”。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>心智模型最小刷新间隔</td><td>本 Bank 的默认自动刷新间隔下限，当前 0 秒。</td><td>窗口内触发合并等待；单页可覆盖，手动刷新可立即执行。</td><td>我们定刷新预算</td></tr>
+<tr class="item"><td>知识页面默认触发器</td><td>之后创建知识页时采用的初始刷新设置。</td><td>当前内置默认是整理后自动、增量、只读 observation、排除其他生成答案；已有页保留自身设置。</td><td>我们配置模板</td></tr>
+<tr class="item"><td>客户端 → 别名</td><td>让同一个 Bank 还能通过另一个 ID 访问。</td><td>不复制记忆；支持分阶段迁移调用方。设主显示别名只改变界面展示。</td><td>人工维护</td></tr>
+<tr class="item"><td>客户端 → 限制工具</td><td>为这个 Bank 设置 Hindsight MCP 工具白名单。</td><td>仅约束 MCP；HTTP 调用和未来 Sagitta 包装工具的授权要在各自层落实。</td><td>我们管理权限</td></tr>
+<tr class="item"><td>客户端 → 工具分组／全选／取消全选</td><td>按核心操作、Bank、模型、页面、文档等勾选 MCP 工具。</td><td>全部不选会使该 MCP 入口没有可调用能力。</td><td>人工配置</td></tr>
+<tr class="item"><td>安全与隐私 → 启用审计日志</td><td>记录此 Bank 操作层的调用记录，当前继承关闭。</td><td>与逐次 LLM 输入输出日志分开；可按库启用。</td><td>我们配置</td></tr>
+<tr class="item"><td>安全与隐私 → 存储文档原文</td><td>保留文档原文和分块，当前启用。</td><td>关闭后只保留派生事实会影响展开原文、重新提取等能力；历史数据处理另看保留规则。</td><td>我们决定，成长实验通常需保留依据</td></tr>
+<tr class="item"><td>召回 → 文本检索</td><td>启用关键词／全文匹配分支，当前启用。</td><td>本地当前为 PostgreSQL native 全文后端；界面 BM25 字样是对文本分支的泛称。</td><td>先启用</td></tr>
+<tr class="item"><td>召回 → 时间检索</td><td>启用时间分析和日期相关候选。</td><td>涉及长期变化和过去约定时有用。</td><td>先启用</td></tr>
+<tr class="item"><td>召回 → 图检索</td><td>利用共享实体、语义和因果关联扩展相关记忆。</td><td>有助于把直接命中的记录与背景相连，也可能引入高频对象关联噪声。</td><td>先启用，实测检查</td></tr>
+<tr class="item"><td>召回 → 重排序</td><td>对合并候选再按问题相关程度排序。</td><td>可能提高相关性，也可能压低仅有结构关联的证据；对照实际问题评估。</td><td>先启用</td></tr>
+<tr class="item"><td>模型 → Gemini / Vertex AI 安全设置</td><td>指定 Gemini 类提供商的内容拦截阈值。</td><td>当前使用 DeepSeek，这个分区不影响该模型；实际 LLM、embedding、reranker 在服务配置选择。</td><td>当前保持默认</td></tr>
+<tr class="item"><td>安全类别：骚扰、仇恨、露骨色情、危险内容</td><td>分别控制对应类别的提供商过滤设置。</td><td>属于 Gemini 提供商策略，与记忆事实准确性分开。</td><td>提供商配置</td></tr>
+<tr class="item"><td>阈值：默认、关闭、不阻断、低／中／高</td><td>决定该提供商以多高风险阈值拦截输入输出。</td><td>阈值越低通常拦截范围越广；这些选项受提供商版本支持影响。</td><td>当前无需调整</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/bank-config-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="defense"><summary>22. 记忆库配置 → 记忆防护</summary><div class="chapter-body"><p class="intro">当前开源界面提供基础敏感内容检测；此页开关变化采用约 800 毫秒防抖后的自动保存。只阅读时保持现有值。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>主开关</td><td>启用这套 Bank 写入前的检查策略。</td><td>当前未配置；开启后还需看具体检测器及其动作。</td><td>我们配置</td></tr>
+<tr class="item"><td>密钥泄露防护开关</td><td>对写入内容应用内置敏感数据模式检测。</td><td>这是规则检测能力，实际覆盖范围以实现为准。</td><td>我们配置</td></tr>
+<tr class="item"><td>动作：脱敏 redact</td><td>移除或替换检测到的敏感片段，再继续处理允许的内容。</td><td>会改变进入记忆的原始材料。</td><td>我们配置</td></tr>
+<tr class="item"><td>动作：拦截 block</td><td>拒绝触发规则的写入。</td><td>上游需要处理明确失败，而不是把提交当成成功。</td><td>我们配置</td></tr>
+<tr class="item"><td>动作：允许 allow</td><td>该规则命中时仍允许写入。</td><td>应依据实际存储用途决定。</td><td>我们配置</td></tr>
+<tr class="item"><td>保存中／已保存提示</td><td>显示自动保存状态。</td><td>与主配置各分区的手动保存行为不同。</td><td>查看状态</td></tr>
+<tr class="item"><td>Memory Defense Enterprise／申请演示</td><td>展示云端企业产品提供的额外能力与咨询入口。</td><td>列出的更高级检测与审计能力不等于当前本地安装已具备；本文只介绍本地可用项。</td><td>产品说明</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/memory-defense-section.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="webhooks"><summary>23. 记忆库配置 → Webhooks：每一项</summary><div class="chapter-body"><p class="intro">这是给系统接入用的事件通知。主 AI 通过插件感知简化后的任务状态即可。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>列表：URL、方法、事件类型、启用状态、创建时间</td><td>看当前 Bank 会通知哪些接收方。</td><td>通知只发送匹配事件；接收后做什么由接收方决定。</td><td>我们接入</td></tr>
+<tr class="item"><td>添加／编辑／删除</td><td>管理一个通知目标。</td><td>删除注册会取消相关待发送投递；已生成的记忆独立保存。</td><td>我们管理</td></tr>
+<tr class="item"><td>类型</td><td>选择受支持的 Webhook 方式。</td><td>当前普通接入为 HTTP。</td><td>保持默认</td></tr>
+<tr class="item"><td>URL</td><td>接收通知的接口地址。</td><td>必须是接收系统实际提供的入口。</td><td>我们配置</td></tr>
+<tr class="item"><td>方法</td><td>发送通知使用的 HTTP 方法。</td><td>当前普通事件投递使用 POST。</td><td>保持协议默认</td></tr>
+<tr class="item"><td>超时（秒）</td><td>等待接收方响应多久。</td><td>超时或非成功响应会被视为投递失败，并按策略重试。</td><td>系统配置</td></tr>
+<tr class="item"><td>签名密钥／显示隐藏／清除密钥</td><td>为事件正文生成签名，供接收方验证。</td><td>是通知校验用密钥，与 LLM API 密钥分开；编辑时留空通常保留旧值。</td><td>我们配置</td></tr>
+<tr class="item"><td>自定义请求头／查询参数／键值对</td><td>给通知附加接收方要求的固定字段。</td><td>例如请求头里的接入标识；字段应与接收协议一致。</td><td>我们配置</td></tr>
+<tr class="item"><td>事件：retain.completed</td><td>一项文档写入处理结束后通知。</td><td>完成的是提取存储阶段；后续整理可能仍在运行。</td><td>系统接入</td></tr>
+<tr class="item"><td>事件：consolidation.completed</td><td>一轮 observation 整理结束后通知结果。</td><td>可看创建／更新数量和错误状态。</td><td>系统接入</td></tr>
+<tr class="item"><td>事件：memory_defense.triggered</td><td>写入检查触发相关规则时通知。</td><td>便于记录被拦截、脱敏等情况。</td><td>系统接入</td></tr>
+<tr class="item"><td>启用</td><td>暂时启用或停止这个通知注册。</td><td>保留配置方便重新使用。</td><td>我们维护</td></tr>
+<tr class="item"><td>投递：状态、HTTP、尝试次数、事件、时间</td><td>检查接收方有没有成功收到通知。</td><td>可展开错误和服务器允许暴露的响应信息。</td><td>诊断</td></tr>
+<tr class="item"><td>重复事件与重试</td><td>服务会重试失败投递，接收方可能收到同一事件多次。</td><td>使用 operation_id 等标识去重；通知重试并不代表重复写入事实。</td><td>接收方实现</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/webhooks-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="audit"><summary>24. 记忆库配置 → 审计日志</summary><div class="chapter-body"><p class="intro">审计日志记录系统操作；当前演示库继承关闭，打开后才会对相应后续操作形成记录。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>启用状态／功能未启用提示</td><td>说明这个记录能力当前是否开启。</td><td>在安全与隐私分区设置本库开关；服务也有相关配置。</td><td>我们配置</td></tr>
+<tr class="item"><td>请求量图、今天／7 天／30 天、累计窗口</td><td>按时间观察操作数量。</td><td>观察记录习惯或异常调用量。</td><td>诊断</td></tr>
+<tr class="item"><td>操作筛选</td><td>按 Retain、Recall、Reflect、整理、创建库、模型刷新等筛选。</td><td>用于定位某一类行为。</td><td>诊断</td></tr>
+<tr class="item"><td>传输：HTTP／MCP／系统</td><td>区分请求从哪种入口产生。</td><td>系统通常表示后台触发。</td><td>诊断</td></tr>
+<tr class="item"><td>时间范围、刷新、分页</td><td>选择观察时段，重新读取，浏览更多记录。</td><td>保留范围受服务配置限制。</td><td>诊断</td></tr>
+<tr class="item"><td>表格：时间、操作、传输、耗时</td><td>调用级记录概览。</td><td>一次 Reflect 内可能包含多次 LLM 调用，要看 LLM Requests。</td><td>诊断</td></tr>
+<tr class="item"><td>详情：请求、响应、元数据</td><td>检查该操作的输入输出与执行信息。</td><td>日志可能包含记忆内容，其保留策略由我们设置。</td><td>我们维护</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/audit-logs-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="llm"><summary>25. 记忆库配置 → LLM Requests</summary><div class="chapter-body"><p class="intro">这里能直接看到后台模型在做什么。当前部署已启用模型请求追踪。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>调用量／Token 量图</td><td>分别显示模型调用次数与输入输出消耗。</td><td>可识别记录、整理或刷新哪个阶段最耗资源。</td><td>我们评估</td></tr>
+<tr class="item"><td>输入、输出、推理、缓存、总计</td><td>按提供商报告的 token 分类展示。</td><td>不同模型不一定报告所有类别；缓存统计与实际收费规则需分别理解。</td><td>成本诊断</td></tr>
+<tr class="item"><td>总计／明细／累计</td><td>切换消耗的展示方式。</td><td>用于看一次调用或某个时间窗口的总量。</td><td>查看即可</td></tr>
+<tr class="item"><td>操作筛选：保留／反思／整合／刷新</td><td>只看指定后台环节的模型调用。</td><td>例如怀疑观察归纳失真，就筛“整合”。</td><td>诊断</td></tr>
+<tr class="item"><td>状态、时间范围、刷新、分页</td><td>定位失败、耗时或特定时间的请求。</td><td>请求失败与业务 operation 失败之间还可能有重试过程。</td><td>诊断</td></tr>
+<tr class="item"><td>按运行分组／Trace 过滤</td><td>把同一次完整操作里的多次模型调用放到一起。</td><td>便于还原一次 Reflect 的多轮查找。</td><td>诊断</td></tr>
+<tr class="item"><td>表格：时间、操作、范围、状态、耗时、Token</td><td>模型调用级别的概览。</td><td>范围可能描述处理批次或关联材料。</td><td>诊断</td></tr>
+<tr class="item"><td>详情：提供方、模型、输入、输出、LLM 信息</td><td>查看实际送入和返回的内容。</td><td>能核对“这个配置到底有没有进入提示词”。</td><td>我们调试与审查</td></tr>
+<tr class="item"><td>Trace／Span／父 Span</td><td>标识整个操作、其中某个子调用及父子关系。</td><td>相当于一次运行和其中各步骤的编号。</td><td>开发诊断</td></tr>
+<tr class="item"><td>已创建记忆／来源记忆</td><td>从调用结果或输入跳回记忆对象。</td><td>把错误结论与具体产生它的模型输入对应起来。</td><td>质量检查</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-control-plane/src/components/llm-requests-view.tsx" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="all-fields"><summary>26. 附录：当前版本全部 51 项逐库配置</summary><div class="chapter-body"><p class="intro">这是 Hindsight 1.0.0 的 _CONFIGURABLE_FIELDS 完整名单。每项都有解释和当前演示库的读取值。当前值不等于每套部署的固定默认值；更新版本后应重新核对。此前接口参考按较新主线列过 52 项，本部署以这份运行版本清单为准。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>audit_log_enabled · 审计日志开关</td><td>记录库内操作级审计。与 LLM 请求追踪分开。</td><td>入口：安全与隐私。当前：关闭</td><td>我们</td></tr>
+<tr class="item"><td>consolidation_llm_batch_size · 整理 LLM 批大小</td><td>一次归纳调用放入多少条新事实。</td><td>入口：观察。当前：8</td><td>我们</td></tr>
+<tr class="item"><td>consolidation_llm_parallelism · 整理并行数</td><td>允许同时处理多少组归纳工作；影响吞吐、模型限流和资源使用。</td><td>入口：API／服务配置。当前：4</td><td>我们</td></tr>
+<tr class="item"><td>consolidation_max_memories_per_round · 每轮整理事实数上限</td><td>限制一轮任务处理量；有积压时可继续排队处理。</td><td>入口：API／服务配置。当前：100</td><td>我们</td></tr>
+<tr class="item"><td>consolidation_source_facts_max_tokens · 整理来源事实总预算</td><td>归纳时给相关历史认识携带多少来源依据。</td><td>入口：观察。当前：4096</td><td>我们</td></tr>
+<tr class="item"><td>consolidation_source_facts_max_tokens_per_observation · 每条认识的来源预算</td><td>限制单条旧 observation 的支持事实占用，避免挤满总预算。</td><td>入口：观察。当前：256</td><td>我们</td></tr>
+<tr class="item"><td>consolidation_strategies · 按范围的整理策略</td><td>通过 scope 匹配，为不同范围设使命、上限和来源预算；先匹配策略优先。</td><td>入口：观察 → 整合策略。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>disposition_empathy · 共情度</td><td>Reflect 提示里的情感背景关注倾向，1—5。</td><td>入口：反思。当前：未设覆盖；演示库属性为 3/5</td><td>我们</td></tr>
+<tr class="item"><td>disposition_literalism · 字面度</td><td>Reflect 提示里的按原话理解倾向，1—5。</td><td>入口：反思。当前：未设覆盖；演示库属性为 3/5</td><td>我们</td></tr>
+<tr class="item"><td>disposition_skepticism · 怀疑度</td><td>Reflect 提示里的质疑倾向，1—5；仍需实际依据核对。</td><td>入口：反思。当前：未设覆盖；演示库属性为 3/5</td><td>我们</td></tr>
+<tr class="item"><td>enable_auto_consolidation · 自动整理开关</td><td>写入、纠正等变化后自动排队整理；关闭则需手动触发，前提仍是启用 observations。</td><td>入口：API／服务配置；主表单无独立项。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>enable_graph_retrieval · 图检索</td><td>用关系扩展候选记忆。</td><td>入口：召回。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>enable_observations · 观察能力开关</td><td>允许产生归纳认识；关闭会停止该库自动及手动 observation 整理。</td><td>入口：观察。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>enable_reranking · 重排序</td><td>对合并候选重新判断与查询的相关程度。</td><td>入口：召回。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>enable_temporal_retrieval · 时间检索</td><td>启用日期分析与时间相关候选。</td><td>入口：召回。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>enable_text_search · 全文检索</td><td>启用关键词／全文匹配分支。</td><td>入口：召回。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>entities_allow_free_form · 自由实体</td><td>允许在预设分类之外识别人、项目和概念等实体。</td><td>入口：Retain。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>entity_labels · 实体标签定义</td><td>字段、类型、候选值、描述和是否同时写为 tags。</td><td>入口：Retain → 实体标签。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>knowledge_page_default_trigger · 新知识页默认刷新设置</td><td>在内置页面默认值上覆盖后，供新页面初始化；已有页面保留各自设置。</td><td>入口：心智模型与知识页配置。当前：内置：delta／整理后自动／只读 observation／排除其他模型</td><td>我们</td></tr>
+<tr class="item"><td>llm_gemini_safety_settings · Gemini 内容过滤</td><td>对 Gemini／Vertex AI 生效的提供商过滤参数；当前 DeepSeek 不使用它。</td><td>入口：模型。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>max_observations_per_scope · 每范围观察上限</td><td>一个范围内的派生认识数量限制；-1 表示无限制。</td><td>入口：观察。当前：-1</td><td>我们</td></tr>
+<tr class="item"><td>mcp_enabled_tools · MCP 工具白名单</td><td>限制 Hindsight MCP 入口可调用的工具；null 表示不设白名单。</td><td>入口：客户端。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>memory_defense · 写入防护策略</td><td>入库前内容检测及允许、脱敏或拦截等行为。</td><td>入口：记忆防护独立标签页。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>mental_model_min_refresh_interval_seconds · 默认最短刷新间隔</td><td>自动刷新触发可合并等待；0 表示无下限，页面可覆盖。</td><td>入口：心智模型与知识页配置。当前：0</td><td>我们</td></tr>
+<tr class="item"><td>observation_scope_limits · 旧式按范围观察上限</td><td>兼容旧配置；当前优先使用 consolidation_strategies，旧字段仍有兼容处理。</td><td>入口：API 兼容字段。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>observations_mission · 观察整理使命</td><td>决定如何形成持续认识，可替换内置整理规则。</td><td>入口：观察。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_adaptive_high · 高档自适应预算系数</td><td>adaptive 模式下，用返回 token 预算乘该系数得到候选工作量，再受上下限约束。</td><td>入口：API／服务配置。当前：0.25</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_adaptive_low · 低档自适应预算系数</td><td>同上，对应 low 档。</td><td>入口：API／服务配置。当前：0.025</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_adaptive_mid · 中档自适应预算系数</td><td>同上，对应 mid 档。</td><td>入口：API／服务配置。当前：0.075</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_fixed_high · 高档固定候选预算</td><td>fixed 模式下 high 映射的每分支候选工作量。</td><td>入口：API／服务配置。当前：1000</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_fixed_low · 低档固定候选预算</td><td>fixed 模式下 low 映射的每分支候选工作量。</td><td>入口：API／服务配置。当前：100</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_fixed_mid · 中档固定候选预算</td><td>fixed 模式下 mid 映射的每分支候选工作量。</td><td>入口：API／服务配置。当前：300</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_function · 召回预算映射方式</td><td>fixed 按档固定工作量；adaptive 根据返回长度调整候选工作量。</td><td>入口：API／服务配置。当前：fixed</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_max · 自适应候选预算上限</td><td>限制 adaptive 映射后的候选工作量。</td><td>入口：API／服务配置。当前：2000</td><td>我们</td></tr>
+<tr class="item"><td>recall_budget_min · 自适应候选预算下限</td><td>限制 adaptive 映射后的候选工作量。</td><td>入口：API／服务配置。当前：20</td><td>我们</td></tr>
+<tr class="item"><td>recall_chunks_max_tokens · 默认原文片段预算</td><td>内部召回可返回的原始片段文字长度；具体请求和页面可有单独预算。</td><td>入口：API；页面选项可覆盖相关预算。当前：1000</td><td>我们</td></tr>
+<tr class="item"><td>recall_include_chunks · 内部召回默认包含原文</td><td>内部检索是否默认附带来源片段；直接 HTTP 请求有自身 include 设置。</td><td>入口：API；页面与查询有对应选项。当前：启用</td><td>我们</td></tr>
+<tr class="item"><td>recall_max_tokens · 内部召回事实预算</td><td>内部检索返回事实文字的默认长度；直接请求可单独指定。</td><td>入口：API；页面与查询有对应选项。当前：2048</td><td>我们</td></tr>
+<tr class="item"><td>reflect_default_options · 普通 Reflect 默认选项</td><td>未在调用中指定时采用的 observation 搜索长度与实体附带设置。模型刷新应核对自身 trigger。</td><td>入口：反思 → 自定义。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>reflect_mission · Reflect 分析使命</td><td>为 Hindsight 内部分析提供角色与目标。</td><td>入口：反思。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>reflect_source_facts_max_tokens · Reflect 来源事实预算</td><td>检索时附带支持事实的 token 预算；-1 表示该限制不设上限，仍受整体上下文约束。</td><td>入口：API／服务配置。当前：-1</td><td>我们</td></tr>
+<tr class="item"><td>retain_chunk_batch_size · 长材料分块批次大小</td><td>流式处理长材料时每批最多处理多少个块；0 可关闭这层分批。</td><td>入口：API／服务配置。当前：100</td><td>我们</td></tr>
+<tr class="item"><td>retain_chunk_size · 普通分块字符数</td><td>把长材料切为提取片段的字符长度。</td><td>入口：Retain。当前：3000</td><td>我们</td></tr>
+<tr class="item"><td>retain_custom_instructions · 自定义提取规则</td><td>custom 模式下采用的提取说明。</td><td>入口：Retain → 自定义模式。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>retain_default_strategy · 默认写入策略</td><td>调用未指定 strategy 时选用的命名策略。</td><td>入口：Retain。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>retain_extraction_mode · 提取模式</td><td>concise／verbose／verbatim／chunks／custom。</td><td>入口：Retain。当前：concise</td><td>我们</td></tr>
+<tr class="item"><td>retain_max_attachments_per_chunk · 每块图像附件上限</td><td>限制单个提取块携带多少图像附件，避免一次输入过大。</td><td>入口：API／服务配置。当前：8</td><td>我们</td></tr>
+<tr class="item"><td>retain_mission · 提取重点</td><td>在内置提取规则之外指导优先记住什么。</td><td>入口：Retain。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>retain_strategies · 命名写入策略集</td><td>为不同材料类型保存局部提取配置。</td><td>入口：Retain → 添加策略。当前：未设置；沿用默认或无额外规则</td><td>我们定义，Agent 选择</td></tr>
+<tr class="item"><td>retain_structured_chunk_size · 结构化记录保留长度</td><td>单条对话轮次或 JSONL 记录可保持完整的字符上限。</td><td>入口：Retain。当前：未设置；沿用默认或无额外规则</td><td>我们</td></tr>
+<tr class="item"><td>store_document_text · 保存原始材料</td><td>保存完整原文与片段以供展开、核对和重提取。</td><td>入口：安全与隐私。当前：启用</td><td>我们</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://github.com/vectorize-io/hindsight/blob/v1.0.0/hindsight-api-slim/hindsight_api/config.py" target="_blank" rel="noopener">固定版本源码</a></p>
+</div></details>
+<details class="chapter" id="service"><summary>27. 附录：当前本地服务配置与少量预览中的服务级字段</summary><div class="chapter-body"><p class="intro">以下解释服务运行环境；它们与网页中的 Bank 配置分开。这里只列本次部署与界面理解直接有关的服务项；完整服务变量定义见上游配置手册和此前的 API 参考。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>LLM provider／model／base URL／API key</td><td>模型提供方、模型名称、API 地址与凭据。</td><td>当前为 DeepSeek / deepseek-flash；密钥放在 Git 忽略的本地配置文件。</td><td>我们维护</td></tr>
+<tr class="item"><td>LLM extra body／thinking</td><td>发给提供商的额外请求选项。</td><td>当前为接口兼容和快速流程测试显式关闭 thinking；后续可对照效果调整。</td><td>我们配置</td></tr>
+<tr class="item"><td>各操作独立模型／超时／重试</td><td>可为提取、整理、Reflect、页面刷新分别配置模型或限制。</td><td>当前共用已验证模型；Reflect 超时设置为 120 秒。</td><td>我们维护</td></tr>
+<tr class="item"><td>Embedding provider／model</td><td>检索向量模型。</td><td>当前镜像默认 BAAI/bge-small-en-v1.5 偏英文；当前只验证流程，中文检索效果待专门评估。</td><td>我们维护</td></tr>
+<tr class="item"><td>Reranker provider／model</td><td>候选重排序模型。</td><td>当前 cross-encoder/ms-marco-MiniLM-L-6-v2 也偏英文；UI 中文不会改变该模型。</td><td>我们维护</td></tr>
+<tr class="item"><td>数据库／pgvector／全文后端</td><td>记录持久化和各类索引的运行位置。</td><td>当前嵌入式 PostgreSQL + pgvector + native 全文；数据保存在独立 Docker 卷。</td><td>我们维护</td></tr>
+<tr class="item"><td>Worker／worker ID／并发</td><td>执行后台整理与刷新队列。</td><td>当前稳定 worker ID 为 sagitta-hindsight-local；并发和 API 进程资源由运行配置管理。</td><td>我们维护</td></tr>
+<tr class="item"><td>历史、日志保留与维护任务</td><td>保存多少观察／模型版本、审计与调用记录，以及何时清理。</td><td>界面能展示的是保留策略允许的历史。</td><td>我们维护</td></tr>
+<tr class="item"><td>文件解析器／OCR／文件存储</td><td>办公文件转文本、扫描内容识别、附件保存。</td><td>当前默认解析器是本地 MarkItDown；额外外部解析服务需自己的配置。</td><td>我们维护</td></tr>
+<tr class="item"><td>LLM 输出语言 llm_output_language</td><td>提示中的输出语言规则。</td><td>用来控制提取／整理等内容语言，与网页菜单语言分开。</td><td>服务级规则</td></tr>
+<tr class="item"><td>提取因果 retain_extract_causal_links</td><td>要求提取器识别材料中明确的因果联系。</td><td>参与建立因果边，结果仍需依据原文核对。</td><td>服务级规则</td></tr>
+<tr class="item"><td>可选事实字段 retain_optional_fact_dimensions</td><td>允许某些“何时／何地／何人／为何”等信息缺失。</td><td>避免没有材料时强行补齐字段；实际输出需检查。</td><td>服务级规则</td></tr>
+<tr class="item"><td>API／Control Plane 地址与访问</td><td>分别提供程序调用和管理网页。</td><td>当前仅本机：8888 API，9999 UI；完整部署命令见 infra/hindsight/README.md。</td><td>我们维护</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://hindsight.vectorize.io/developer/configuration" target="_blank" rel="noopener">官方说明</a></p>
+</div></details>
+<details class="chapter" id="examples"><summary>28. 四个实际阅读与维护例子</summary><div class="chapter-body"><p class="intro">这些是使用流程示例，适合配合本地虚构演示库查看。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>想确认它有没有记住一个约定</td><td>到文档找原话 → 到记忆看提取事实 → 到观察看是否合并改变了条件 → 到页面看整理后的说法。</td><td>如果原文是“这次部署前确认”，检查每层是否保留“这次”。</td><td>按来源逐层核对</td></tr>
+<tr class="item"><td>发现页面结论错误</td><td>打开生成依据 → 找到错误来自原文、提取还是归纳 → 修正对应来源 → 等整理／申请刷新页面。</td><td>只重写源查询可能改变表达，未必修复错误事实。</td><td>Agent 维护，系统重算</td></tr>
+<tr class="item"><td>想保留长期管理经验</td><td>记录行动、实际结果和适用条件 → 后台 observation 归纳 → 用专题问题整理管理经验页面 → 后续遇到相关任务时检索使用。</td><td>项目库经验要进入主库，需要上游选择并写入；Hindsight 在各自 Bank 内整理。</td><td>后续 Sagitta 调度</td></tr>
+<tr class="item"><td>想判断改配置是否有帮助</td><td>保留同一组测试材料与查询，比较提取结果、来源覆盖、错误与费用，再决定是否调整。</td><td>数量、证据次数或图的密度可以辅助观察，效果要看实际问题能否答对并保留条件。</td><td>我们评估</td></tr>
+</tbody></table></div>
+<p class="source">核对依据：<a href="https://hindsight.vectorize.io/faq" target="_blank" rel="noopener">官方说明</a></p>
+</div></details>
+<details class="chapter" id="sagitta"><summary>29. 与未来 sagitta-memory 的分工</summary><div class="chapter-body"><p class="intro">本次只解释现有 Hindsight 控制台；以下是此前讨论的插件职责，尚待实现和确认。</p><div class="table-wrap"><table><thead><tr><th>界面项／关键词</th><th>它具体做什么</th><th>例子、当前值与影响</th><th>管理建议</th></tr></thead><tbody>
+<tr class="item"><td>我们维护的规则</td><td>服务模型、提取与整理使命、Directives、预算、权限和默认模板。</td><td>规则可先使用默认，针对实际失败样本调整。</td><td>人工审查</td></tr>
+<tr class="item"><td>Agent 运行中维护的对象</td><td>普通项目 Bank、写入材料、事实纠正、页面主题、来源范围、主动查询与刷新申请。</td><td>使用既定接口积累经验，发现系统机制问题反馈给用户。</td><td>Agent</td></tr>
+<tr class="item"><td>插件自动维护的事项</td><td>记录游标、待提交队列、来源标识、Bank 路由、总注入预算、失败状态。</td><td>避免主模型每轮手工填写技术字段。</td><td>sagitta-memory</td></tr>
+<tr class="item"><td>常态／项目／情景召回绑定</td><td>决定当前哪些 Bank 参与自动查询及注入侧重。</td><td>这层配置属于插件；当前 Hindsight 界面中的召回开关控制单库内部检索方式。</td><td>插件＋Agent 在约束内管理</td></tr>
+<tr class="item"><td>自动记录频率与触发时点</td><td>何时收集一轮工作、多少材料提交一次、何时查询并注入。</td><td>它与 Hindsight 分块大小、LLM 整理批大小分别配置。</td><td>插件注册规则</td></tr>
+<tr class="item"><td>主 AI 的行为约束</td><td>授权、项目切换和任务注册等由宿主与任务系统实施。</td><td>Hindsight 的 Reflect 指令只约束其内部分析调用。</td><td>Sagitta 执行层</td></tr>
+</tbody></table></div>
+</div></details>
+</main></div><footer><p>本地控制台：<a href="http://127.0.0.1:9999/banks/sagitta-local-demo?view=profile&bankConfigTab=configuration">打开演示库配置</a> · <a href="http://127.0.0.1:8888/docs">本地 API 文档</a></p><p>术语翻译尽量采用实际界面文字。涉及“世界事实”“硬性规则”“BM25”“时间范围”等容易产生过强推断的文案，正文已按接口行为补充说明。界面有显示不代表适用于当前模型，云端产品介绍与本地开源能力分别标注。</p></footer>
+<script>
+const input=document.getElementById('search'), chapters=[...document.querySelectorAll('details.chapter')], rows=[...document.querySelectorAll('tr.item')], count=document.getElementById('count');
+function filter(){const q=input.value.trim().toLocaleLowerCase();let n=0;chapters.forEach(c=>{const title=c.querySelector('summary').textContent.toLocaleLowerCase(),intro=c.querySelector('.intro').textContent.toLocaleLowerCase();let hits=0;c.querySelectorAll('tr.item').forEach(r=>{const ok=!q||title.includes(q)||intro.includes(q)||r.textContent.toLocaleLowerCase().includes(q);r.hidden=!ok;if(ok){hits++;n++;}});c.hidden=!!q&&!hits;if(q&&hits)c.open=true;});count.textContent=q?`${n} 条匹配`:`${rows.length} 个条目`;}
+input.addEventListener('input',filter);document.getElementById('clear').addEventListener('click',()=>{input.value='';filter();});document.getElementById('expand').addEventListener('click',()=>chapters.filter(c=>!c.hidden).forEach(c=>c.open=true));document.getElementById('collapse').addEventListener('click',()=>chapters.forEach(c=>c.open=false));document.querySelectorAll('aside a').forEach(a=>a.addEventListener('click',()=>{input.value='';filter();const c=document.querySelector(a.getAttribute('href'));if(c)c.open=true;}));function revealHash(){const id=location.hash.slice(1),c=document.getElementById(id);if(c&&c.tagName==='DETAILS')c.open=true;}window.addEventListener('hashchange',revealHash);window.addEventListener('beforeprint',()=>chapters.forEach(c=>c.open=true));revealHash();filter();
+</script></body></html>

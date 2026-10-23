@@ -5,10 +5,19 @@
   "description": "启动时更新 Sagitta，再注册其预设；Updater 自身手动安装。",
   "type": "module",
   "engines": { "dsh": "0.2.1-rc.2" },
-  "exports": { ".": "./index.js" },
-  "files": ["index.js", "cordis.patch.yml", "README.md"],
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist", "cordis.patch.yml", "README.md"],
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
-  "dependencies": { "js-yaml": "4.3.2", "@deepseek-ai/schemastery": "~3.18.5" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "24.13.6",
+    "@types/js-yaml": "4.0.9"
+  },
+  "dependencies": { "js-yaml": "4.3.2" },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",
     "@deepseek-ai/cordis-plugin-include": "~1.0.10",

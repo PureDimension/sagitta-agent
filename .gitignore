@@ -14,16 +14,16 @@
 *.pfx
 credentials*.json
 secrets*.json
-worker/.dev.vars
-worker/wrangler.toml
-worker/reference/account.json
-worker/reference/env
 
 # Dependencies and generated state
 node_modules/
+.venv/
 dist/
 coverage/
+.runtime/
+.DS_Store
 *.log
 *.bak.*
-*.update-candidate.*
-.sagitta-auto-advance.json
+
+# Preserved local dependencies belong to the archive, not to source control
+archive/**/local-only/
