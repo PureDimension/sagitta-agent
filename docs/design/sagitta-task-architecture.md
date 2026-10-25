@@ -1,7 +1,7 @@
 # 任务插件架构提案
 
 2026-10-21。依据本机 DSH 0.2.1-rc.2、已创建的 PostgreSQL 表结构和已确认规则。
-共用数据库模块及前三批已获准继续；第四批正式任务创建/读取待审，DSH 接入尚待后续批次。
+主动业务接口已完成；2026-10-25 已挂载 DSH 配置、连接初始化、15 个主动工具及固定使用说明，自动业务与任务数据动态上下文留待后续批次。2026-10-24 单任务入口改造见下文；各批次记录保留演化过程，当前调用方式以对应最新章节为准。
 
 ## 架构范式：已确认方向
 
@@ -18,7 +18,7 @@ https://docs.spring.io/spring-framework/reference/data-access/transaction/declar
 AI 主动调用和事件/定时自动触发同属接入层，用户已同意平级组织；当前文件提案为 tools.ts 与 automation.ts。
 工具入口负责注册、参数格式、身份提取和返回结果；自动入口负责触发时点、托管会话、
 调用调度及错误报告；业务规则统一进入 Service，持久化统一进入 Repository。
-例如周期由自动入口控制，哪些认领能续租由 Service 决定，批量更新 SQL 由 Repository 执行。
+例如续租 Service 声明周期并提供注册函数，自动入口调用注册并绑定 DSH 生命周期，批量更新 SQL 由 Repository 执行。
 规模较小时保持平级文件，内容增长后可分别升为 tools/ 与 automation/ 目录。
 下面的模块表为职责清单，辅助文件按实现规模创建。
 
@@ -38,18 +38,20 @@ DSH 工具 / Sagitta 插件 / 生命周期与定时器 → service/ 中的业务
 | index.ts | 装配、配置校验、服务发布、注册和销毁 | DSH Context、配置 → 可用的任务服务与适配器 |
 | contracts.ts | 公共输入输出、身份和错误码 | Project/Task 视图、Actor、内部认领凭证、变更通知 |
 | service/ | 按业务拆分项目/任务操作、状态规则、授权、业务事务边界 | 普通 TS 参数 → 业务结果或明确错误 |
-| repository.ts | 参数化 SQL、锁、数据库行转换，使用传入的查询入口 | 内部查询参数 → 数据对象 |
+| repository/ | 按项目、任务、认领拆分参数化 SQL、锁和数据库行转换，使用传入的查询入口 | 内部查询参数 → 数据对象 |
 | schema.ts | 检查任务应用表结构版本 | 查询入口 → 检查通过或明确错误 |
 | runtime.ts | 本地数据库按需启动、就绪检查 | 本地运行配置 → 可连接实例；external 跳过 |
 | adapters/tools.ts | 已确认的 11 个模型工具 | 官方参数校验、调用者身份 → service；结果向模型投影 |
 | adapters/context.ts | 稳定使用说明与动态任务摘要 | 官方提示词注册、刷新后的任务快照 → 上下文 |
-| adapters/automation.ts | 会话托管、续租/清理调度、卸载收尾 | 官方生命周期和定时器 → service |
+| adapters/automation.ts（待实现） | 从 DSH 取得会话身份，将定时器、日志和上下文接入 Service，绑定注册与注销 | 官方生命周期 → service.register / 注销函数 |
 | adapters/gate.ts | 执行前权限检查 | 官方 tools/pre-execute → 权限结果；覆盖范围仍待审 |
 | migrations/ | 可审查的结构变更 | 现有 SQL 与初始化入口；版本由应用 schema 管理 |
 
 按用户已接受的划分，service/operations/ 放具体操作，当前已有 project.ts、task.ts；
 后续自动业务流程放 service/automation/，DSH 触发和注册仍放 adapters/。其余文件随实现增加。
-Repository 的进一步拆分随实际职责确定。
+repository/ 内 project.ts、task.ts、claim.ts 分别承载三类数据访问；result.ts 保存查询三态类型。
+index.ts 的 TaskRepositories 仅组装 projects、tasks、claims，三者共用传入的查询入口。
+事务执行器为每次事务传入同一条连接；Service 显式选择对应 Repository，业务顺序及事务边界保持原样。
 仅公开 contracts 与任务服务入口；SQL、连接池和运行目录属于私有实现。
 首版采用 pg 驱动与明确 SQL，延续现有 PostgreSQL 结构；暂缓通用存储框架。
 连接池与事务收尾已由 shared/database.ts 提供。
@@ -58,7 +60,7 @@ Repository 的进一步拆分随实际职责确定。
 
 - contracts.ts：Project 读取结果含 id、name、description。
 - schema.ts：checkTaskSchema 要求迁移记录恰为 [1]，空记录及其他版本直接报错；不会自动修改结构。
-- repository.ts：TaskRepository 接收 Pick<Database, 'query'>，兼容共用实例与事务连接的查询能力。
+- repository/：各 Repository 接收 Pick<Database, 'query'>，可使用共用实例或事务连接的查询能力。
   listProjects 按 created_at、id 排序并过滤归档；getProject 按参数化 ID 查询，以三态结果区分可用、归档和缺失。
   归档/缺失结果只含状态标记，Service 通过 requireFound 转换为明确错误。
 - 编译通过 shared/dist/database.d.ts 引用公共类型；源码仍只维护 .ts，产物保持忽略。
@@ -84,7 +86,7 @@ Repository 的进一步拆分随实际职责确定。
 - 列表按数值 ID 升序，排除归档项目、归档任务。项目详情、项目编辑、任务详情及正式任务创建统一返回 RepositoryResult<T>：
   found 在 value 字段携带结果；归档只返回 archived 标记；缺失返回 missing 标记。
   service/require-found.ts 按当前操作对象生成明确错误；任务自身或所属项目归档均返回 archived，正文止于 Repository。
-  用户已确认接受到期至回收之间的短暂不一致，移除 temp 到期查询过滤；回收流程在后续批次实现。
+  当时按用户要求移除 temp 到期查询过滤；2026-10-24 列表继续保持此行为，单任务详情改由统一入口访问时回收。
   Task 视图仅含 id、projectId、kind、title、description、status。
 - 类型检查、构建及四组真实数据库测试通过，覆盖正常创建、空标题/无效项目拒绝、三态结果、temp 到期后仍可读取与删除后不存在、
   立即认领的身份/期限、认领失败整体回滚、项目并发归档时编辑/创建等待后正确拒绝；测试数据通过临时表或独立随机 schema 隔离并清理。
@@ -100,12 +102,12 @@ Repository 的进一步拆分随实际职责确定。
   Service 通过 requireFound 确认可用，再调用 updateTaskDescription 更新 description 和 updated_at。
   两个 Repository 方法共用事务连接；其他字段及认领记录保持原样。
 - 权限补充批次：锁任务后调用 lockClaim 锁定认领，requireTaskWriteAccess 允许未认领编辑；已有认领须有效且设备/会话同时匹配。
-  已过期认领返回等待回收错误；权限检查与编辑共用事务。类型检查、构建及身份/过期拒绝的真实数据库测试通过，尚未接入 DSH 工具。
+  当时已过期认领返回等待回收错误；2026-10-24 改为统一入口清理并返回到期结果。权限检查与编辑共用事务，尚未接入 DSH 工具。
 
 ### 第六批：正式任务认领（已审查）
 
 - 用户撤回双层 TaskOperations/TaskService 方案；现仅保留 service/operations/task.ts 的 TaskOperations，直接实现创建、编辑、认领。
-- claimTask 独立调用时使用默认事务执行器；创建后认领时显式传入 reuseTransactionRunner(repository)，复用创建事务且由外层提交或回滚。
+- 当时 claimTask 通过 reuseTransactionRunner 组合创建事务；2026-10-24 统一入口直接向内部动作传递事务 Repository，该辅助已删除。
 - claimTask 锁定任务并确认未归档，接受 open 或 normal/blocked；第七批允许创建事务中的 temp/open 复用首次认领。拒绝任何尚未清除的认领，包括已过期记录。
   校验通过后创建 20 分钟认领，再更新状态为 in_progress；二者共享事务，失败整体回滚。
 - Repository 新增 hasClaim 与 updateTaskStatus，正式任务创建固定 open；认领状态转换由 Service 负责。
@@ -140,9 +142,23 @@ Repository 的进一步拆分随实际职责确定。
 | 阻塞 | in_progress → blocked | 拒绝 | 本人有效认领，执行时撤销 |
 | 取消 | open/in_progress/blocked → cancelled | 从 in_progress 物理删除 | 无认领或本人有效认领，执行时撤销 |
 
-- done/cancelled 不再执行这五个动作；过期认领等待回收。所有修改在同一事务提交。
-- service/with-claimed-task.ts 共用事务、锁与有效本人认领检查，状态规则由调用者的动作回调声明；取消使用允许未认领的权限路径。requireTaskWriteAccess 名称和逻辑按用户要求保留。
+- done/cancelled 不再执行这五个动作；2026-10-24 过期认领改为访问时回收。所有修改在同一事务提交。
+- 当时 service/with-claimed-task.ts 共用事务及认领检查；2026-10-24 这些职责集中到 execute/dispatch，该辅助已删除。requireTaskWriteAccess 名称和逻辑按用户要求保留。
 - 已通过类型检查、构建和七组真实数据库测试，覆盖正式/临时动作、权限和终态拒绝、未认领取消及失败回滚。
+
+### 2026-10-24：单任务统一入口与访问时回收（已审查）
+
+- TaskOperations 对外保留 createTask、listTasks，并以 execute(input) 统一承接 get/update/delete/claim/release/complete/block/cancel。
+  execute 在同一事务中锁项目、任务、认领，调用 reclaimExpiredTask；正常路径再由 dispatch 分发至内部动作。
+  各动作接收 TaskContext，复用已读取数据；到期检查只在入口调用一次，正常写入无需额外预查询。
+- reclaimExpiredTask：有效或无认领直接返回；过期 normal 撤销认领并恢复 open，过期 temp 撤销认领并删除任务。
+  返回 expired、回收前 Task、原 owner 和说明；入口直接返回该结果并提交，原请求动作不执行。
+  正常结果为 success/value，数据库或业务异常沿用事务回滚。消息呈现留给 DSH 接入层。
+- 创建后立即认领直接复用内部 claimTask，依然与创建共用事务；读取详情也进入事务并取得行锁。
+  列表和项目操作保持原语义；周期回收见生命周期章节，上下文通知仍待 DSH 接入。
+- lockClaim 用物化 CTE 先取得行锁，再计算 expired；避免锁等待跨过到期点后仍使用提前计算的判断。
+- 到期结果随本次调用返回；物理删除后再访问返回不存在。尚未引入持久通知记录，提交后进程崩溃不能保证提示送达。
+- 验证：12 组真实 PostgreSQL 测试通过，覆盖全部单任务动作到期回收、原内容返回、范围隔离、失败回滚、并发仅一方回收和等待认领锁期间到期。
 
 ### 后续动作扩展待办
 
@@ -284,9 +300,36 @@ Spring Modulith 事件发布记录 https://docs.spring.io/spring-modulith/refere
 
 ## 生命周期
 
+### 正式任务续租（2026-10-23，单次业务已实现，DSH 接入待审查）
+
+- DSH 接入层取得本设备身份及本实例负责的存活会话；会话空闲时继续续租，销毁或插件卸载后停止纳入。历史会话记录和浏览器标签页不直接作为存活依据。
+- 就绪后执行一次，每轮完成后等待 5 分钟再开始下一轮；串行等待自然防重叠，错误交给 DSH logger，下一周期重新按数据库现状查询。
+- 每轮仅续租匹配设备/会话的有效 normal 认领，任务须 in_progress 且项目/任务均未归档。沿用认领代次约束：从本轮候选记录取得 claim_id，更新时匹配该代次并复查有效期；无须向 AI 暴露。
+- expires_at 更新为数据库当前时间加 20 分钟，保持任务状态和 updated_at；temp 与过期认领留给独立回收流程。
+- 组织：service/automation/renewal.ts 的 TaskRenewal 提供 register(periodicTasks, owner, callbacks) 注册策略，以及 renewClaims(deviceId, sessionIds) 单轮业务；repository/claim.ts 执行批量续租 SQL。后续 adapters/automation.ts 从 DSH 取得身份、绑定定时/日志/上下文与生命周期，再调用 Service；插件 index.ts 装配依赖。
+- 当前已实现 TaskRenewal 与 Repository.renewClaims：空会话列表返回 0；单条 SQL 按任务 ID 顺序锁定候选认领，再检查代次及有效期并更新，返回续租数量。错误直接传播；任务数据保持原样。周期注册与到期回收已提供内部能力，实际 DSH 定时器及会话采集仍待接入。
+- 公共执行组件 shared/periodic-task.ts 中，PeriodicTasks 负责登记运行实例及统一停止；内部 PeriodicTaskRunner 通过 start/stop/execute/wait/cancelWaiting 管理单项的停止信号、计时器和运行 Promise，复用 runPeriodicTask 循环。定时和日志仍由构造参数注入；register 返回异步注销函数。各注册独立串行运行，周期从本轮业务及结果回调结束时计算。
+- TaskRenewal.register 注册立即执行的本会话续租，间隔 5 分钟；额外重试最多 2 次、间隔 5 秒、重试时间预算 60 秒。成功传递续租数量，重试耗尽传递原始异常；重试预算不能中止正在执行的 SQL。实际 DSH 挂载、身份读取、上下文提示与续租结果语义补充仍待后续接入。原 adapters/automation.ts 仅声明业务策略，已合并进 Service。
+- 本机 DSH 0.2.1-rc.2 已核对 AgentRegistry.list()、agent/created/disposed 和 session/created/disposed；ctx.interval 回调不等待 Promise，因此串行调度交给公共组件，接入层绑定 ctx.timeout。设备 ID 来源及任务插件作用域内的会话筛选仍待接入时确定。
+
+### 周期回收（2026-10-24，内部能力已实现，待审查）
+
+- service/automation/reclamation.ts 的 TaskReclamation 在插件级注册一次，立即执行首轮，此后每轮结束等待 5 分钟。与按会话注册的续租独立调度，覆盖所有设备、包括已经关闭的会话遗留的到期认领。
+- listExpiredTaskIds 只查询未归档项目/任务的到期候选，按数值任务 ID 排序；单次回收事务按顺序锁项目、任务和认领，复查当前状态。
+  候选已删除或归档时跳过；有效或已撤销认领由 reclaimExpiredTask 返回无需回收。主动访问与周期回收共用该函数的全部清理规则。
+- 一批回收在同一事务提交，任一项失败整体回滚；成功后 onSuccess 接收 ExpiredTask[]（原任务内容、原 owner、回收说明），接入层据 owner 路由提示。
+  共用说明只描述回收结果，主动 execute 额外说明本次请求动作未执行。
+- 回收注册 retries: 0，异常原样交给 onFailure，下一周期按数据库现状继续扫描；避免立即重放物理删除使提交结果不明的清理被后续空结果掩盖。续租保留原有重试策略。
+- 验证：15 组真实 PostgreSQL 测试和 7 组周期组件/注册测试通过，覆盖跨会话回收、有效记录保留、批量整体回滚、主动与两个回收调用竞争、首次执行及失败后下一周期恢复。
+  尚未实际挂载 DSH 或实现提示投递；跨进程崩溃的通知持久化仍未提供。
+
+### DSH 装配与生命周期待办
+
+- 2026-10-25 本批：index.ts 声明 static Config，Service.init 调用 runtime/connection.ts；普通配置变更复用 Cordis 重启实例，卸载时关闭池。连接失败记录到本地并交给 logger，初始化到此结束，修正配置可重新检查。
+  根包导出 @sagitta/runtime/task，sagitta.json 登记插件。后续同日已增加 schema 检查、业务装配、15 个主动工具和固定说明，详见 [主动工具接入](sagitta-task-tools.md)；定时维护与任务数据动态上下文仍待挂载。
 - 插件在 Sagitta 对应作用域内发布服务，工具/上下文/门禁沿用相同作用域。
 - 工具注册与数据库就绪分开；后续执行插件的绿色通道在任务数据库不可用时仍须可用。
-- 本地模式按需启动，external 只连接；初始化迁移由独立脚本处理，插件检查 schema。
+- 首版只连接已有服务；初始化迁移由独立脚本处理，业务挂载前已接入已有 schema 检查。受管数据库启动留待后续。
 - 会话创建/恢复时纳入本进程托管范围，销毁时停止为它续租；加载时兼顾已存在的会话。
 - 定时维护串行运行，上一轮未结束时不会再重叠；查询与锁等待有超时。
 - 上下文注入采用 DSH section/context；context 的同步文本回调读取已刷新快照，

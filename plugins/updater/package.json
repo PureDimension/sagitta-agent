@@ -14,15 +14,21 @@
   },
   "devDependencies": {
     "typescript": "5.9.3",
+    "@deepseek-ai/dsh-config-editor": "0.2.1-rc.2",
     "@types/node": "24.13.6",
     "@types/js-yaml": "4.0.9"
   },
-  "dependencies": { "js-yaml": "4.3.2" },
+  "dependencies": { "js-yaml": "4.3.2", "yaml": "2.9.1" },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/cordis-plugin-loader": "1.0.6",
+    "@deepseek-ai/dsh-atomic-write": "0.2.1-rc.2",
     "@deepseek-ai/cordis-plugin-include": "~1.0.10",
     "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-plugin-manager": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5",
     "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent-preset": "0.2.1-rc.2",
     "@deepseek-ai/dsh-web-app": "0.2.1-rc.2"
   }
 }

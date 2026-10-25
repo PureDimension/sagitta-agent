@@ -112,7 +112,7 @@
 
 - 用户询问是否有必要在查询时推导到期状态。核对 BullMQ 官方文档：worker 的 stalled 检查负责把失去锁的 active 任务转回 waiting 或 failed；状态回收有检查周期。参考：https://docs.bullmq.io/guide/jobs/stalled 和 https://docs.bullmq.io/patterns/manually-fetching-jobs 。
 - SQS 官方契约是 visibility timeout 到期后消息重新可接收；此文档不证明它内部在普通查询时重写状态。参考：https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html 。
-- 用户已确认：Sagitta 采用插件启动时及运行期间周期回收，事务内将正式任务恢复 open 并撤销过期认领、将 temp 连同认领删除；列表读取存储状态，接受回收前的短暂延迟。已按最简化原则删除 temp 查询中的认领关联及期限过滤；回收流程仍待后续批次实现。
+- 用户已确认回收规则：事务内将正式任务恢复 open 并撤销过期认领、将 temp 连同认领删除；列表读取存储状态，接受回收前的短暂延迟。2026-10-24 单任务访问增加立即回收，详情随之改走统一入口；启动及周期批量回收仍待实现。
 - 有效认领校验仍必须按数据库时间检查 expires_at，使用该认领执行的状态写入也须原子检查凭证与期限；回收延迟不应延长操作权限。先前“查询必须立即映射状态”的建议属于可选契约，并非成熟实现的必要条件。
 - 本次简化已通过类型检查、构建及两组真实 PostgreSQL 测试；调整既有用例确认 temp 认领到期后列表与详情仍返回原存储结果，归档过滤继续生效。
 - 用户进一步要求：任务详情分别提示“不存在”和“已归档”。temp 被回收删除后统一提示不存在；到期通知由后续自动流程提醒 AI，查询阶段继续直接读取存储结果。
@@ -154,14 +154,14 @@
 - 多步骤业务优先使用显式事务与简单 SQL，按已同意的方向先调整任务编辑。lockTask 与后续写入必须使用同一事务 Repository；当前设计中任务所属项目不可修改。
 - 用户补充：每次只实现一个主动接口，说明并审查后继续。当前批次只拆分任务编辑的事务与 SQL；类型检查、构建及四组真实数据库测试均通过，并发归档拒绝及原有读写行为保持。
 - 已确认删除规则：正式任务软删除归档，temp 物理删除；项目删除时归档项目及其正式任务、清除 temp、撤销全部认领。
-- 已确认任务权限：已认领任务的说明修改、释放、完成、阻塞、取消和删除，仅当前认领设备与会话可执行；未认领任务允许任意会话编辑、取消、删除。认领过期后等待回收完成再操作。
+- 已确认任务权限：已认领任务的说明修改、释放、完成、阻塞、取消和删除，仅当前认领设备与会话可执行；未认领任务允许任意会话编辑、取消、删除。2026-10-24 过期访问改为立即回收并返回到期结果，本次原操作停止；原有等待周期回收的路径被替换。
 - 已确认并实现正式状态流转：open/blocked 可认领为 in_progress；in_progress 可释放为 open、完成为 done、阻塞为 blocked，均撤销认领；open/in_progress/blocked 可取消为 cancelled；done/cancelled 不重开。temp 从 in_progress 释放、完成、取消时直接清除，阻塞报错。
 
 ## 2026-10-23：完整认领能力与事务组合
 
 - 用户要求 Service 提供完整认领、完成、阻塞、释放等业务能力；组合流程调用这些能力，避免直接拼接其他业务能力的 Repository 写入。已先实现 claimTask，其他状态动作后续逐项实施。
 - 用户纠正并要求回退重写：当前只做 Service/Repository，不能为了组合创建与认领新增里外两层 Task 或 Facade；对外 AI 接口属于后续 DSH 适配。已撤回 TaskService 类及其装配，重写为 TaskOperations 内完整的创建与 claimTask；创建入口随后统一为 createTask。
-- claimTask 默认通过注入的执行器开启事务；createTask 创建 open 后直接调用 this.claimTask，显式传入 reuseTransactionRunner(repository)。该公共辅助仅执行回调，复用当前事务 Repository，异常传播到外层统一回滚；没有另开事务、隐式上下文或额外业务入口层。
+- 当时 claimTask 通过 reuseTransactionRunner(repository) 复用创建事务。2026-10-24 统一入口改造后直接向内部 claimTask 传入当前事务 Repository，删除该辅助；创建继续复用认领业务，失败由外层整体回滚。
 - 重写后类型检查、构建及五组真实数据库测试通过：独立/创建后认领、重复和过期未回收认领拒绝、非法状态/归档/temp 拒绝、blocked 认领、两设备竞争及两种失败回滚。该认领批次已获用户认可；编辑权限在下一批补齐，尚未接入 DSH。
 
 ## 2026-10-23：任务说明编辑权限
@@ -199,3 +199,282 @@
 - 后续待设计：参考 legacy 的完成前检查，以及阻塞信息登记、额外处理与联动。具体字段、规则和调用顺序须单独审查；本批仅记录待办。
 - 类型检查、构建及七组真实 PostgreSQL 测试通过。新增覆盖四个动作的正式流转、临时清理、身份/过期/终态拒绝、未认领取消、阻塞后重新认领，以及撤销认领后的状态更新或物理删除失败时整体回滚。
 - 用户已审查认可本阶段并要求本地提交：11 个主动接口对应的 Repository/Service 业务能力完成；DSH 工具注册、自动续租、到期回收与上下文注入仍属后续接入工作。
+
+## 2026-10-23：自动机制接入前的工具说明核对
+
+- 本机 DSH 0.2.1-rc.2 源码核对：defineTool 接收 description/parameters，tools.register 注册；systemPrompt.assemble 收集工具 schema，agent-loop 将 tools 纳入模型请求。插件负责编写说明，框架负责传递，工具说明无需重复手工追加到对话历史。
+- 默认 native 模式以请求 tools 字段提供工具；ptc 模式由框架生成 tools:sdk 提示词区，并提供 run_code。工具说明的模型呈现由模式决定，不能概括为固定插在上下文最底部。
+- 当前任务清单、认领状态和临时任务到期提醒属于动态运行信息，需要插件提供。用户明确希望临时任务到期后注入提示；续租、回收和提示投递的具体接入尚未实施。
+- 用户要求正式续租先讨论插件行为和代码组织；提案已记录于任务架构文档，尚未编写运行代码。核对本机 DSH 的存活 Agent 列表、创建/销毁事件及 Cordis 定时器；会话空闲是否继续续租按已有“插件存活自动续期”意图建议保留，具体接入待审查。
+
+## 2026-10-23：正式认领的单次批量续租
+
+- 用户批准先实现 Service/Repository。TaskRenewal.renewClaims(deviceId, sessionIds) 接收接入层提供的会话列表，空列表直接返回 0，其余交给 Repository，返回实际续租数量。
+- Repository 单条 SQL 筛选有效的正式、进行中、未归档项目/任务认领，匹配设备和会话。按任务 ID 顺序锁定候选认领，更新时复查 claim_id 与有效期，避免等待锁时已过期的认领被延长。到期时间取数据库当前时间加 20 分钟，沿用 claimLeaseMinutes；任务内容、状态和 updated_at 保持原样。
+- 单条 SQL 由数据库保证原子性，无额外事务包装、重试或局部错误吞掉。临时及过期认领保持原样；自动调度、DSH 生命周期、回收与提醒仍待实现。
+- 类型检查、构建及八组真实 PostgreSQL 测试通过；新增覆盖设备/会话筛选、临时/过期/归档/非进行中排除、连续续租不累计时长、任务及认领身份保持、空会话不访问数据库和错误传播。续租锁等待及并发回收的交互尚未专项测试；git diff --check 通过。
+
+## 2026-10-23：Repository 按职责拆分
+
+- 用户要求将 repository.ts 拆为文件夹，本轮结构调整免于 150 行限制。repository/project.ts、task.ts、claim.ts 分别保存项目、任务、认领的数据访问；三态查询结果类型移至 repository/result.ts。
+- repository/index.ts 提供 TaskRepositories，显式组装 projects、tasks、claims，三个对象共用传入的查询入口。Service 与事务回调按对应属性调用；事务执行器始终将同一条连接传给三者，保留原业务顺序、锁顺序及提交/回滚范围。
+- 本轮保留方法名和 SQL，移除旧源码入口并更新所有维护中的导入与测试。按实际写入对象归属：项目范围的认领删除在 claim.ts，临时任务删除与任务归档在 task.ts；项目删除的跨表顺序继续由 ProjectOperations 声明。
+- 验证：原有 21 个方法的签名及正文与提交版本逐项一致，新增续租方法归入 claim.ts；类型检查、构建、八组真实 PostgreSQL 测试及 git diff --check 通过。首次测试因本地数据库未运行失败，按需启动已有实例后全部通过，未设置开机自启。清除了原路径的两个过时编译产物。
+
+## 2026-10-23：续租身份来源讨论
+
+- 核对本机 DSH 0.2.1-rc.2：Agent.id 是 SessionId，与持久会话身份一致；工具执行上下文可提供 agent。Web 新建会话生成 session-UUID，恢复历史会话通过 resumeSessionId 沿用原 ID。一次模型轮次、页面重新打开和后端进程生命周期均不等同于新的 Session。
+- 自动续租需区分持久会话 ID 与本实例正在托管的 Agent；存活会话采集与销毁事件在后续适配层接入，浏览器标签页可见性不足以判断后台 Agent 是否存活。
+- 设备身份候选为官方 getOrCreateAnonymousUserId()：它是 DSH_HOME 范围的随机 UUID，可正常跨重启保留，复制整个 home 也会复制 ID；写入失败会退化为本进程标识。可用于安装范围关联，不能视作硬件身份或认证凭据。是否采用该标识仍待用户确认；本轮仅说明语义，未添加身份或自动调度代码。
+
+## 2026-10-23：续租调度与失败处理讨论
+
+- 用户保留 20 分钟租约、5 分钟续租；明确每个会话续租本会话认领的正式任务。后端退出保留认领，由到期回收处理；恢复同一会话且租约有效时继续续租。
+- 用户希望简单重试，持续失败进入该会话上下文，支持逻辑集中维护。本轮提议增加轻量后台执行辅助，集中防重叠、有限重试、停止与结果回调，续租 Service 保持单次业务；次数、间隔与具体公共接口仍待确认。
+- 本机源码核对：Cordis 提供生命周期绑定的 interval/timeout，systemPrompt.context 提供按作用域注入的动态上下文；已发现的 dsh-llm-retry 专用于模型请求恢复，不能直接承担数据库续租重试。尚未发现覆盖本需求的通用后台作业执行器。
+- 待审建议：整轮含重试期间保持 running，finally 释放；失败状态经 DSH 动态上下文呈现，下次模型请求可见，成功后清除当前告警。提示本身不保证唤醒空闲 Agent；下一周期成功也不代表先前过期的任务已重新认领。当前仅记录讨论，未编写调度代码。
+
+## 2026-10-23：成熟续租机制与轻量依赖调研
+
+- 用户希望参考工业实现并优先复用公共库。本轮阅读 BullMQ 的 LockManager/extendLocks Lua：独立管理续租、持有 job/token、单轮 await 完成后递归安排下一次 timeout、原子校验 token 并延长 TTL、报告具体续租失败任务。LockManager 依赖 Worker 及存储接口，直接调用它无法自动管理 Sagitta 自定义认领表。
+- Kubernetes client-go leader election 区分 LeaseDuration/RenewDeadline/RetryPeriod，续租超过截止窗口后停止领导职责；引用用于借鉴有界重试和租约丢失语义，不引入其选主系统。此前“5 秒额外重试 2 次”仅为本项目候选参数，并非行业标准。
+- 轻量候选 p-retry 提供重试次数、退避、时间预算、shouldRetry、AbortSignal 和失败回调；本次读取的上游 package.json 为 8.0.1、Node >=22、一个直接运行依赖，本机 Node 24.16.0。建议使用 DSH 定时/生命周期 + p-retry + 现有续租 SQL，具体版本和参数待实现时确认；未安装依赖。
+- p-queue 是进程内并发队列，pg-boss/Graphile Worker 是完整 PostgreSQL 作业队列，均有各自的语义与集成成本。当前单个续租循环优先复用 DSH；可借鉴 BullMQ 的递归 timeout 自然串行模式，替代 interval/running 提案，尚待用户确认。
+- 仍需显式设计的边界：现有续租返回数量无法报告预期认领的丢失；当前 SQL 从数据库读取 claim_id 后在本轮内匹配，区别于 Worker 保留旧 token 并提交验证，不能宣称可隔离同设备同会话的旧运行实例。p-retry 不能取消底层 SQL，重试时间预算也不等同于单次调用硬超时。上述为发现与待审事项，本轮保持代码不变。
+- 官方依据：[BullMQ LockManager](https://github.com/taskforcesh/bullmq/blob/master/src/classes/lock-manager.ts)、[extendLocks](https://github.com/taskforcesh/bullmq/blob/master/src/commands/extendLocks-1.lua)、[client-go leader election](https://github.com/kubernetes/client-go/blob/master/tools/leaderelection/leaderelection.go)、[p-retry](https://github.com/sindresorhus/p-retry)、[p-queue](https://github.com/sindresorhus/p-queue)、[pg-boss](https://github.com/timgit/pg-boss)、[Graphile Worker](https://github.com/graphile/worker)。
+
+## 2026-10-23：公共串行执行组件首批实现
+
+- 用户同意复用 p-retry 并采用串行周期流程。本批新增 50 行 shared/periodic-task.ts，立即执行首轮，本轮业务与结果回调完成后才等待下一周期；由 p-retry 8.0.1 处理业务重试，参数直接沿用官方 Options，signal 统一由执行组件传入。
+- 接入层注册 run、wait、onSuccess、onFailure、周期、重试策略与 AbortSignal；wait 后续使用 DSH timeout，卸载须同时中止 signal 并取消等待。结果回调与调度错误向返回的 Promise 传播，避免重放已经成功的业务；执行中停止仍等待原调用结束并抑制结果通知。业务最终失败经 onFailure 报告后继续后续周期。
+- 类型检查、构建共享模块及三组测试通过，覆盖重试耗尽后恢复、结果传递、执行顺序、启动前/执行中/重试等待/周期间隔停止、报告与调度错误传播；git diff --check 通过。依赖经 npm 安装，清单与源码均用 apply_patch 修改。
+- 本批尚未接入 DSH，未改变数据库业务或启动实际续租；会话身份、具体重试策略、上下文告警、续租结果语义补充按后续小批次审查。
+
+## 2026-10-23：注册式自动续租接入
+
+- 用户明确要求固定间隔与回调通过注册启动，本批增加 PeriodicTasks.register/dispose，复用已有 runPeriodicTask。管理器统一持有各注册的 AbortController、等待取消函数和运行 Promise；注销中止重试并解除等待，等待在途调用结束；统一关闭后拒绝新注册。
+- 注册能力最初位于 adapters/automation.ts；后续按职责归入 TaskRenewal.register，捕获 owner 的设备/会话身份，只传入本会话 ID；周期固定 5 分钟，重试常量为最多额外 2 次、间隔 5 秒、60 秒时间预算。成功/最终失败交给插件注册的回调，报告与调度错误交给管理器的 reportError；数量 0 保留原业务语义，未宣称代表所有历史认领恢复。
+- 后续装配将 schedule 绑定 DSH ctx.timeout(callback, delay)，reportError 绑定 DSH logger；会话卸载时调用并等待注销函数，插件卸载时调用并等待 dispose，再关闭数据库。停止只撤销运行安排，认领行由原租约规则处理。本批未启动实际 DSH 插件或读取身份。
+- 类型检查、全量构建、五组周期执行与续租接入测试、git diff --check 通过；新增验证真实 p-retry 配合虚拟计时器下的重试次数、会话范围、失败后下一周期恢复、单项等待取消、统一关闭等待在途调用和关闭后注册拒绝。DSH 实际生命周期集成仍待验证。
+
+## 2026-10-23：周期任务可读性与接入层边界整理
+
+- 用户指出嵌套回调使代码难维护，要求保持注册能力并整理为可直接理解的对象和方法。PeriodicTasks 只登记、启动及统一停止实例；内部 PeriodicTaskRunner 保存停止信号、运行 Promise 和计时状态，分为 start/stop/execute/wait/cancelWaiting。复合函数类型使用命名类型，批量停止展开循环，错误报告与注册移除使用显式 try/catch/finally。
+- 注册制仍需要业务和定时回调，按职责收敛到短方法，避免把全部生命周期状态塞进 register 局部闭包；单项执行继续复用 runPeriodicTask/p-retry，成功/失败通知和注销行为保持原样。
+- 接入层的职责是连接 DSH 与内部服务：取得调用身份、绑定框架定时器/日志/上下文、响应生命周期。原 adapters/automation.ts 只定义续租业务策略，归类不准确；现移入已有 TaskRenewal.register，并移除原入口及过时编译产物。后续 DSH 接入层直接调用该方法，Service 调用公共管理器并返回注销函数。
+- 类型检查、全量构建及六组周期执行/续租注册测试通过，新增验证单项注销和异常不会影响其他注册；git diff --check 通过。续租周期、重试策略、Repository 与数据库行为保持原样，实际 DSH 装配仍待后续实施。
+
+## 2026-10-23：自动计时统一注册约定
+
+- 用户确认并要求推广：涉及自动计时的业务必须提供注册函数；接入层调用业务注册函数，业务注册函数依赖公共调度组件，循环和计时统一由公共组件管理。已同步 AGENTS.md，替换此前仅按复用需要考虑提取调度的条目。
+- 业务模块负责执行内容、间隔、重试策略及结果处理；接入层绑定 DSH 原生计时器、日志和生命周期，并负责注销。当前 TaskRenewal.register → PeriodicTasks.register 的结构符合该约定；后续定时上下文处理也沿用此入口关系。
+- 本次仅更新开发约定，运行代码与行为保持原样。
+
+## 2026-10-24：单任务访问统一检查与到期回收
+
+- 用户要求首次访问发现到期就清理并带回内容，且每个业务函数连一行检查调用也不重复。已授权将已有单任务操作集中到 TaskOperations.execute；列表保持普通查询，周期批量回收后续接入。
+- execute 统一事务、锁定、到期回收；dispatch 统一写入权限并分发，动作只保留各自状态校验和数据库修改。创建和列表独立保留；创建后认领继续直接调用相同认领处理函数。未添加外层 Task 类、代理或装饰器。
+- reclaimExpiredTask 作为共用业务返回 expired/task/owner/message；临时任务删除，正式任务撤销认领并恢复 open。返回值在事务提交后交付；清理路径不抛业务异常，避免清理被回滚。原内容随结果返回，尚未提供跨崩溃的持久通知保障。
+- 移除被替代的 withClaimedTask、reuseTransactionRunner 及过时编译文件。requireTaskWriteAccess 保持原名与原逻辑。lockClaim 在取得行锁后用数据库时间判断到期，防止锁等待期间失效仍继续操作。
+- 类型检查、全量构建及 12 组真实 PostgreSQL 测试通过：正常业务回归、八种单任务动作的两类到期回收、内容保留、目标范围隔离、两类清理失败回滚、并发回收及锁等待跨越到期。测试只使用临时表或随机 schema 并清理；本地数据库按需启动，未设置自启动。
+- 另通过 6 组周期执行与续租注册测试及 git diff --check；本批未修改周期策略或实际挂载 DSH。
+
+## 2026-10-24：周期回收与主动访问共用业务
+
+- 用户已通过上一批统一入口审查，并要求实现定时维护，强调两条路径必须共用清理规则。新增 TaskReclamation.register/reclaimExpiredTasks；全部清理调用既有 reclaimExpiredTask，Service 仅选择候选、组织事务和汇总结果。
+- 续租按会话注册，回收按插件注册一次；回收全库未归档任务的过期认领，覆盖已关闭会话及其他设备遗留的数据。注册立即执行，单轮结束等待 5 分钟，循环和停止复用 PeriodicTasks。
+- 候选查询按任务 ID 排序；取得项目、任务和认领锁后复查，已删除/归档候选跳过。一批回收共享事务，失败整体回滚，提交后才交付包含原内容与 owner 的回收结果。共用提示描述回收事实，主动操作入口补充原动作未执行。
+- 回收包含物理删除，采用 retries: 0，失败原样报告，下一周期重新检查；提交结果不明时不立即重放清理。续租原有重试策略保持原样；未加入持久通知或额外恢复状态。
+- 类型检查、构建、15 组真实 PostgreSQL 测试、7 组周期/注册测试通过。新增覆盖跨会话回收、有效认领保持、整批回滚、主动与周期回收竞争、注册首次执行及失败后下一周期恢复。实际 DSH 装配与上下文消息投递仍待实现。
+
+## 2026-10-25：DSH 配置与已有数据库连接初始化
+
+- 用户确认本批挂载 DSH 配置与初始化，只连接已有数据库；工具、自动维护及上下文留待后续。首版连接模式取代此前 local/external 双模式提案，数据库安装和启动仍使用独立脚本。
+- index.ts 使用 static Config 与 Service.init；配置声明和 pg 参数转换放在 runtime/database-config.ts，连接及状态记录放在 runtime/connection.ts。sagitta.json 注册 @sagitta/runtime/task；当前变更尚未发布或安装到用户正在运行的 DSH profile。
+- 本机 Cordis 4.0.5 的普通配置更新会卸载并重新初始化插件，因此直接复用框架重启与资源释放。真实测试发现初始化抛错时 Fiber.update 丢弃 restart 返回的拒绝 Promise；插件入口捕获初始化失败并调用 DSH logger，保留配置入口供修正后重新检查。连接成功的日志只在记录保存成功后输出。
+- 配置提供 host、port、database、user、password、ssl、可选 caFile；密码使用 Schemastery 原生 secret 标记。TLS 开启时验证证书，CA 文件通过 Node 读取；本轮只验证参数转换，远程 TLS 握手与 Windows 尚未实测。
+- 使用 DSH 的 writeFileAtomic 保存 `<profileContext.dir>/sagitta-task/connection-status.json`，包含检查时间、目标摘要和 connected/failed；该文件只代表最近检查结果，每次初始化仍执行 SELECT 1。凭据和原始错误不写入记录；错误通过日志报告。记录失败时释放新连接池并保留原始异常，避免交付未完成初始化的连接。
+- 本轮连通性检查尚未接入业务 schema 检查；既有 checkTaskSchema 应在挂载业务前接入。插件卸载关闭连接池，数据库服务由其部署环境管理。
+- 验证：类型检查、构建、git diff --check 通过；24 组测试通过，包括真实 Cordis + PostgreSQL 的初始化、配置变更失败及修正恢复、本地状态脱敏、配置校验、TLS 参数、连接关闭，以及此前全部数据库/周期业务回归。Web 配置页操作及实际 profile 安装仍待验证。
+
+## 2026-10-25：任务主动工具完整接入
+
+- 用户同意按前轮方案一次接完 11 个主动工具，本批免除约 150 行限制。项目五项、任务六项沿用既定命名和参数；状态工具通过 action 选择五个已有动作。Repository 和 Service 本批保持原样。
+- 使用官方 defineTool/ctx.tools.register，参数和输出 schema 由 DSH 校验，业务错误沿用原生转换。共用参数、输出结构和 JSON 渲染提取到 adapters/tools；到期结果显式保留原任务与说明，内部 owner 由统一投影移除。详细接口见 [主动工具接入](design/sagitta-task-tools.md)。
+- 身份采用前轮建议：deviceId 来自 getOrCreateAnonymousUserId，sessionId 来自 exec.agent.id。标识按 DSH_HOME 持久化，保留官方复制目录、写入失败的实际边界；AI 参数不参与身份构造。
+- 初始化在连接成功后检查现有 schema 版本，再装配 Repository、事务执行器和 Operations，并注册工具。配置变更复用 DSH 重载；连接记录继续只表示连通性，schema 错误由日志报告。
+- 已验证 Cordis effect 的关键边界：嵌套 effect 中通过外部 ctx 注册的资源，需要显式 yield 注册返回的注销函数，才能保证嵌套初始化失败时及时撤销。两个注册入口使用生成器逐个 yield，index 通过 yield* 接收；数据库关闭函数同样交给 effect，复用框架清理，避免另写注册回滚机制。
+- 类型检查、构建与 30 组测试通过；本轮新增真实 DSH 工具执行管线测试，覆盖全部接口、状态动作、输入校验、跨会话权限、身份伪造无效、到期结果、作用域隔离、取消前拒绝执行、卸载及部分注册失败清理；schema 失败测试确认池已关闭并可在修正后恢复。测试使用隔离 schema 和临时身份目录，无 LLM 调用。
+- 自动续租、周期回收和上下文留待后续；现阶段正式认领仍按 20 分钟期限生效。运行中的 DSH profile 尚未安装本批变更，真实 Web UI 和模型工具选择行为仍待验证。
+
+## 2026-10-25：说明原子追加
+
+- 用户要求系统提供追加写入。project_update/task_update 共用 mode=replace/append，省略保持替换；系统层的 ProjectOperations.updateProject 和 TaskOperations.execute(update) 同样支持该参数，工具数量保持 11 个。
+- Repository 在既有 SQL 内使用 CASE 选择替换或 description || 新文本，保留行锁、事务、归档和权限路径。追加原样拼接，换行由调用方提供；并发追加均保留，整体替换仍按完整输入覆盖，尚无版本冲突检查。
+- 已核对 description 为 text NOT NULL DEFAULT ''，应用及数据库未设额外字符数上限，无需变更 schema。PostgreSQL 自身的字符串值大小上限约 1 GB，属于引擎边界；依据：https://www.postgresql.org/docs/18/datatype-character.html 。
+- 类型检查、构建和 23 组相关回归测试通过；新增真实 DSH/数据库测试覆盖项目和任务各八次并发追加、原文保留、空文本、引号/换行/长文本、默认替换、非法模式、跨会话拒绝、到期与归档拒绝。
+
+## 2026-10-25：工具说明保留使用规则
+
+- 用户明确：模型侧 description 只表达业务使用方式。正式任务认领后由系统负责续租，会话消失且续租失败后回收；临时任务有效期 20 分钟。检查时点、续租周期和扫描过程属于内部机制。
+- 已精简 task_list/task_get 说明，并在 task_create 明示临时任务 20 分钟。实际回收结果仍返回说明与原内容，业务代码和当前续租挂载进度保持原样。
+- 用户要求 task_transition 先解释状态，再说明每个动作的起始与目标状态。已按 Service 实现逐项展开 open/in_progress/blocked/done/cancelled、五种动作、认领权限和临时任务清除规则；说明只涉及业务语义，保持内部计时细节隐藏。
+
+## 2026-10-25：独立动作工具与固定总体说明
+
+- 用户确认在接入层拆分 task_claim/release/complete/block/cancel，替换 task_transition；工具总数由 11 变为 15。每个动作独立定义，内部继续调用同一个 TaskOperations.execute，保留统一事务、权限和回收；专属参数留待后续。
+- 新增 adapters/guidance.ts，说明项目与任务关系、正式/临时用途、状态含义、多任务认领、查询/登记/交接与清理流程。index 显式注册到 systemPrompt.section，与工具共同由 ctx.effect 管理；固定总体说明和每个工具的使用说明分别由原生注册器组装。
+- 已核对 DSH SystemPrompt.assemble/renderPrompt 及 AgentLoop 的 SystemPromptProjection：每次模型步骤使用当前组装，提示词文本相同不重复追加；文本变化时可能按连接能力替换或追加新版本。注册一次与每次请求可见可以同时成立，输入 token 仍有固定占用；持续可见不保证模型始终正确执行。
+- 验证：类型检查、构建、9 组真实 DSH/PostgreSQL 接入测试通过，覆盖五个独立动作、旧入口移除、连续三次组装只有一份固定说明、工具共用组装、作用域隔离、重载无重复及卸载清理。Service/Repository 本轮保持原样，任务数据动态上下文和自动维护仍待挂载。
+
+## 2026-10-25：说明文本分段排版
+
+- 用户要求 description 等长说明按语义分行，方便阅读源码；进一步明确起始反引号后换行，正文从下一行顶格书写，正文各行之间不留空行。已更新多行模板字符串，短说明保持简洁。
+- 已整理项目、任务工具及更新模式说明，保留原有文字含义和业务逻辑；约定同步到 AGENTS.md。
+
+## 2026-10-25：临时任务立即认领参数
+
+- 用户确认 temp 创建接受 claimImmediately 省略或 true，仅显式 false 报错；替换之前拒绝传入该参数的接入层规则。Service 继续统一自动认领，正式任务行为保持原样。
+- 参数说明和接口文档已同步；接入测试验证省略/true 均写入本会话认领，false 报错且不创建任务。
+
+## 2026-10-25：用户维护开头与模块说明边界
+
+- 用户自行删除 task_block 中要求先登记障碍和解除条件的指引；专门的阻塞登记尚未实现，后续说明保持现有状态操作语义。
+- 用户重写 guidance 开头，要求后半段按清晰条理介绍模块。已保留用户开头与预设，按记录结构、任务类型、状态、动作、说明维护、建议流程补充后半段，避免重复预设中的身份与人格定位。
+- 用户开头包含跨模块任务资源门禁及 <SagittaEmergencyCode> 占位文本；用户明确这些能力由其他模块实现，任务模块保留原文说明，其实现归属相应模块。
+- 用户明确 guidance 负责通用知识（任务类型、状态、会话关系等）和工作流程参考；各工具的参数、操作含义和前置条件由 API description 定义。后半段已据此精简，保留用户开头。
+- 本轮验证：构建、5 组 DSH 工具/PostgreSQL 接入测试及 diff 格式检查通过；固定说明测试改为检查状态知识，避免要求 guidance 重复具体工具名称。
+
+## 2026-10-25：重启与认领恢复的源码核对
+
+- archive 最终版本的 memory/tools.js 将 DSH agent.id 作为云端 owner，启动时重建本地门禁；worker/worker.js 的 claim 允许同 owner 续租恢复。早期 task-ownership-p2.md 仍描述丢失 token 后无法操作的设计，不能据此断言最终归档代码仍有同一问题。历史部署版本和当时会话 ID 未核实，实际故障原因尚不能确定。
+- 当前认领持久化在 PostgreSQL；插件卸载只关闭连接，不撤销认领。相同设备标识、恢复原会话且租约有效时可继续操作；重复 claim 仍按现有规则报已有认领。相同目录新建会话会生成另一 session ID。
+- 20 分钟租约从创建认领或最后一次成功续租计算。自动维护 Service 已实现，当前 index 尚未挂载；过期认领可由单任务访问回收，正式任务回到 open，触发回收的本次操作不执行。以上为源码核对，未进行实际 DSH 重启测试。
+
+## 2026-10-25：续租接入与提示词边界
+
+- 用户要求本批注册续租；模型组装时展示已认领任务、认领 ID 和 description 留待下一批。认领 ID 的具体投影需在该批核对既有任务 ID 与内部 claim_id 的用途。
+- adapters/renewal.ts 将 TaskRenewal.register 接到 DSH agents 的 created/disposed 事件，同时扫描已加载会话以支持配置重载；通过官方 scope 链限定本插件范围。index 在工具注册后挂载，计时使用官方 cordis-plugin-timer 的 ctx.timeout，循环/重试/停止复用 PeriodicTasks。
+- 注册后立即续租，之后沿用单轮结束后等待 5 分钟、失败重试两次的业务策略；续租只涉及本设备、本会话尚有效的正式认领。卸载停止并等待在途续租结束，随后关闭连接池；认领保留到期。周期回收仍待挂载。
+- 失败耗尽后记录原始错误，以 DSH 原生消息来源 sagitta-task 向所属会话发送 next-step 提醒，wakeup=false；等待下一次运行读取。正常续租保持安静。
+- 用户认可提示词两处修正：其他会话可读已认领任务，修改/删除/状态操作受认领限制；阶段性结果本身不等于阻塞或完成，应根据实际结果决定。
+- 用户希望 description 仅承担概览。已在记忆路线图记录：记忆区实现后提醒确认大小限制，并指导模型持任务 ID 存取具体情报；当前维持已有字段大小与工作目录存放材料的指引。
+- 验证：构建、17 组初始化/工具/周期执行测试通过；追加的续租失败提醒断言单独复跑通过，diff 检查通过。接入测试使用真实 DSH 注册表、作用域、计时服务与会话替身，覆盖已有/新建会话、范围隔离、停止、恢复及失败提醒；实际 DSH UI 重启尚未测试，本批未发布或安装到运行 profile。
+
+## 2026-10-25：认领凭据与本会话工作上下文
+
+- 用户明确认领 ID 用于跨模块资源访问，要求同时展示任务 ID 和认领 ID。沿用工具命名风格：任务对象 id 对应 taskId 参数，数据库 claim_id 输出为 claimId。正式/临时创建并认领、独立认领均提供该值；普通列表/详情和过期结果维持任务资料投影。
+- createClaim 使用 INSERT RETURNING 取得数据库生成的 UUID；原子认领仍在同一事务内创建认领并修改任务状态。续租保持凭据，重新认领生成新凭据；其他模块的访问校验后续实现。
+- 新增当前工作读取：Repository 单次联查本设备、本会话有效认领和未归档任务/项目，Service 去重分组。有效凭据展示专用查询过滤到期行，普通任务列表维持既定行为；上下文读取保持只读。
+- adapters/work-context.ts 注册工具工作说明区的 section，并通过 DSH 异步 system-prompt/assemble 填充本次结果。项目含 id/name/description，任务含原字段及 claimId；没有共享会话缓存或额外定时器。无 Agent 的诊断组装不查询；读库失败交给原生组装错误传播，未增加降级路径。
+- guidance 补充两类 ID 的用途和生命周期，跨模块资源访问指引改为使用 claimId；description 长度限制继续等待记忆模块实现后确认。
+- 验证：构建及 24 组数据库/到期回收/初始化/工具测试通过；文本排版调整后重新构建并通过 6 组工具测试，diff 检查通过。新增验证覆盖两个会话并发组装隔离、项目分组、正式/临时凭据返回、说明更新、续租凭据保持、重新认领更换、到期隐藏、项目归档与作用域卸载。尚未调用真实模型或安装到运行 profile。
+
+## 2026-10-25：任务插件独立可用性核对
+
+- 已验证 @sagitta/runtime/task 入口可直接 import，npm pack --dry-run 包含任务编译文件、初始化 SQL 和 shared 支撑模块。任务插件可单独挂载在 DSH 中，业务上不依赖 memory、异步执行或自主推进插件；安装单元仍为 @sagitta/runtime。
+- 此次核对发现 TaskReclamation.register 已实现但 index 漏接，导致后台回收未运行。该遗漏已在下述“周期维护补齐”批次修复；仍需真实 DSH 加载、重启及到期通知验收。
+- 独立使用需要匹配的 DSH 原生服务和已初始化的 PostgreSQL；本地数据库部署脚本目前仅支持 macOS/Homebrew。未安装到运行 profile，未以真实模型完整验收。本轮只核对并记录，未改运行逻辑。
+
+## 2026-10-25：周期维护补齐与临时到期通知
+
+- 用户指出正式回收本属已确认能力，应修复入口遗漏；临时任务额外需要周期清理后的显式上下文提示。维护入口更名 registerTaskMaintenance（adapters/maintenance.ts），统一调用已有 TaskRenewal.register 与 TaskReclamation.register；前者按会话续租，后者插件级扫描一次，避免逐会话重复全库清理，也覆盖无在线会话时的遗留认领。两项沿用各自 5 分钟周期、重试和停止策略，未新写循环或回收 SQL。
+- 通知仅处理本次周期回收返回的 temp 原内容，匹配本设备和当前作用域内的原会话，包含标题、任务 ID、description 等。使用 DSH next-step、wakeup=false；正式回收静默，主动访问继续只返回原有工具结果。续租故障提醒保持已有行为。
+- 用户希望首次初始化清理静默，且只提醒同一会话持续超过 20 分钟的临时到期。本批按会话在当前插件中的连续加载时长至少 20 分钟判断；首次成功扫描一律静默。会话卸载/恢复或插件重载会重新计时；原会话离线、其他设备及其他作用域的数据清理静默，当前不提供持久补发。
+- 初始化现在会写数据库，已将全部初始化测试改为隔离 schema，避免后台清理触碰真实任务。入口集成测试直接验证插件挂载后删除遗留 temp、正式认领恢复 open；期间未调用主动清理入口。
+- 验证：构建及 17 组周期、接入、回收和初始化测试通过；新增真实数据库入口测试后 5 组初始化测试再次通过，diff 检查通过。通知覆盖首次静默、20 分钟阈值、身份隔离、正式静默、同会话恢复重计时、无在线会话持续扫描及卸载停止。尚未安装到真实运行 profile。
+
+## 2026-10-25：独立审查与真实模型接入验收
+
+- 用户要求一个子 Agent 独立审查当前代码，同时由主线程验证真实 DSH 加载及 DeepSeek 工具调用。完整发现和证据范围记录于 [审查报告](reviews/2026-10-25-sagitta-review.md)。本批只审查、验证和记录，未修改运行实现。
+- 构建、Updater 类型检查和现有 35 项测试通过。通过独立 DSH_HOME、隔离数据库 schema 和正式 headless 启动入口，真实模型成功列项目、创建项目、创建并认领正式任务、查询详情；退出进程后恢复同一 session，再成功完成任务。数据库核对最终为 done 且认领清除；测试数据和 profile 已删除。
+- 该结果验证直接加载 task 并显式配置数据库的路径；Updater 生成的 programmatic preset 仍缺少持久连接配置入口。框架依赖重复安装还存在 scope 实例隔离风险，已用官方实现的两个模块实例复现，真实 Updater 布局待验证。
+- 多实例全库清理与仅本地通知组合存在在线提醒丢失路径：其他实例抢先删除后，原会话无法再得到结果。此前接受的离线不补发不能覆盖这一竞争；后续需明确清理与原 owner 通知的协调方式。
+
+## 2026-10-25：更新配置与本地数据库托管讨论
+
+- 已确认更新方向：启动时检查远程版本；版本变化才部署、构建并处理配置。已有同名配置值保留，新字段采用默认值；字段改名或类型变化需要显式迁移，数据库表结构迁移另行处理。
+- 用户确认任务插件配置分为“本地目录”和“自定义连接”：前者管理目录内的数据库准备、启动和连接，后者仅连接已有服务；各阶段须向终端报告。用户随后澄清“记忆插件”为口误，实际挂在任务插件初始化。按约 150 行分批实现。
+- 已核对现有 install-task-db.py：数据和连接信息位于指定目录，PostgreSQL 程序通过 Homebrew 安装到公共前缀。因此该脚本不能直接充当用户要求的全目录内自动安装器。
+- embedded-postgres 提供初始化、启动、停止及持久数据目录，支持多平台；其上游二进制主要定位于测试用途，且 npm 包要求 postinstall，与当前 Updater 的 --ignore-scripts 存在接入冲突。首批局部安装验证见下文，完整生命周期接入仍待实施。来源：https://github.com/leinelissen/embedded-postgres 、https://github.com/zonkyio/embedded-postgres-binaries 。
+
+## 2026-10-25：本地 PostgreSQL 程序准备第一批
+
+- 新增独立目录 plugins/task/src/database-management，runtime.ts 的 preparePostgresRuntime 在用户目录的 runtime 子目录局部安装 embedded-postgres 及当前平台程序包，固定已验证的包版本。使用 DSH withFileLock 串行准备；默认禁用安装脚本，只执行所选平台包的符号链接恢复脚本，运行 postgres --version 成功后记录就绪。
+- 程序已就绪则复用；目录不完整或记录的程序包版本不同则报错，保留现场。此限制针对插件托管的程序包，现有自定义 PostgreSQL 连接继续不校验数据库引擎版本。未执行 Homebrew、全局 npm 安装或注册系统服务；npm 自身仍使用用户配置和缓存。
+- 首次测试遇到代理连接 ECONNRESET；仅在重试测试进程中移除代理环境变量后，真实安装和验证约 18 秒通过，运行实现保持继承环境。macOS ARM 包解压约 148 MB。
+- 新增显式启用的 postgres-runtime.test.js：验证程序复用、真实初始化/启动、写入后停止重启读取同一数据，测试实例和目录自动清理。构建和 diff 检查通过；Windows/Linux 尚未实测。
+- 本批约 150 行（模块、测试及记录），尚未接入插件 Config/index、连接信息生成、任务表初始化或已有运行实例复用；这些留待用户审查后继续。
+
+## 2026-10-25：本地数据库准备第二批
+
+- database-management/local.ts 新增 prepareLocalDatabase：复用程序准备模块，首次选择本地可用端口、生成随机密码，使用 PostgreSQL 原生 initdb 初始化 data，持久保存 connection.json；后续读取配置。缺配置但已有 data 或缺 PG_VERSION 均报错，保留数据。
+- 复用 DSH 文件锁串行初始化和启动；通过 pg_ctl status 判断运行状态，仅未运行时 start。绑定本机回环地址、关闭 Unix socket；使用 pg 校验实际 data_directory，并创建缺少的目标数据库，返回既有 TaskDatabaseConfig。
+- initdb 使用目录内 0600 临时密码文件，执行结束清理，避免凭据进入命令参数和日志。各准备阶段调用传入的日志函数；本批提供启动与复用，不绑定插件卸载停库，避免关闭其他调用方复用的实例。
+- 构建、格式检查及两组真实 PostgreSQL 测试通过，覆盖程序准备、数据库配置生成、并发复用运行实例、停机重启和数据保留；实例与测试目录清理。当前仅 macOS ARM 实测，任务表初始化、配置模式选择及 index 挂载留待下一批。
+
+## 2026-10-25：数据库模式配置与初始化挂载
+
+- 新增 taskConfig 原生条件配置：local 必填 directory，custom（默认）复用原连接字段。index 在 local 时准备本地实例，两种模式都调用同一 connectTaskDatabase；只有 local 自动初始化任务表，custom 保持只连接和版本检查。
+- 001-initial.sql 改为单条 PostgreSQL DO 语句：事务级 advisory lock 后检查迁移表，缺少时创建原有四张表并登记版本；与安装脚本共用文件，移除 psql 专属命令，表字段和约束保持原样。已有其他结构版本仍报错，未增加自动迁移路径。
+- 配置分支和数据库准备阶段日志已挂载 DSH。插件卸载仍关闭连接池并撤销工具/维护注册，共享本地数据库进程保留。Updater 预设的用户配置持久入口仍待接通。
+- 构建、4 项配置/真实本地数据库测试及 11 项已有初始化/工具测试通过。验证本地模式建表并注册 15 个工具、重复挂载保留项目、切换 custom 使用相同工具和数据；隔离实例与目录清理。未进行真实 Web 配置页验收，Windows/Linux 尚未实测。
+
+## 2026-10-25：Updater 原生预设配置与手动重启
+
+- 用户确认采用 DSH profile 中的官方 Sagitta 预设声明；修改配置后提示用户手动重启 DSH。任务插件继续声明 Config、负责初始化和卸载；已有会话按官方预设生命周期保留原组合，重启恢复时读取当前配置。本批没有实现专用 Web 表单或重启按钮。
+- 撤销讨论中临时加入的 Updater.pluginConfigs 配置层。安装 bundle 声明 preset-sagitta（@deepseek-ai/dsh-agent-preset），通过 sagittaReady 服务依赖等待 Updater 完成；业务插件保持在 Sagitta 预设内。启动准备采用原生 Entry.update 更新单个等待条目，避免在 Updater 自己初始化时等待包含自身的全局 reconcile。
+- profile.ts 使用 DSH 原生 profile 读取/组合、文件锁和原子写入，保留 YAML 注释与 !!js 表达式。对 sagitta.json 中注册的业务插件，按稳定 ID 保留现有 config 同名值；新字段采用仓库默认。插件清单、标准组合和 persona 提示词由仓库维护。配置存在 profile/cordis.patch.yml，原子写入权限 0600。
+- 启动查询 stable 最新提交，变化时才 fetch、安装和编译；相同提交校验本地 HEAD 后复用产物。准备配置后原子记录成功提交。终端报告检查、下载、安装、编译、保存及就绪阶段；预设配置变更时提示手动重启，配置 Schema 中也注明。错误保留 cause，失败不发布就绪服务。
+- 按用户要求删除旧 install-task-db.py，保留已有本地数据库及凭据；数据库文档改为任务插件按需托管与自定义连接两种模式。
+- 验证：根构建、Updater 构建、配置 Schema 测试及两组新增接入测试通过。接入测试使用真实 DSH Loader、官方 preset 声明和 ConfigEditor，覆盖首次等待准备、保存后重启读取、升级保留用户值并补新字段、提示词更新、YAML 注释/表达式保留、相同配置不重写、相同版本跳过部署、编译失败保持未就绪和旧成功记录；registry 使用记录替身，Git/npm 使用命令替身。未安装进日常 profile、未推送 GitHub；本批未重复执行真实 PostgreSQL 部署测试。
+
+## 2026-10-25：框架 peer 解析路径核实
+
+- 用户要求确认第二份框架依赖是否会被实际使用，本批检查并保留诊断脚本，未修改运行实现。DSH 0.2.1-rc.2 官方解析器区分 profile 内路径与外部 linked root：前者优先本地 node_modules，后者在各层 package.json 声明 peer 时优先宿主映射。不能笼统认为 peerDependencies 一定让所有安装布局共享宿主实例。
+- tests/diagnostics/dsh-scope-resolution.js 使用官方 createRuntimeResolution 和公开 Worker bootstrap（相同 ESM/CommonJS 路由实现），隔离临时目录验证三种布局。profile/sagitta-source 内存在 scope 副本时，实际 ESM URL 指向该副本，函数身份不同，读取宿主 scope 失败；没有本地副本时，或目录位于 profiles 之外且通过 profile node_modules 链接、声明 peer 时，均读取宿主实例成功。三组断言通过，临时目录自动删除。
+- 此证据确认当前 Updater 部署目录配合本地 framework 副本会触发问题；完整下载/安装/模型调用链仍待验收。后续修复应统一框架 peer 的运行时来源，具体部署改法尚未实施。
+
+## 2026-10-25：改用预编译 Release，发布端第一批
+
+- 用户决定由开发端本地编译、打包并上传发布包，使用端下载预编译包；取代此前用户机器上拉取源码并编译的方向。采用 GitHub Release，Updater 自身保持手动安装，按约 150 行分批审查。
+- 首批 scripts/release.py 默认清理生成目录、编译并 npm pack 两个包，生成 release.json（tag、commit、dirty、DSH 版本和资产 SHA-256）。显式 --publish 才上传，要求干净工作树且远程版本标签指向 HEAD；版本取根 package.json，Updater 保留自身包版本。使用 gh 官方 Release 命令，新版本标记 Latest，现有 Release 不覆盖。
+- 根运行包添加空 bundle patch，以便后续走 DSH 官方安装入口；业务插件启用仍由预设控制。产物写入已忽略的 .runtime/releases，编译产物仍不进入 Git。
+- 验证：本地构建与打包通过，runtime 41 个文件、updater 5 个文件；归档含所需 JS/SQL/提示词及 bundle 声明，不含 node_modules、src 或 .env，SHA-256 匹配。未提交工作树的发布调用按预期在网络操作前拒绝。
+- 本批没有创建 Release、提交或推送。当前包仅用于验包，Updater 仍执行旧源码更新逻辑；下一批需改为下载发布清单、检查 DSH 版本与资产、安装 runtime，并调整手动安装 Updater 的入口。框架 peer 重复加载问题须在新安装路径下复验，当前不能标记已解决。
+- 用户明确编译打包脚本无需逐行审查，后续对此类脚本说明行为、输入输出和验证结果即可；其余业务代码继续遵循原有分批审查约定。
+
+## 2026-10-25：Updater 对齐预编译 Release
+
+- 本批以 release.ts 替换启动时 Git 拉取、源码依赖安装和编译。读取固定仓库 Latest 的 release.json，校验 dirty=false 与 DSH 精确版本；已安装 runtime 同版复用，异版按清单 tag 下载、核对 SHA-256，再安装。此前 stable 分支与 sagitta-built-commit 的部署规则由此替代；旧下载目录未自动删除。
+- 使用官方公开的 @deepseek-ai/dsh-plugin-manager/operations.runPluginCommand，复用 profile 文件锁、pnpm、版本检查与诊断日志。此接口完成磁盘安装；随后 pluginPackages.refresh 更新解析表，现有 preparePresetProfile 保存用户配置，最后提供 sagittaReady。启动初始化中避免调用等待整个插件树重载的安装入口，以免等待自身。
+- 运行包留在 profile/sagitta-releases，供 pnpm 保存的本地包路径复用；运行代码安装在 profile/node_modules。安装禁用生命周期脚本和 peer 自动安装；全局 fetch 沿用 DSH 代理策略。Updater 与 DSH 自身仍手动更新，用户安装脚本留待下一批。
+- 预设字段通过解构排除 prompt 后传给官方接口，避免将未提供的可选 description 显式写成 undefined；真实配置编辑器测试发现后者经 YAML 序列化会变为 null，导致编辑一致性校验失败。
+- 验证：根包及 Updater 构建、发布端本地打包通过；两组接入测试通过，使用真实 Loader、官方预设/ConfigEditor、模块解析刷新和 pnpm，GitHub 下载替换为本地发布样本，预设 registry 为记录替身。覆盖首次安装、同版跳过、升级保留配置/更新提示词、SHA/版本/dirty 校验拒绝及失败不发布就绪。
+- 实际 runtime.tgz 在隔离 profile 通过官方接口安装后，诊断脚本 release 模式确认 scope 解析到宿主同一模块，函数身份相同且读取宿主 scope 成功。此前重复框架问题已在此新安装路径验证解决；历史源码安装残留及其他安装布局不在此结论范围。
+- 未创建 GitHub Release，未提交、推送或替换日常 profile；正式 GitHub 下载到模型运行的全链路尚待首个发布包与用户安装入口完成后验收。网络检查失败仍会阻止 Sagitta 就绪，未新增离线回退。
+
+## 2026-10-25：独立安装脚本对齐 Release
+
+- scripts/install-updater.py 改为独立 Python 标准库安装器，替代原来的仓库内 npm install/build/file-directory 安装。读取最新正式 release.json，精确核对已安装 DSH 版本，下载该 tag 的 Updater tgz 并校验 SHA-256，再调用 dsh plugin --profile web add；禁用生命周期脚本及 peer 自动安装。Updater 仍由用户手动安装和更新。
+- 缓存写入 DSH_HOME/profiles/web/sagitta-releases/<tag>/（默认 ~/.dsh），下载校验完成后原子替换文件；因 pnpm 保存本地 tgz 路径而持续保留。安装器可脱离仓库运行，使用 urllib 原生代理和证书校验；缺少命令、网络失败、校验失败或安装失败均直接报错停止。
+- scripts/release.py 原样复制安装器为 install.py，并连同两个 tgz 和 release.json 共四个资产发布；Release 说明附安装命令。此前独立用户安装入口待实现的记录由本批取代。
+- 验证：发布端本地构建/打包通过；脚本测试覆盖安装及重复运行、版本/哈希/正式标记/路径校验拒绝、命令缺失、下载失败与安装失败。实际预编译 Updater 包通过真实 dsh plugin 命令安装进隔离 DSH_HOME，官方配置导出包含 preset-sagitta 和 sagittaReady，未安装第二份 dsh-scope。该测试仅替换 GitHub HTTP 下载，执行后清理隔离目录。
+- 当前在 macOS 验证；Windows/Linux 未实测。未发布 Release、提交或推送，也未改日常 profile；GitHub 在线全链路仍待首次正式发布。任务模块的多实例清理通知竞争不属于本次安装脚本修改，仍待处理。
+
+## 2026-10-25：预设插件按白名单更新
+
+- 用户要求 Updater 只管理指定白名单，升级时原样保留其他插件清单。白名单在 index.ts 显式由 persona 与 sagitta.json 中的业务插件 ID 组成；不增加另一份配置清单。此规则取代此前每次重建整个官方标准组合的行为。
+- profile.ts 以已有插件列表为基础，仅替换白名单条目，保持已有条目位置；新白名单插件追加。非白名单插件及其 config、disabled、条件表达式、嵌套组和顺序整体保留；缺少的非白名单默认条目不自动补入。白名单业务配置继续保留用户同名值，persona 的 prefix 随发布更新，其余配置保留用户值。
+- 仅当本地没有 preset-sagitta 覆盖条目且有效插件列表为空时，视作尚未配置的初始声明，填入完整默认组合。已有预设正常清空 plugins 后仅恢复白名单；完全删除本地预设覆盖并还原空声明则回到初始化状态。移出白名单的旧条目会保留，后续移除或迁移需显式处理。
+- 验证：Updater 编译及两组接入测试通过。真实 Loader、官方 ConfigEditor 保存/重启验证非托管插件和嵌套配置保留、启停状态/顺序保留、删除不补回、官方新增条目不擅自加入、白名单新增、提示词更新、业务配置保留、空清单与重复启动不重写。Release 安装测试继续通过；未修改日常 profile、未提交或发布。
+
+## 2026-10-25：独立安装目录与首版打包验收
+
+- 用户确认独立目录分发：runtime 局部安装发布清单指定的精确 DSH，home 作为 DSH_HOME，agents 作为 DSH_AGENTS_HOME；平台启动脚本仅为当前进程设置这些路径及本地 PATH，保持调用时的工作目录。此规则替代上一批安装到已有 DSH 的方案。Node.js、npm、pnpm 只检查，npm engine-strict 校验安装所需 Node 版本。
+- 安装器必须传入 --directory，首次使用空目录；用 runtime/package.json 的 sagitta-environment 名称识别已有安装。重复运行保留数据，支持失败后重试；中途失败直接报告，未增加整体安装回滚。缓存的 tgz 保留供 pnpm 引用。DSH 和 Updater 手动更新，业务包启动更新。
+- 首个实验版本编号 0.1.0，固定 DSH 0.2.1-rc.2。Web 启动后由用户选择 Sagitta 预设并配置任务数据库目录或已有连接；启动脚本透传 --no-open、--port 等 Web 原生参数。未添加自动选择预设的新路径。
+- 安装器 5 项测试通过，覆盖重复安装、用户数据保留、格式/哈希/引擎安装失败、未知目录拒绝，以及含空格目录下启动参数和工作目录保留。现有 Node 测试 41 项中 38 项通过、3 项显式部署测试默认跳过；开启本地 PostgreSQL 验证后，相应测试文件 4 项全部通过。
+- 使用打包的 install.py 在 .runtime 下含空格的隔离目录实际安装 DSH/Updater，启动真实 Web、安装 runtime、准备本地数据库。真实 DeepSeek 模型调用项目工具成功；重新启动后同一会话继续认领任务、完成任务并删除测试项目成功，动态上下文包含已认领任务。Web 登录链接先返回 303 设置 cookie，再访问页面为 200；未携带凭据时 401 属于官方认证行为。
+- 验收脚本集中在 tests/diagnostics：install-release.py 仅替换发布资产 HTTP 下载，packed-web.js 运行实际独立环境及测试插件，online 模式访问真实 GitHub。测试密钥从本机 .env 进入测试进程环境，未写入发布包或 Git。日志含本地 Web 登录令牌，留在忽略目录。
+- 已实测 macOS ARM。Windows/Linux 尚未实机验证；多个实例共用数据库时临时任务通知竞争仍为已知限制。记忆模块仍为空壳，发布说明明确本版范围。正式 GitHub 发布后的在线下载需在发布后另行验收。

@@ -1,8 +1,17 @@
+import { readFile } from 'node:fs/promises';
 import type { Database } from '@sagitta/runtime/database';
 
 const schemaVersion = 1;
 
-/** 只检查应用表结构版本；初始化与迁移由独立脚本完成。 */
+/** 本地托管使用与安装脚本相同的 SQL；文件内原子检查并初始化。 */
+export async function initializeTaskSchema(
+  database: Pick<Database, 'query'>,
+): Promise<void> {
+  const sql = await readFile(new URL('../migrations/001-initial.sql', import.meta.url), 'utf8');
+  await database.query(sql);
+}
+
+/** 检查应用表结构版本；已有其他版本时报告错误，迁移另行实现。 */
 export async function checkTaskSchema(
   database: Pick<Database, 'query'>
 ): Promise<void> {

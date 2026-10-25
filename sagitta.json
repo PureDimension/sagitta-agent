@@ -7,6 +7,11 @@
   },
   "plugins": [
     {
+      "id": "sagitta-task",
+      "name": "@sagitta/runtime/task",
+      "config": {}
+    },
+    {
       "id": "sagitta-memory",
       "name": "@sagitta/runtime/memory",
       "config": {}

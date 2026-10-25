@@ -1,3 +1,10 @@
 - insert:
     - id: sagitta-updater
       name: '@sagitta/updater'
+    - id: preset-sagitta
+      name: '@deepseek-ai/dsh-agent-preset'
+      inject: [sagittaReady]
+      config:
+        id: sagitta
+        name: Sagitta
+        plugins: []

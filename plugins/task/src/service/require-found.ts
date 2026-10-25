@@ -1,4 +1,4 @@
-import type { RepositoryResult } from '../repository-result.js';
+import type { RepositoryResult } from '../repository/result.js';
 
 /** 操作层统一将存储结果转换为业务结果或明确错误。 */
 export function requireFound<T>(

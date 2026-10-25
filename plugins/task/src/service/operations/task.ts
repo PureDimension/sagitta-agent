@@ -1,175 +1,174 @@
-import type { CreateTaskInput, Task, TaskOwner } from '../../contracts.js';
-import type { TaskRepository } from '../../repository.js';
-import { reuseTransactionRunner, type TransactionRunner } from '../../transaction.js';
+import type { ClaimedProject, ClaimedTask, CreateTaskInput, DescriptionWriteMode, Task, TaskClaim, TaskOperation, TaskOperationResult, TaskOwner } from '../../contracts.js';
+import type { TaskRepositories } from '../../repository/index.js';
+import type { TransactionRunner } from '../../transaction.js';
+import { reclaimExpiredTask } from '../reclaim-expired-task.js';
 import { requireFound } from '../require-found.js';
 import { requireTaskWriteAccess } from '../require-task-write-access.js';
-import { withClaimedTask } from '../with-claimed-task.js';
 
-/** 查询使用注入的 Repository；写入操作通过事务执行器共享连接。 */
+interface TaskContext {
+  repository: TaskRepositories;
+  task: Task;
+  claim: TaskClaim | undefined;
+}
+
+/** 单任务操作统一经 execute；动作处理函数仅在当前事务内使用。 */
 export class TaskOperations {
   constructor(
-    private readonly repository: TaskRepository,
+    private readonly repository: TaskRepositories,
     private readonly transaction: TransactionRunner,
   ) {}
 
   listTasks(
     projectId: string
   ): Promise<Task[]> {
-    return this.repository.listTasks(projectId);
+    return this.repository.tasks.listTasks(projectId);
   }
 
-  async getTask(
-    taskId: string
-  ): Promise<Task> {
-    const result = await this.repository.getTask(taskId);
+  async listClaimedProjects(
+    owner: TaskOwner,
+  ): Promise<ClaimedProject[]> {
+    const rows = await this.repository.claims.listClaimedTasks(owner);
+    const projects = new Map<string, ClaimedProject>();
 
-    return requireFound(result, '任务');
+    for (const { project, task } of rows) {
+      let group = projects.get(project.id);
+      if (!group) {
+        group = { ...project, tasks: [] };
+        projects.set(project.id, group);
+      }
+      group.tasks.push(task);
+    }
+
+    return [...projects.values()];
   }
 
-  async updateTask(
-    taskId: string,
-    description: string,
-    owner: TaskOwner
-  ): Promise<Task> {
+  execute(
+    input: TaskOperation,
+  ): Promise<TaskOperationResult> {
     return this.transaction(async (
       repository
     ) => {
-      const result = await repository.lockTask(taskId);
-      const task = requireFound(result, '任务');
-      const claim = await repository.lockClaim(task.id);
-      requireTaskWriteAccess(claim, owner);
+      const task = requireFound(await repository.tasks.lockTask(input.taskId), '任务');
+      const claim = await repository.claims.lockClaim(task.id);
+      const expired = await reclaimExpiredTask(repository, task, claim);
+      if (expired) return { ...expired, message: `${expired.message}，本次操作未执行` };
 
-      return repository.updateTaskDescription(task.id, description);
-    });
-  }
-
-  async deleteTask(
-    taskId: string,
-    owner: TaskOwner
-  ): Promise<void> {
-    await this.transaction(async (
-      repository
-    ) => {
-      const task = requireFound(await repository.lockTask(taskId), '任务');
-      const claim = await repository.lockClaim(task.id);
-      requireTaskWriteAccess(claim, owner);
-
-      await repository.deleteClaim(task.id);
-      if (task.kind === 'temp') {
-        await repository.deleteTaskRecord(task.id);
-      } else {
-        await repository.archiveTask(task.id);
-      }
+      const value = await this.dispatch(input, { repository, task, claim });
+      return { kind: 'success', value };
     });
   }
 
   async createTask(
     input: CreateTaskInput,
-  ): Promise<Task> {
+  ): Promise<Task | ClaimedTask> {
     if (input.title.trim().length === 0) throw new Error('任务标题不能为空');
 
     return this.transaction(async (
       repository
     ) => {
-      const result = await repository.createTask(input.projectId, input.title, input.description ?? '', input.kind);
+      const result = await repository.tasks.createTask(input.projectId, input.title, input.description ?? '', input.kind);
       const task = requireFound(result, '项目');
 
       if (input.kind === 'temp' || input.claimImmediately) {
-        return this.claimTask(task.id, input.owner, reuseTransactionRunner(repository));
+        return this.claimTask({ repository, task, claim: undefined }, input.owner);
       }
 
       return task;
     });
   }
 
-  releaseTask(
-    taskId: string,
-    owner: TaskOwner
-  ): Promise<void> {
-    return withClaimedTask(this.transaction, taskId, owner, async (
-      repository,
-      task
-    ) => {
-      if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许释放`);
+  private async dispatch(
+    input: TaskOperation,
+    context: TaskContext,
+  ): Promise<Task | ClaimedTask | void> {
+    if (input.action === 'get') return context.task;
+    if (input.action === 'claim') return this.claimTask(context, input.owner);
 
-      await repository.deleteClaim(task.id);
-      if (task.kind === 'temp') await repository.deleteTaskRecord(task.id);
-      else await repository.updateTaskStatus(task.id, 'open');
-    });
+    // 写入权限与需要有效认领的动作在分发处统一检查。
+    requireTaskWriteAccess(context.claim, input.owner);
+    if (['release', 'complete', 'block'].includes(input.action) && !context.claim) {
+      throw new Error('任务尚未认领');
+    }
+
+    switch (input.action) {
+      case 'update': return this.updateTask(context, input.description, input.mode);
+      case 'delete': return this.deleteTask(context);
+      case 'release': return this.releaseTask(context);
+      case 'complete': return this.completeTask(context);
+      case 'block': return this.blockTask(context);
+      case 'cancel': return this.cancelTask(context);
+    }
   }
 
-  completeTask(
-    taskId: string,
-    owner: TaskOwner
-  ): Promise<void> {
-    return withClaimedTask(this.transaction, taskId, owner, async (
-      repository,
-      task
-    ) => {
-      if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许完成`);
-
-      await repository.deleteClaim(task.id);
-      if (task.kind === 'temp') await repository.deleteTaskRecord(task.id);
-      else await repository.updateTaskStatus(task.id, 'done');
-    });
-  }
-
-  blockTask(
-    taskId: string,
-    owner: TaskOwner
-  ): Promise<void> {
-    return withClaimedTask(this.transaction, taskId, owner, async (
-      repository,
-      task
-    ) => {
-      if (task.kind === 'temp') throw new Error('临时任务不允许阻塞');
-      if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许阻塞`);
-
-      await repository.deleteClaim(task.id);
-      await repository.updateTaskStatus(task.id, 'blocked');
-    });
-  }
-
-  async cancelTask(
-    taskId: string,
-    owner: TaskOwner
-  ): Promise<void> {
-    await this.transaction(async (
-      repository
-    ) => {
-      const task = requireFound(await repository.lockTask(taskId), '任务');
-      const claim = await repository.lockClaim(task.id);
-      requireTaskWriteAccess(claim, owner);
-      const canCancel = task.status === 'in_progress'
-        || (task.kind === 'normal' && (task.status === 'open' || task.status === 'blocked'));
-      if (!canCancel) throw new Error(`当前状态 ${task.status} 不允许取消`);
-
-      await repository.deleteClaim(task.id);
-      if (task.kind === 'temp') await repository.deleteTaskRecord(task.id);
-      else await repository.updateTaskStatus(task.id, 'cancelled');
-    });
-  }
-
-  /** 独立调用开启事务；创建后认领时由调用方显式传入已有事务。 */
-  async claimTask(
-    taskId: string,
-    owner: TaskOwner,
-    transaction: TransactionRunner = this.transaction,
+  private updateTask(
+    { repository, task }: TaskContext,
+    description: string,
+    mode?: DescriptionWriteMode,
   ): Promise<Task> {
-    return transaction(async (
-      repository
-    ) => {
-      const task = requireFound(await repository.lockTask(taskId), '任务');
-      if (await repository.hasClaim(task.id)) {
-        throw new Error('任务已有认领，请先释放或等待回收');
-      }
-      const canClaim = task.status === 'open' || (task.kind === 'normal' && task.status === 'blocked');
-      if (!canClaim) {
-        throw new Error(`当前状态 ${task.status} 不允许认领`);
-      }
+    return repository.tasks.updateTaskDescription(task.id, description, mode);
+  }
 
-      await repository.createClaim(task.id, owner);
-      return repository.updateTaskStatus(task.id, 'in_progress');
-    });
+  private async deleteTask(
+    { repository, task }: TaskContext,
+  ): Promise<void> {
+    await repository.claims.deleteClaim(task.id);
+    if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
+    else await repository.tasks.archiveTask(task.id);
+  }
+
+  private async releaseTask(
+    { repository, task }: TaskContext,
+  ): Promise<void> {
+    if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许释放`);
+
+    await repository.claims.deleteClaim(task.id);
+    if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
+    else await repository.tasks.updateTaskStatus(task.id, 'open');
+  }
+
+  private async completeTask(
+    { repository, task }: TaskContext,
+  ): Promise<void> {
+    if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许完成`);
+
+    await repository.claims.deleteClaim(task.id);
+    if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
+    else await repository.tasks.updateTaskStatus(task.id, 'done');
+  }
+
+  private async blockTask(
+    { repository, task }: TaskContext,
+  ): Promise<void> {
+    if (task.kind === 'temp') throw new Error('临时任务不允许阻塞');
+    if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许阻塞`);
+
+    await repository.claims.deleteClaim(task.id);
+    await repository.tasks.updateTaskStatus(task.id, 'blocked');
+  }
+
+  private async cancelTask(
+    { repository, task }: TaskContext,
+  ): Promise<void> {
+    const canCancel = task.status === 'in_progress'
+      || (task.kind === 'normal' && (task.status === 'open' || task.status === 'blocked'));
+    if (!canCancel) throw new Error(`当前状态 ${task.status} 不允许取消`);
+
+    await repository.claims.deleteClaim(task.id);
+    if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
+    else await repository.tasks.updateTaskStatus(task.id, 'cancelled');
+  }
+
+  /** 创建后认领与独立认领共用业务；事务和已有认领由调用方提供。 */
+  private async claimTask(
+    { repository, task, claim }: TaskContext,
+    owner: TaskOwner,
+  ): Promise<ClaimedTask> {
+    if (claim) throw new Error('任务已有认领，请先释放或等待回收');
+    const canClaim = task.status === 'open' || (task.kind === 'normal' && task.status === 'blocked');
+    if (!canClaim) throw new Error(`当前状态 ${task.status} 不允许认领`);
+
+    const claimId = await repository.claims.createClaim(task.id, owner);
+    const claimed = await repository.tasks.updateTaskStatus(task.id, 'in_progress');
+    return { ...claimed, claimId };
   }
 }

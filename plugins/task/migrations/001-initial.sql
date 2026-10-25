@@ -1,8 +1,8 @@
--- 由 psql 执行：初始化与版本记录一起提交，重复运行保留现有数据。
-BEGIN;
-SELECT pg_advisory_xact_lock(724861, 1);
-SELECT to_regclass('public.schema_migrations') IS NULL AS initialize \gset
-\if :initialize
+-- 单条 DO 语句原子初始化，可由 pg 和 psql 共用；重复运行保留现有数据。
+DO $initialize$
+BEGIN
+PERFORM pg_advisory_xact_lock(724861, 1);
+IF to_regclass('schema_migrations') IS NULL THEN
 CREATE TABLE schema_migrations (
     version integer PRIMARY KEY,
     applied_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -39,5 +39,6 @@ CREATE INDEX tasks_project_idx ON tasks(project_id, id);
 CREATE INDEX claims_owner_idx ON task_claims(owner_device_id, owner_session_id);
 CREATE INDEX claims_expiry_idx ON task_claims(expires_at);
 INSERT INTO schema_migrations(version) VALUES (1);
-\endif
-COMMIT;
+END IF;
+END
+$initialize$;

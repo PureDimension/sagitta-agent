@@ -10,5 +10,5 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["database.ts"]
+  "include": ["database.ts", "periodic-task.ts"]
 }
