@@ -477,4 +477,5 @@
 - 安装器 5 项测试通过，覆盖重复安装、用户数据保留、格式/哈希/引擎安装失败、未知目录拒绝，以及含空格目录下启动参数和工作目录保留。现有 Node 测试 41 项中 38 项通过、3 项显式部署测试默认跳过；开启本地 PostgreSQL 验证后，相应测试文件 4 项全部通过。
 - 使用打包的 install.py 在 .runtime 下含空格的隔离目录实际安装 DSH/Updater，启动真实 Web、安装 runtime、准备本地数据库。真实 DeepSeek 模型调用项目工具成功；重新启动后同一会话继续认领任务、完成任务并删除测试项目成功，动态上下文包含已认领任务。Web 登录链接先返回 303 设置 cookie，再访问页面为 200；未携带凭据时 401 属于官方认证行为。
 - 验收脚本集中在 tests/diagnostics：install-release.py 仅替换发布资产 HTTP 下载，packed-web.js 运行实际独立环境及测试插件，online 模式访问真实 GitHub。测试密钥从本机 .env 进入测试进程环境，未写入发布包或 Git。日志含本地 Web 登录令牌，留在忽略目录。
-- 已实测 macOS ARM。Windows/Linux 尚未实机验证；多个实例共用数据库时临时任务通知竞争仍为已知限制。记忆模块仍为空壳，发布说明明确本版范围。正式 GitHub 发布后的在线下载需在发布后另行验收。
+- 已实测 macOS ARM。Windows/Linux 尚未实机验证；多个实例共用数据库时临时任务通知竞争仍为已知限制。记忆模块仍为空壳，发布说明明确本版范围。
+- v0.1.0 已从提交 1429df3 发布，包含 install.py、release.json 及两个 tgz；标签和源码已推送 main。发布后从 GitHub 下载 install.py，确认与源码一致，在另一个全新目录完成在线安装。Updater 实际下载 GitHub runtime、真实模型调用工具、Web 认证访问、重启恢复认领并完成任务全部通过。验收插件已移除，隔离测试 PostgreSQL 进程已停止；没有改动日常 DSH profile。
