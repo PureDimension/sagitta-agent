@@ -563,3 +563,11 @@
 - 用户授权将已审查版本推送 main、发布 0.1.1 并验证自动更新。根运行包及有改动的 Updater 均升为 0.1.1，DSH 仍固定 0.2.1-rc.2；安装与发布文档补齐 GUI 配置入口。
 - 发布前根目录类型检查/构建、38 项真实 PostgreSQL 与设置测试、2 项 Updater 接入测试、5 项安装器测试通过；3 项可选的数据库部署测试未启用。首次全量测试缺少 SAGITTA_TEST_DB_CONFIG，提供隔离验收库后全部必需检查通过。
 - 在既有 Sagitta Test 验收环境中，保留正式发布的 Updater 0.1.0，使用本地下载替换器提供 0.1.1 运行包，启动后实际安装并通过认证 HTTP 调用新设置接口成功。此为发布前本地预检；真实 GitHub 下载及同版跳过结果将在发布后另记。
+
+## 2026-10-26：v0.1.1 发布和联网升级验收
+
+- 748c29a 已推送 main 并标记 v0.1.1；发布脚本从干净工作树重新构建，上传 install.py、release.json、runtime/updater 两个 tgz，GitHub Latest 指向该正式版本，清单 dirty=false。Updater 0.1.1 包含此前已审查的工具白名单及包名处理；自身保持手动安装。
+- 在 Sagitta Online 隔离验收环境中，保留正式 Updater 0.1.0 并关闭下载替换器，实际从 GitHub 自动安装 runtime 0.1.1。缓存归档 SHA-256 与发布清单相同；原任务库配置和非托管插件的完整配置哈希保持一致；新设置 RPC 返回原配置，前端模块被实际 Web 页面发现。
+- 再次正常联网启动时，日志明确显示“已安装，跳过下载和安装”及“准备完成”；认证调用 agentPresets/list 确认 Sagitta 存在且无 broken 诊断。归档修改时间和 profile package.json 哈希均未变化，证明未重复下载或安装。
+- 复测过程中曾遇到 github.com/release-assets.githubusercontent.com 的 TLS ECONNRESET，导致现有实现不提供 sagittaReady；这是已知的联网检查失败即不就绪路径。后续使用原代理环境正常重启通过；未添加重试、离线回退或改动代理优先级。临时日志导出仅用于隔离验收，未进入发布包。
+- 当前 3788 聊天进程保留，会话未中断；其本地 chat.sh 从固定本地 v0.1.0 验包切到 online，之后手动重启会检查正式 Release。实际联网升级结论来自隔离环境；当前进程仍使用启动时版本。
