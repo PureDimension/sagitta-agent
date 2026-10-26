@@ -11,10 +11,10 @@
 python3 scripts/release.py
 ```
 
-脚本清理并重建四个 dist 目录，使用 npm pack 按 files 清单打包，输出到 `.runtime/releases/v<根包版本>/`。
+脚本清理并重建 shared、task、memory、settings、updater 的 dist 目录，使用 npm pack 按 files 清单打包，输出到 `.runtime/releases/v<根包版本>/`。
 包含 runtime、updater 两个 tgz 包、release.json 和 install.py；清单记录提交、工作树是否有修改、DSH 版本和包 SHA-256。
 包内包含 JS、必要类型声明、SQL、提示词和包元信息，不携带本机 node_modules 或凭据。
-运行包的空 bundle patch 使它可由官方插件管理器安装；加载哪些业务插件仍由 Sagitta 预设决定。
+运行包的 bundle patch 挂载宿主级设置服务；会话内加载哪些业务插件仍由 Sagitta 预设决定。
 
 ## 发布
 

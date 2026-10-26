@@ -18,6 +18,7 @@ secrets*.json
 # Dependencies and generated state
 node_modules/
 .venv/
+__pycache__/
 dist/
 coverage/
 .runtime/

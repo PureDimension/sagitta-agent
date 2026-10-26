@@ -58,6 +58,7 @@ export async function preparePresetProfile(
       if (plugin.id === 'persona') config.prefix = plugin.config.prefix;
       plugins[position] = { ...plugin, config };
     }
+
     const config = { ...definition, plugins };
 
     if (!isDeepStrictEqual(current.config, config)) {

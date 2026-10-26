@@ -1,2 +1,4 @@
-# 运行包提供预编译模块；Sagitta 预设及其启用顺序由 Updater 管理。
-[]
+# 设置服务挂载在宿主；会话内业务插件仍由 Sagitta 预设启用。
+- insert:
+    - id: sagitta-settings
+      name: '@sagitta/runtime'

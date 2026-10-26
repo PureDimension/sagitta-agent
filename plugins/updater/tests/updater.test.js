@@ -27,9 +27,11 @@ test('Release 更新：真实 pnpm 安装、同版跳过、升级保留配置，
     { id: 'preset-sagitta', name: '@deepseek-ai/dsh-agent-preset', inject: ['sagittaReady'],
       config: { id: 'sagitta', plugins: [] } },
   ] }]));
+  const initialPatch = await readFile(profile.patchPath, 'utf8');
 
   let release;
   let archive;
+  const { officialPlugins } = JSON.parse(await readFile(new URL('../../../sagitta.json', import.meta.url), 'utf8'));
   const publishFixture = async (
     version,
   ) => {
@@ -45,6 +47,7 @@ test('Release 更新：真实 pnpm 安装、同版跳过、升级保留配置，
     await writeFile(join(source, 'prompt.md'), `prompt-${version}`);
     await writeFile(join(source, 'sagitta.json'), JSON.stringify({
       preset: { id: 'sagitta', name: 'Sagitta', prompt: 'prompt.md' },
+      officialPlugins: version === '0.0.1' ? [...officialPlugins, 'tool-goal'] : officialPlugins,
       plugins: [{ id: 'sagitta-task', name: '@sagitta/runtime/task', config: { host: 'default', version } }],
     }));
     const { stdout } = await execute('npm', ['pack', '--ignore-scripts', '--json'], { cwd: source });
@@ -99,6 +102,16 @@ test('Release 更新：真实 pnpm 安装、同版跳过、升级保留配置，
       config.plugins.find((
         plugin,
       ) => plugin.id === 'sagitta-task').config.host = 'user-database';
+      const web = config.plugins.find((
+        plugin,
+      ) => plugin.id === 'tool-web');
+      web.config = { search: false, fetch: false, searchTimeoutMs: 12345 };
+      config.plugins.find((
+        plugin,
+      ) => plugin.id === 'present').disabled = true;
+      config.plugins = config.plugins.filter((
+        plugin,
+      ) => plugin.id !== 'time-context');
       return config;
     });
     await ctx.fiber.dispose();
@@ -113,10 +126,33 @@ test('Release 更新：真实 pnpm 安装、同版跳过、升级保留配置，
     ctx = await start();
     assert.equal(ctx.get('sagittaReady'), true);
     assert.equal(refreshes, 2);
-    assert.equal(registrations.at(-1).plugins.at(-1).config.host, 'user-database');
+    assert.equal(registrations.at(-1).plugins.find((
+      plugin,
+    ) => plugin.id === 'sagitta-task').config.host, 'user-database');
     assert.equal(registrations.at(-1).plugins.find((
       plugin,
     ) => plugin.id === 'persona').config.prefix, 'prompt-0.0.2');
+    const configured = registrations.at(-1).plugins;
+    assert.deepEqual(configured.find((
+      plugin,
+    ) => plugin.id === 'tool-web').config, { search: false, fetch: false, searchTimeoutMs: 12345 });
+    assert.equal(configured.find((
+      plugin,
+    ) => plugin.id === 'present').disabled, true, '保留用户禁用状态');
+    assert.equal(configured.some((
+      plugin,
+    ) => plugin.id === 'time-context'), false, '保留用户删除结果');
+    assert.ok(configured.find((
+      plugin,
+    ) => plugin.id === 'tool-goal'), '已有非托管插件即使不在默认白名单也保留');
+    const delegation = configured.find((
+      plugin,
+    ) => plugin.id === 'delegation');
+    for (const id of ['tool-subagent', 'tool-subagent-fork', 'tool-subagent-control', 'tool-subagent-list-agents', 'tool-workflow']) {
+      assert.equal(delegation.config.find((
+        plugin,
+      ) => plugin.id === id).disabled, undefined, `${id} 沿用官方启用状态`);
+    }
     await assert.rejects(readFile(join(profileDir, 'node_modules/@deepseek-ai/dsh-scope/package.json')), { code: 'ENOENT' });
     await ctx.fiber.dispose();
 
@@ -134,6 +170,23 @@ test('Release 更新：真实 pnpm 安装、同版跳过、升级保留配置，
       const installed = JSON.parse(await readFile(join(profileDir, 'node_modules/@sagitta/runtime/package.json')));
       assert.equal(installed.version, '0.0.2');
       await ctx.fiber.dispose();
+    }
+    // 清除用户覆盖，验证首次组装仅选用白名单中的官方插件。
+    await writeFile(profile.patchPath, initialPatch);
+    await publishFixture('0.0.4');
+    ctx = await start();
+    assert.equal(ctx.get('sagittaReady'), true);
+    const fresh = registrations.at(-1).plugins;
+    assert.deepEqual(fresh.map((
+      plugin,
+    ) => plugin.id), ['sagitta-task', ...officialPlugins]);
+    assert.equal(fresh.find((
+      plugin,
+    ) => plugin.id === 'tool-web').config.fetch, true);
+    for (const id of ['command-goal', 'tool-goal', 'tool-todo', 'planning']) {
+      assert.equal(fresh.some((
+        plugin,
+      ) => plugin.id === id), false, `${id} 不加入默认组合`);
     }
   } finally {
     await ctx?.fiber.dispose();

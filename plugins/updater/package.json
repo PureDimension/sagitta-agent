@@ -1,6 +1,6 @@
 {
   "name": "@sagitta/updater",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "启动时更新 Sagitta，再注册其预设；Updater 自身手动安装。",
   "type": "module",

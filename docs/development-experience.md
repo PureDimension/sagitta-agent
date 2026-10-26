@@ -479,3 +479,87 @@
 - 验收脚本集中在 tests/diagnostics：install-release.py 仅替换发布资产 HTTP 下载，packed-web.js 运行实际独立环境及测试插件，online 模式访问真实 GitHub。测试密钥从本机 .env 进入测试进程环境，未写入发布包或 Git。日志含本地 Web 登录令牌，留在忽略目录。
 - 已实测 macOS ARM。Windows/Linux 尚未实机验证；多个实例共用数据库时临时任务通知竞争仍为已知限制。记忆模块仍为空壳，发布说明明确本版范围。
 - v0.1.0 已从提交 1429df3 发布，包含 install.py、release.json 及两个 tgz；标签和源码已推送 main。发布后从 GitHub 下载 install.py，确认与源码一致，在另一个全新目录完成在线安装。Updater 实际下载 GitHub runtime、真实模型调用工具、Web 认证访问、重启恢复认领并完成任务全部通过。验收插件已移除，隔离测试 PostgreSQL 进程已停止；没有改动日常 DSH profile。
+
+## 2026-10-26：管理者工具清单核对
+
+- 用户要求对照官方预设与归档 Sagitta，评估管理者需要的工具。已按安装包 0.2.1-rc.2 的 Standard、base/web 组合和包内说明核对，形成 [工具选型讨论](design/sagitta-tool-selection.md)；本轮仅记录建议，未修改配置。
+- 区分模型主动工具、提示词支撑和宿主服务；旧版“启用”来自归档配置声明，不代表历史实际调用。官方 master 的可选 Codex 后端文档仅作参考，固定版兼容性仍须验证。
+- 当前发布版从完整 Standard 起步。裁剪既有安装需考虑此前确认的非白名单保留规则；主 Agent 与子 Agent 清单需分别配置。
+- 用户已确认 web 搜索/读取、present、working-directory、time-context 保留；Goal 不需要、Todo 关闭且后续归任务机制、Plan 禁用。随后授权先接入所讨论工具：启用 Schedule，子 Agent 和 Workflow 沿用官方实现，后续与异步执行统一适配。
+
+## 2026-10-26：官方工具选择接入
+
+- 用户纠正后，sagitta.json 的 officialPlugins 改为默认选用的官方插件 ID 白名单，替代上一版强制覆盖启停状态的实现。Updater 按 ID 选取 Standard 条目并沿用其配置；缺少官方定义直接报错。首次配置采用该组合，后续沿用既有更新规则，仅 persona 和业务插件参与托管更新。
+- Goal 工具/命令、Todo、Planning 组不进入默认组合；Web、Present、时间、Schedule、委派组等进入白名单。工作目录沿用宿主入口，Shell 沿用官方平台条件。已有安装的官方插件及用户配置保留，包括旧版已有的 Goal 等条目；用户删除的非托管条目不补回。策略不承担子 Agent 任务绑定和异步执行适配。
+- 本次修改包括 Updater 本体，后续发布需要手动重跑安装器才能取得新实现；当前线上 v0.1.0 保持原样。本批未发布或安装到日常环境。
+- 验证：Updater 类型检查、构建及两组接入测试通过。真实 Loader、ConfigEditor 和 pnpm 覆盖首次按白名单组装、升级保留用户 Web 配置、启停状态、删除结果及旧版非托管条目；发布下载使用本地样本，未进行新的模型调用。
+
+## 2026-10-26：异步执行接入前核对
+
+- 用户提出异步调用显式传入 claimId，通过任务校验后放行，未来为记忆快照、过程记录和目录联动保留执行归属；当前先讨论异步接入。详见 [异步执行讨论](design/sagitta-async-discussion.md)。
+- 固定 DSH 0.2.1-rc.2 的 spawn/fork 可续聊；同版本官方 Codex 后端每次新进程/临时线程/单轮执行，无续聊或过程工具事件流。已读 npm 包源码，未安装或调用 Codex；不能把官网 master 的能力直接视作本地能力。
+- 官方异步启动、通知、取消能力可复用；claim 校验与关联尚未实现。tools.guard 同步、subagent/start 为发布后的观察事件，均不能直接承担异步数据库授权与严格执行前快照。
+
+## 2026-10-26：自主推进与记忆的实施顺序讨论
+
+- 用户提出辅助 AI 定期检查任务偏离、停滞、重组及进展，候选间隔 30 分钟或 1 小时，并将执行记录交给未来记忆模块整理。
+- 本轮建议顺序为最小证据/关联、异步委派、自主复查、长期记忆，细节记入异步执行讨论；属于待审查方案，尚未编写功能代码或固定周期。全量操作观察与异步派发分清职责，任务快照与文件快照范围需明确，第二模型收益不预设为已验证结论。
+- 用户提出公共包装统一 claim 校验和输入输出记录，以及监督模型双向通信。核对固定版 DSH：tools/pre-execute 支持异步，tools/result 可观察最终工具结果，会话日志已有消息及工具事件。建议优先记录关联并引用原日志，完整请求上下文与子执行过程另行区分；方案待审查，未实现。
+
+## 2026-10-26：结合归档的后续方向调研
+
+- 按用户要求汇总归档、新版和已讨论功能，并检索 Paperclip、OpenClaw、Deep Agents/LangGraph、Mastra、Hindsight/Letta 和 Langfuse 官方资料，记录于 [后续开发方向](design/sagitta-development-direction-2026-10-26.md)。本轮仅研究与建议，未安装框架或改运行代码。
+- 优先建议保留 DSH，借鉴 Paperclip 的任务交接/停止检查与 OpenClaw 的唤醒机制；Task Watchdog 检查已停下的任务树，不能等同于运行中偏离监督。其他完整框架会带来另一套消息、状态及运行体系，不能将功能清单丰富直接视为接入收益。
+- 建议依次完成授权/派发契约、异步结果处理、事件推进、独立双向复查、记忆首批接入。此为待审查建议，未撤销已确认记忆功能；不将先前讨论或本次调研写成一次性实现授权。
+
+## 2026-10-26：本地聊天预览部署
+
+- 用户要求启动后直接聊天。当前源码重新编译打包，使用本地验包安装入口部署到 `.runtime/Sagitta Chat`，独立 DSH 0.2.1-rc.2、home、agents、workspace 和本地任务数据库。未发布 GitHub Release；公开 v0.1.0 资产不受本地同版本构建影响。
+- 本地 `chat.sh` 沿用验包预加载器，将 GitHub 发布下载指向当前本地构建，并在进程启动时从项目 `.env` 提供 DeepSeek 密钥；密钥未复制进脚本或发布包。仅此开发预览入口使用本地样本，正式更新校验未改。
+- Web 在 `127.0.0.1:3788` 启动。全新预设采用官方工具白名单，任务模式配置为环境内本地数据库目录，首次挂载自动初始化成功。原有验收环境及日常 DSH 配置未修改。
+- 通过浏览器实际选择 Sagitta、调用 DeepSeek，模型执行 `project_list`，工具记录显示输入 `{}`、输出 `[]`，并正常回答。随后创建新的空白会话并选中 Sagitta，页面留给用户；本地服务保持运行。
+- 当前可用任务模块与 DSH 原生工具。异步 claim 接入、独立监督及长期记忆仍未实现；persona 中的目标描述不能当成这些能力已完成的证明。
+
+## 2026-10-26：插件显示名称与配置入口核实
+
+- 用户要求任务/记忆插件使用可读名称并前移。Updater 保留 `@sagitta/runtime/task` 和 `/memory` 包子路径，继续检查入口可读；根包导出各自 locale/en.json、zh.json，使用 DSH 原生 meta.title/description。文件 URL 被 readPluginMeta 跳过，是此前显示路径的原因。
+- 新初始化的预设将业务插件放在官方组合前；已有配置继续保留顺序。本地聊天环境按本次明确要求前移任务/记忆条目，配置与数据保留，重装当前本地打包的 runtime 和 Updater 后生效。类型检查、构建、两组接入测试通过；实际 Web 已确认中文标题和前两项顺序。
+- 核实配置入口：「设置 → 内置插件」为只读状态清单；「设置 → 打开配置文件」访问当前 profile/cordis.patch.yml。任务参数位于 preset-sagitta.config.plugins 中 sagitta-task 的 config；原生后端编辑能力不等于已有专用 Web 表单，图形表单尚未实现。
+- 本次重启意外中断用户已开始的模型回合，DSH 保留历史并标记停止。以后维护当前聊天实例，重启前检查活跃回合；不能依据浏览器显示设置页推断后端空闲。
+- 用户进一步明确要求通过 GUI 配置任务数据库，打开 YAML 不满足要求。当前缺少 GUI 入口，需要补齐；数据库选择与连接字段继续沿用现有 taskConfig 和 preset-sagitta 中的配置，不应为界面另建一套配置来源。
+- 本机官方 ui-settings-plugins 的 README 确认内置清单只读，配置页面由各插件的配套 UI 注册。原生 SettingsForms.describe 还要求 volatileForm 可用；声明构造时 Config 本身不能保证 GUI 自动出现。配套页面及写回预设的方案尚未实现，后续按小批次审查。
+
+## 2026-10-26：独立 Sagitta 设置，后端第一批
+
+- 用户要求设置侧栏单列 Sagitta 设置，前后端分离并分别审查。本批先提供任务配置读写核心 `plugins/task/src/settings/service.ts`；后续独立设置入口通过通信适配调用，尚未注册 RPC、编写前端或改动运行中的聊天实例。
+- TaskSettingsService.read 读取 preset-sagitta 内的任务配置，密码仅返回已配置标记；save 复用 taskConfig 校验及 DSH ConfigEditor.edit，保留其他预设字段和插件。密码省略表示保留，显式空字符串表示清空；切到本地模式仅保存 mode/directory。
+- 复用原生编辑器的锁、文件持久化及正常 Loader 更新，服务本身不重复实现文件写入或数据库连接；GUI 保存后仍提示用户在当前工作结束后重启。下一批真实接入发现 Loader 条目可能仍保留旧配置，配置读取已改为官方 profile 组合函数，见下文。
+- 类型检查、构建及设置服务测试通过，覆盖密码保留/修改/清空/不回显、无效参数不写入、切换模式清除无关字段、其他插件保留和目标缺失。测试使用配置编辑器替身，真实 GUI/RPC 和通过原生编辑器写回文件的验证留到对应接入批次。
+- 测试发现 Schemastery 保留输入中的额外字段，不能把模式校验当成自动清理旧字段；本地视图和保存路径显式选取 mode/directory，避免遗留远程密码被带入页面。
+
+## 2026-10-26：Sagitta 设置后端通信
+
+- 用户审查通过读写服务后，本批增加 `settings/controller.ts`，以原生 TypertRemoteService 和 @Remote 暴露 `sagittaSettings/readTask`、`saveTask(input)`；runtime bundle 在宿主注册该服务，依赖 ConfigEditor/profileContext，与会话和数据库实例分开。
+- 使用官方支持的 SRC 标记发现模式，Gateway 校验方法及参数名，业务字段沿用 taskConfig 校验；尚未生成 Typert 类型反射或编写前端。身份与权限沿用 DSH Gateway/RemoteAccess。
+- 真实原生编辑器测试发现：配置已落盘，但本测试的 Loader 条目仍保留旧值。读写服务因此改用 `composeEntries([readProfilePatches(...)])` 读取保存配置；save 在 ConfigEditor 的锁内读取并合并最新值，避免连续保存丢失修改或恢复旧密码。此方式沿用 Updater 的官方 profile 读取路径。
+- 类型检查、构建和两组设置测试通过。临时 profile 中真实挂载 Gateway、ConfigEditor、预设声明和设置服务，验证保存后读取、连续保存保留新密码、非法端口不改文件、非 owner 无策略时拒绝访问，以及重启后恢复并保留其他插件。预设注册的消费者使用替身，未启动数据库、浏览器 HTTP 或调用 LLM。
+- 本批未安装到当前聊天环境，未重启正在运行的聊天服务。前端设置页留待后端代码审查后实现。
+
+## 2026-10-26：Sagitta 设置前端
+
+- 用户审查通过后端后，实现 `plugins/settings/src/index.tsx`，通过原生 `settings.section` 注册侧栏独立入口，使用 Connection RPC 调用既有 readTask/saveTask。前端仅以类型导入后端契约，浏览器运行时复用宿主 React；构建产物单独放在 plugins/settings/dist。
+- 页面提供本地目录、自定义主机/端口/数据库/用户/密码/TLS/CA 路径。密码留空保留，勾选清空明确提交空字符串；保存期间禁用表单，失败保留输入并显示错误，成功提示手动重启。保存请求只维护配置，数据库连接和初始化仍由任务插件承担。
+- 核对固定版 ClientModules：裸包名和文件路径参与前端发现，包子路径不参与。宿主设置入口因此改为根导出 `@sagitta/runtime`，RPC 名称保持不变；根清单声明 ./client 和 dsh.client，发布脚本同步清理并打包前端产物。
+- 类型检查、构建、两组后端设置测试及 npm pack 内容检查通过。独立 DSH_HOME 的真实 Web 在 3790 验证侧栏入口、两种表单保存、重新打开读取保存值及成功提示；未调用模型、未执行数据库连接测试。临时服务和浏览器页已关闭，当前 3788 聊天实例保持运行。
+- npm 官方源下载 esbuild 平台二进制缓慢，本次依赖安装临时使用 npmmirror 命令参数，未修改全局 registry。前端截图保存在忽略的 .runtime/settings-ui-review/sagitta-settings.png，代码留待用户审查后再安装到聊天环境。
+
+## 2026-10-26：设置页样式调整
+
+- 用户反馈首版样式生硬。本批将样式独立到 settings/src/styles.ts，沿用 DSH 主题变量，改为圆角卡片、细边框、次级说明与原生主按钮配色；常用连接字段双列排列，小屏单列。仅调整展示结构和说明层级，配置与 RPC 行为沿用已审查实现。
+- build:settings 类型检查和构建通过；独立 3790 Web 实际查看本地、自定义两种布局并保存截图。当前聊天实例保持原样，样式仍待审查后安装。
+
+## 2026-10-26：准备发布 v0.1.1
+
+- 用户授权将已审查版本推送 main、发布 0.1.1 并验证自动更新。根运行包及有改动的 Updater 均升为 0.1.1，DSH 仍固定 0.2.1-rc.2；安装与发布文档补齐 GUI 配置入口。
+- 发布前根目录类型检查/构建、38 项真实 PostgreSQL 与设置测试、2 项 Updater 接入测试、5 项安装器测试通过；3 项可选的数据库部署测试未启用。首次全量测试缺少 SAGITTA_TEST_DB_CONFIG，提供隔离验收库后全部必需检查通过。
+- 在既有 Sagitta Test 验收环境中，保留正式发布的 Updater 0.1.0，使用本地下载替换器提供 0.1.1 运行包，启动后实际安装并通过认证 HTTP 调用新设置接口成功。此为发布前本地预检；真实 GitHub 下载及同版跳过结果将在发布后另记。

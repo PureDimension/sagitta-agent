@@ -52,7 +52,7 @@ def main():
     output = ROOT / ".runtime/releases" / tag
     output.mkdir(parents=True, exist_ok=True)
     # 清理编译目录，避免已经删除的源码以旧 JS 文件的形式残留在发布包中。
-    for relative in ["shared/dist", "plugins/task/dist", "plugins/memory/dist", "plugins/updater/dist"]:
+    for relative in ["shared/dist", "plugins/task/dist", "plugins/memory/dist", "plugins/settings/dist", "plugins/updater/dist"]:
         directory = ROOT / relative
         if directory.exists():
             shutil.rmtree(directory)
@@ -80,8 +80,10 @@ def main():
                          '下载 install.py，运行 python3 install.py --directory "/你的路径/Sagitta"。\n'
                          "Windows 使用 py -3 install.py --directory D:\\Sagitta。随后运行安装目录内的 sagitta.sh / sagitta.cmd。\n"
                          "需要 Node.js、npm、pnpm 和 Python 3；安装器局部安装指定版本 DSH。已有安装再次指定同一目录即可更新。\n\n"
-                         "此为实验版本，包含任务插件和 Updater；记忆插件暂为空壳。启动后选择 Sagitta 预设，"
-                         "为任务插件配置本地数据库目录或已有 PostgreSQL 连接，保存后重启。\n\n"
+                         "此为实验版本，包含任务插件和 Updater；记忆插件暂为空壳。启动后通过“设置 → Sagitta 设置”"
+                         "配置本地数据库目录或已有 PostgreSQL 连接，保存后重启。\n\n"
+                         "本版新增独立 Sagitta 配置页面、插件显示名称及官方工具默认白名单。业务包启动时自动更新；"
+                         "Updater 本体保持手动更新，旧安装需重跑 install.py 才能取得新版 Updater 的工具选择和名称处理。\n\n"
                          "验收平台为 macOS ARM；Windows/Linux 尚未实机验证。首版以单实例使用为验收范围，"
                          "多个实例共用数据库时临时任务到期提醒存在竞争丢失问题。启动时 GitHub 检查失败会阻止 Sagitta 就绪。\n",
                          encoding="utf-8")

@@ -20,7 +20,7 @@ python3 install.py --directory "$HOME/Sagitta"
 Windows 使用 `py -3 install.py --directory D:\Sagitta`，然后运行 `D:\Sagitta\sagitta.cmd`。
 安装器在指定目录局部安装发布包要求的精确 DSH 版本（当前 `0.2.1-rc.2`）和 Updater；Node.js 引擎要求由 npm 严格校验。
 启动入口固定使用目录内的程序、配置、插件、会话和指引目录，并保留启动时的工作目录。Web 中选择 Sagitta 预设。
-首次使用请为任务插件配置本地数据库目录，或填写已有 PostgreSQL 连接；保存后重启。数据库配置说明见[任务插件](plugins/task/README.md)。
+首次使用请在「设置 → Sagitta 设置」配置本地数据库目录，或填写已有 PostgreSQL 连接；保存后重启。数据库配置说明见[任务插件](plugins/task/README.md)。
 
 ```text
 Sagitta/

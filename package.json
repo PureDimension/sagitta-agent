@@ -1,6 +1,6 @@
 {
   "name": "@sagitta/runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "由 Sagitta Updater 加载的预设、提示词与业务插件",
   "type": "module",
@@ -11,7 +11,7 @@
   "engines": {
     "dsh": "0.2.1-rc.2"
   },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" }, "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-connection", "@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-client-ui-renderer"], "external": ["react"] } },
   "exports": {
     "./database": {
       "types": "./shared/dist/database.d.ts",
@@ -22,19 +22,25 @@
       "default": "./shared/dist/periodic-task.js"
     },
     "./memory": "./plugins/memory/dist/index.js",
-    "./task": "./plugins/task/dist/index.js"
+    "./memory/locale/*.json": "./plugins/memory/locale/*.json",
+    "./task": "./plugins/task/dist/index.js",
+    "./task/settings": "./plugins/task/dist/settings/service.js",
+    ".": "./plugins/task/dist/settings/controller.js",
+    "./client": "./plugins/settings/dist/client.js",
+    "./task/locale/*.json": "./plugins/task/locale/*.json"
   },
   "scripts": {
     "build:shared": "tsc -p shared/tsconfig.json",
-    "build": "npm run build:shared && tsc -p plugins/memory/tsconfig.json && tsc -p plugins/task/tsconfig.json",
-    "check": "npm run build:shared && tsc -p plugins/memory/tsconfig.json --noEmit && tsc -p plugins/task/tsconfig.json --noEmit",
+    "build": "npm run build:shared && tsc -p plugins/memory/tsconfig.json && tsc -p plugins/task/tsconfig.json && npm run build:settings",
+    "build:settings": "tsc -p plugins/settings/tsconfig.json && node scripts/build-settings.js",
+    "check": "npm run build:shared && tsc -p plugins/memory/tsconfig.json --noEmit && tsc -p plugins/task/tsconfig.json --noEmit && tsc -p plugins/settings/tsconfig.json",
     "test:database": "npm run build && node --test tests/database.test.js tests/task-repository.test.js tests/task-expiry.test.js",
     "test:periodic-task": "npm run build && node --test tests/periodic-task.test.js tests/task-automation.test.js",
     "test:task-init": "npm run build && node --test tests/task-init.test.js tests/task-renewal-adapter.test.js",
     "test:task-tools": "npm run build && node --test tests/task-tools.test.js"
   },
   "dependencies": { "pg": "8.23.1", "p-retry": "8.0.1", "@deepseek-ai/dsh-atomic-write": "0.2.1-rc.2", "@deepseek-ai/dsh-anonymous-user-id": "0.2.1-rc.2" },
-  "peerDependencies": { "@deepseek-ai/cordis": "4.0.5", "@deepseek-ai/cordis-plugin-timer": "1.1.7", "@deepseek-ai/dsh-agent": "0.2.1-rc.2", "@deepseek-ai/dsh-llm": "0.2.1-rc.2", "@deepseek-ai/dsh-scope": "0.2.1-rc.2", "@deepseek-ai/schemastery": "3.18.5", "@deepseek-ai/dsh-tools": "0.2.1-rc.2", "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2" },
-  "devDependencies": { "typescript": "5.9.3", "@types/node": "22.20.5", "@types/pg": "8.23.1", "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2", "@deepseek-ai/dsh-scope": "0.2.1-rc.2" },
-  "files": ["shared/dist", "plugins/memory/dist", "plugins/memory/package.json", "plugins/task/dist", "plugins/task/migrations", "presets/sagitta.md", "sagitta.json", "cordis.patch.yml"]
+  "peerDependencies": { "@deepseek-ai/cordis": "4.0.5", "@deepseek-ai/cordis-plugin-timer": "1.1.7", "@deepseek-ai/dsh-agent": "0.2.1-rc.2", "@deepseek-ai/dsh-llm": "0.2.1-rc.2", "@deepseek-ai/dsh-scope": "0.2.1-rc.2", "@deepseek-ai/schemastery": "3.18.5", "@deepseek-ai/dsh-tools": "0.2.1-rc.2", "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2", "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2", "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2" },
+  "devDependencies": { "typescript": "5.9.3", "@types/node": "22.20.5", "@types/pg": "8.23.1", "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2", "@deepseek-ai/dsh-config-editor": "0.2.1-rc.2", "@deepseek-ai/dsh-scope": "0.2.1-rc.2", "@deepseek-ai/dsh-agent-preset": "0.2.1-rc.2", "@deepseek-ai/dsh-api-gateway": "0.2.1-rc.2", "@deepseek-ai/dsh-api-remote-access": "0.2.1-rc.2", "@deepseek-ai/dsh-typert-registry": "0.2.1-rc.2", "@deepseek-ai/dsh-client-connection": "0.2.1-rc.2", "@deepseek-ai/dsh-client-ui-settings": "0.2.1-rc.2", "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-rc.2", "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2", "react": "18.3.1", "@types/react": "18.3.18", "esbuild": "0.25.12" },
+  "files": ["shared/dist", "plugins/memory/dist", "plugins/memory/locale", "plugins/memory/package.json", "plugins/task/dist", "plugins/task/locale", "plugins/task/migrations", "plugins/settings/dist", "presets/sagitta.md", "sagitta.json", "cordis.patch.yml"]
 }

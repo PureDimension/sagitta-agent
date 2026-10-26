@@ -5,6 +5,24 @@
     "description": "长期工作伙伴：管理项目、自主推进、积累经验。",
     "prompt": "presets/sagitta.md"
   },
+  "officialPlugins": [
+    "persona",
+    "agent-instructions",
+    "time-context",
+    "tool-bash",
+    "tool-pwsh",
+    "tool-fs",
+    "tool-fs-search",
+    "tool-jobs",
+    "tool-schedule",
+    "skill-filesystem",
+    "tool-skill",
+    "compaction",
+    "delegation",
+    "tool-ask-user",
+    "tool-web",
+    "present"
+  ],
   "plugins": [
     {
       "id": "sagitta-task",
