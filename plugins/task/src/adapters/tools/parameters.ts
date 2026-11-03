@@ -8,7 +8,7 @@ export const taskIdParameter = {
 } as const;
 
 export const descriptionParameter = {
-  type: 'string', description: 'Markdown 说明，可记录目标、验收要求、交接信息和文件链接。',
+  type: 'string', description: 'Markdown 格式的概述、持续规划与资料索引。',
 } as const;
 
 export const descriptionModeParameter = {

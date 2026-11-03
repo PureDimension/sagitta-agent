@@ -53,7 +53,7 @@ export function* registerProjectTools(
     description: `
 更新项目说明。
 mode=replace 整体替换；
-mode=append 原子追加新增内容，可直接提交新增备注。
+mode=append 原子追加说明内容。
 `,
     parameters: {
       projectId: projectIdParameter,

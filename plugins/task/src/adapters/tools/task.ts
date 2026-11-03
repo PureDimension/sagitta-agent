@@ -37,7 +37,7 @@ export function* registerTaskTools(
     name: 'task_create',
     description: `
 在项目下创建任务。
-normal 用于长期推进并保留记录的工作，会话存在时有效，会话结束后20分钟内被自动收回；
+normal 用于长期推进并保留记录的工作，会话存在时持续有效，直到手动标记完成。会话结束后20分钟内也会被自动收回；
 temp 用于勘查等临时工作，自动由本会话认领，有效期 20 分钟。
 立即认领成功时一并返回 claimId；任务管理操作使用返回的 id。
 `,
@@ -153,7 +153,7 @@ open（待领取）或 blocked（阻塞中）→ in_progress（进行中），�
 完成本会话认领的任务。
 正式任务：in_progress（进行中）→ done（已完成），保留记录并撤销认领；
 临时任务：从 in_progress 直接清除任务及认领。
-应先核对目标与验收要求并记录结果。
+应先核对目标与验收要求，并将结果写入相关工作记录。
 `,
     parameters: { taskId: taskIdParameter },
     output: jsonOutput(taskResultSchema),
