@@ -1,12 +1,12 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-agent';
-import type { TaskOperations } from '../service/operations/task.js';
+import type { WorkContext } from '../service/operations/work-context.js';
 import { getTaskOwner } from './identity.js';
 
 /** 每次组装读取当前认领；查询结果只写入本次组装，避免跨会话共享缓存。 */
 export function* registerTaskWorkContext(
   ctx: Context,
-  tasks: TaskOperations,
+  work: WorkContext,
 ) {
   const name = 'sagitta:current-work';
   yield ctx.systemPrompt.section({
@@ -26,10 +26,10 @@ export function* registerTaskWorkContext(
     ) => item.name === name);
     if (!context.agent || !section) return assembly;
 
-    const projects = await tasks.listClaimedProjects(getTaskOwner(context));
+    const projects = await work.listClaimedProjects(getTaskOwner(context));
     section.text = `
 # 本会话当前工作
-以下为当前认领的项目与任务数据。
+按项目列出本会话认领的任务、目标，以及这些任务所属的目标。目标与任务各有自己的认领凭据。
 ${JSON.stringify(projects, null, 2)}
 `;
     return assembly;

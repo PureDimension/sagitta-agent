@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { taskClaimExists } from './helpers/task-claim.js';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -28,11 +29,11 @@ test('批量续租限定设备与会话，仅延长有效正式认领且保持�
   ) => assert.fail(error.message));
 
   try {
-    for (const table of ['projects', 'tasks', 'task_claims']) {
+    for (const table of ['projects', 'tasks', 'task_claims', 'goals', 'goal_claims']) {
       await database.query(`CREATE TEMP TABLE ${table} (LIKE public.${table} INCLUDING ALL)`);
     }
     const repository = new TaskRepositories(database);
-    const renewal = new TaskRenewal(repository);
+    const renewal = new TaskRenewal(repository.claims);
     const active = await repository.projects.createProject('续租项目', '');
     const archived = await repository.projects.createProject('归档项目', '');
     await repository.projects.archiveProject(archived.id);
@@ -82,7 +83,7 @@ test('批量续租限定设备与会话，仅延长有效正式认领且保持�
   }
 
   // 连接关闭后，空会话列表仍直接返回；非空调用的数据库错误向上传播。
-  const renewal = new TaskRenewal(new TaskRepositories(database));
+  const renewal = new TaskRenewal(new TaskRepositories(database).claims);
   assert.equal(await renewal.renewClaims('device', []), 0);
   await assert.rejects(renewal.renewClaims('device', ['s1']), /pool after calling end/);
 });
@@ -97,6 +98,8 @@ test('项目与任务读写、可见性过滤及表结构版本检查', { timeou
     await checkTaskSchema(database);
 
     const connection = database;
+    await connection.query('CREATE TEMP TABLE goals (LIKE public.goals INCLUDING ALL)');
+    await connection.query('CREATE TEMP TABLE goal_claims (LIKE public.goal_claims INCLUDING ALL)');
     // 单连接池的临时表跨事务保留，连接关闭时清除。
     await connection.query('CREATE TEMP TABLE projects (LIKE public.projects INCLUDING ALL)');
     const { rows } = await connection.query(`
@@ -188,10 +191,10 @@ test('项目与任务读写、可见性过滤及表结构版本检查', { timeou
     await connection.query("UPDATE task_claims SET expires_at = statement_timestamp() - interval '1 second'");
     // 列表保留存储结果；详情访问发现到期后提交清理并返回原内容。
     assert.deepEqual(await taskOperations.listTasks(project.id), [task, tempTask]);
-    const expiredTemp = await taskOperations.execute({ action: 'get', taskId: tempTask.id });
+    const expiredTemp = await taskOperations.execute({ action: 'get', taskId: tempTask.id, owner: { deviceId: 'device', sessionId: 'session' } });
     assert.equal(expiredTemp.kind, 'expired');
     assert.deepEqual(expiredTemp.task, tempTask);
-    assert.equal(await repository.claims.hasClaim(tempTask.id), false);
+    assert.equal(await taskClaimExists(database, tempTask.id), false);
     assert.deepEqual(await repository.tasks.getTask(tempTask.id), { state: 'missing' });
     await assert.rejects(perform(taskOperations, { action: 'get', taskId: tempTask.id }), { message: '任务不存在' });
 
@@ -208,21 +211,20 @@ test('项目与任务读写、可见性过滤及表结构版本检查', { timeou
     await assert.rejects(perform(taskOperations, { action: 'delete', taskId: toDelete.id, owner: { ...owner, sessionId: 'other' } }), /仅当前认领设备与会话/);
     await perform(taskOperations, { action: 'delete', taskId: toDelete.id, owner });
     assert.deepEqual(await repository.tasks.getTask(toDelete.id), { state: 'missing' });
-    assert.equal(await repository.claims.hasClaim(toDelete.id), false);
+    assert.equal(await taskClaimExists(database, toDelete.id), false);
 
     await perform(taskOperations, { action: 'claim', taskId: task.id, owner });
     await assert.rejects(perform(taskOperations, { action: 'delete', taskId: task.id, owner: { ...owner, deviceId: 'other' } }), /仅当前认领设备与会话/);
     await connection.query("UPDATE task_claims SET expires_at = statement_timestamp() - interval '1 second'");
-    assert.equal((await taskOperations.execute({ action: 'delete', taskId: task.id, owner })).kind, 'expired');
-    await perform(taskOperations, { action: 'claim', taskId: task.id, owner });
+    assert.equal((await taskOperations.execute({ action: 'claim', taskId: task.id, owner })).value.status, 'in_progress');
     // 认领已删除后让归档失败，确认认领也会恢复。
     await connection.query('ALTER TABLE tasks ADD CONSTRAINT reject_archive CHECK (deleted_at IS NULL)');
     await assert.rejects(perform(taskOperations, { action: 'delete', taskId: task.id, owner }), { code: '23514' });
-    assert.equal(await repository.claims.hasClaim(task.id), true);
+    assert.equal(await taskClaimExists(database, task.id), true);
     assert.equal((await repository.tasks.getTask(task.id)).state, 'found');
     await connection.query('ALTER TABLE tasks DROP CONSTRAINT reject_archive');
     await perform(taskOperations, { action: 'delete', taskId: task.id, owner });
-    assert.equal(await repository.claims.hasClaim(task.id), false);
+    assert.equal(await taskClaimExists(database, task.id), false);
     await assert.rejects(perform(taskOperations, { action: 'delete', taskId: task.id, owner }), { message: '任务已归档' });
     await assert.rejects(perform(taskOperations, { action: 'delete', taskId: '0', owner }), { message: '任务不存在' });
 
@@ -236,16 +238,16 @@ test('项目与任务读写、可见性过滤及表结构版本检查', { timeou
     assert.equal((await repository.projects.getProject(project.id)).state, 'found');
     assert.equal((await repository.tasks.getTask(active.id)).state, 'found');
     assert.equal((await repository.tasks.getTask(activeTemp.id)).state, 'found');
-    assert.equal(await repository.claims.hasClaim(active.id), true);
-    assert.equal(await repository.claims.hasClaim(activeTemp.id), true);
+    assert.equal(await taskClaimExists(database, active.id), true);
+    assert.equal(await taskClaimExists(database, activeTemp.id), true);
     await connection.query('ALTER TABLE projects DROP CONSTRAINT reject_archive');
     await service.deleteProject(project.id);
     assert.deepEqual(await repository.projects.getProject(project.id), { state: 'archived' });
     assert.deepEqual(await repository.tasks.getTask(active.id), { state: 'archived' });
     assert.deepEqual(await repository.tasks.getTask(activeTemp.id), { state: 'missing' });
-    assert.equal(await repository.claims.hasClaim(active.id), false);
-    assert.equal(await repository.claims.hasClaim(activeTemp.id), false);
-    assert.equal(await repository.claims.hasClaim(otherTask.id), true);
+    assert.equal(await taskClaimExists(database, active.id), false);
+    assert.equal(await taskClaimExists(database, activeTemp.id), false);
+    assert.equal(await taskClaimExists(database, otherTask.id), true);
     assert.ok((await service.listProjects()).every((
       item
     ) => item.id !== project.id));
@@ -263,9 +265,9 @@ test('项目与任务读写、可见性过滤及表结构版本检查', { timeou
 
     await connection.query('CREATE TEMP TABLE schema_migrations (version integer)');
     await assert.rejects(checkTaskSchema(connection), /表结构版本不匹配/);
-    await connection.query('INSERT INTO schema_migrations VALUES (1), (2)');
+    await connection.query('INSERT INTO schema_migrations VALUES (1)');
     await assert.rejects(checkTaskSchema(connection), /表结构版本不匹配/);
-    await connection.query('DELETE FROM schema_migrations WHERE version = 2');
+    await connection.query('INSERT INTO schema_migrations VALUES (2)');
     await checkTaskSchema(connection);
   } finally {
     await database.close();
@@ -299,7 +301,7 @@ test('状态动作：正式流转、临时清理、权限拒绝与事务回滚',
         await database.query("UPDATE tasks SET status = 'in_progress' WHERE id = $1", [task.id]);
         if (kind === 'temp' && method === 'block') {
           await assert.rejects(perform(operations, { action: 'block', taskId: task.id, owner }), /临时任务不允许阻塞/);
-          assert.equal(await repository.claims.hasClaim(task.id), true);
+          assert.equal(await taskClaimExists(database, task.id), true);
           assert.deepEqual(await perform(operations, { action: 'get', taskId: task.id }), task);
           continue;
         }
@@ -311,13 +313,13 @@ test('状态动作：正式流转、临时清理、权限拒绝与事务回滚',
           await database.query('INSERT INTO protected_tasks VALUES ($1)', [task.id]);
         }
         await assert.rejects(perform(operations, { action: method, taskId: task.id, owner }), { code: kind === 'normal' ? '23514' : '23503' });
-        assert.equal(await repository.claims.hasClaim(task.id), true);
+        assert.equal(await taskClaimExists(database, task.id), true);
         assert.deepEqual(await perform(operations, { action: 'get', taskId: task.id }), task);
         if (kind === 'normal') await database.query('ALTER TABLE tasks DROP CONSTRAINT reject_transition');
         else await database.query('DELETE FROM protected_tasks WHERE task_id = $1', [task.id]);
 
         assert.equal(await perform(operations, { action: method, taskId: task.id, owner }), undefined);
-        assert.equal(await repository.claims.hasClaim(task.id), false);
+        assert.equal(await taskClaimExists(database, task.id), false);
         if (kind === 'normal') assert.equal((await perform(operations, { action: 'get', taskId: task.id })).status, target);
         else assert.deepEqual(await repository.tasks.getTask(task.id), { state: 'missing' });
         if (target === 'blocked' && kind === 'normal') await perform(operations, { action: 'claim', taskId: task.id, owner });
@@ -411,7 +413,7 @@ test('临时创建：项目归属、自动认领、固定 20 分钟及失败回�
     const owner = { deviceId: 'device', sessionId: 'session' };
     const input = { kind: 'temp', projectId: project.id, title: '勘查', owner };
     const task = await operations.createTask(input);
-    assert.deepEqual(task, { id: task.id, projectId: project.id, kind: 'temp', title: '勘查', description: '', status: 'in_progress', claimId: task.claimId });
+    assert.deepEqual(task, { id: task.id, projectId: project.id, goalId: null, kind: 'temp', title: '勘查', description: '', status: 'in_progress', claimId: task.claimId });
     assert.equal(task.claimId, (await database.query('SELECT claim_id FROM task_claims WHERE task_id=$1', [task.id])).rows[0].claim_id);
     const { rows } = await database.query(`
       SELECT owner_device_id, owner_session_id,
@@ -473,10 +475,9 @@ test('独立认领及编辑权限：校验状态、身份与租约，失败时�
     assert.equal((await perform(operations, { action: 'get', taskId: task.id })).description, '本人编辑');
     await assert.rejects(perform(operations, { action: 'claim', taskId: task.id, owner }), /任务已有认领/);
     await database.query("UPDATE task_claims SET expires_at = statement_timestamp() - interval '1 second'");
-    const expired = await operations.execute({ action: 'update', taskId: task.id, description: '过期后覆盖', owner });
-    assert.equal(expired.kind, 'expired');
-    assert.equal(expired.task.description, '本人编辑');
-    assert.equal((await perform(operations, { action: 'get', taskId: task.id })).description, '本人编辑');
+    const updated = await perform(operations, { action: 'update', taskId: task.id, description: '过期后覆盖', owner });
+    assert.equal(updated.status, 'open');
+    assert.equal((await perform(operations, { action: 'get', taskId: task.id })).description, '过期后覆盖');
     assert.equal((await perform(operations, { action: 'claim', taskId: task.id, owner })).status, 'in_progress');
     assert.equal((await database.query('SELECT * FROM task_claims')).rowCount, 1);
 

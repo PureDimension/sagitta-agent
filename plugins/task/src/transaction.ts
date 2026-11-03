@@ -10,16 +10,20 @@ export type TransactionRunner = <T>(
 
 /** 组装事务内的 Repository，提交、回滚和连接释放复用 Database。 */
 export function createTransactionRunner(
-  database: Database
+  database: Database,
+  mode: 'write' | 'snapshot' = 'write',
 ): TransactionRunner {
   return function transaction<T>(
     work: (
       repository: TaskRepositories
     ) => Promise<T>
   ): Promise<T> {
-    return database.transaction((
+    return database.transaction(async (
       connection
     ) => {
+      if (mode === 'snapshot') {
+        await connection.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+      }
       const repository = new TaskRepositories(connection);
 
       return work(repository);

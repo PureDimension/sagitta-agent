@@ -1,25 +1,69 @@
 import type { Database } from '@sagitta/runtime/database';
-import type { DescriptionWriteMode, Task } from '../contracts.js';
+import type { ClaimedTask, DescriptionWriteMode, Project, Task, TaskOwner } from '../contracts.js';
 import type { RepositoryResult } from './result.js';
 
-const taskColumns = 't.id, t.project_id AS "projectId", t.kind, t.title, t.description, t.status';
+const taskColumns = 't.id, t.goal_id AS "goalId", t.project_id AS "projectId", t.kind, t.title, t.description, t.status';
 
 export class TaskRepository {
   constructor(
-    private readonly database: Pick<Database, 'query'>
+    private readonly database: Pick<Database, 'query'>,
   ) {}
 
+  /** 一次查询取得当前可用认领及项目；只读展示，不执行到期清理。 */
+  async listContext(
+    owner: TaskOwner,
+  ): Promise<{ project: Project; task: ClaimedTask }[]> {
+    const { rows } = await this.database.query<{ project: Project; task: ClaimedTask }>(`
+      SELECT json_build_object('id', p.id, 'name', p.name, 'description', p.description) AS project,
+        json_build_object('id', t.id::text, 'projectId', t.project_id, 'goalId', t.goal_id::text, 'kind', t.kind,
+          'title', t.title, 'description', t.description, 'status', t.status,
+          'claimId', c.claim_id) AS task
+      FROM task_claims c JOIN tasks t ON t.id = c.task_id
+      JOIN projects p ON p.id = t.project_id
+      WHERE c.owner_device_id = $1 AND c.owner_session_id = $2
+        AND c.expires_at > CURRENT_TIMESTAMP AND t.status = 'in_progress'
+        AND t.deleted_at IS NULL AND p.deleted_at IS NULL
+      ORDER BY p.id, t.id
+    `, [owner.deviceId, owner.sessionId]);
+
+    return rows;
+  }
+
   async listTasks(
-    projectId: string
+    projectId: string,
+    goalId?: string,
   ): Promise<Task[]> {
     const { rows } = await this.database.query<Task>(`
       SELECT ${taskColumns} FROM tasks t
       JOIN projects p ON p.id = t.project_id
       WHERE t.project_id = $1 AND t.deleted_at IS NULL AND p.deleted_at IS NULL
+        AND ($2::bigint IS NULL OR t.goal_id = $2)
       ORDER BY t.id
-    `, [projectId]);
+    `, [projectId, goalId]);
 
     return rows;
+  }
+
+  async listUnfinishedForGoal(
+    goalId: string,
+  ): Promise<Pick<Task, 'id' | 'title' | 'status'>[]> {
+    const { rows } = await this.database.query<Pick<Task, 'id' | 'title' | 'status'>>(`
+      SELECT id, title, status FROM tasks
+      WHERE goal_id = $1 AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')
+      ORDER BY id
+    `, [goalId]);
+    return rows;
+  }
+
+  async setGoal(
+    taskId: string,
+    goalId: string | null,
+  ): Promise<Task> {
+    const { rows } = await this.database.query<Task>(`
+      UPDATE tasks t SET goal_id = $2, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1 RETURNING ${taskColumns}
+    `, [taskId, goalId]);
+    return rows[0];
   }
 
   async getTask(
@@ -143,20 +187,26 @@ export class TaskRepository {
     await this.database.query('DELETE FROM tasks WHERE id = $1', [taskId]);
   }
 
-  /** 调用方须在同一事务内先取得项目排他锁，并撤销项目下的认领。 */
+  /** 调用方已锁项目并撤销相应认领；指定目标时只清理其下任务。 */
   async deleteProjectTemporaryTasks(
-    projectId: string
+    projectId: string,
+    goalId?: string,
   ): Promise<void> {
-    await this.database.query("DELETE FROM tasks WHERE project_id = $1 AND kind = 'temp'", [projectId]);
+    await this.database.query(`
+      DELETE FROM tasks WHERE project_id = $1 AND kind = 'temp'
+        AND ($2::bigint IS NULL OR goal_id = $2)
+    `, [projectId, goalId]);
   }
 
   /** 调用方须在同一事务内先取得项目排他锁。 */
   async archiveProjectTasks(
-    projectId: string
+    projectId: string,
+    goalId?: string,
   ): Promise<void> {
     await this.database.query(`
       UPDATE tasks SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
       WHERE project_id = $1 AND kind = 'normal' AND deleted_at IS NULL
-    `, [projectId]);
+        AND ($2::bigint IS NULL OR goal_id = $2)
+    `, [projectId, goalId]);
   }
 }

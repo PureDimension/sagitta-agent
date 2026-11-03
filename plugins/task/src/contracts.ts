@@ -9,13 +9,29 @@ export interface Project {
 }
 
 /** bigint 序号以字符串传递，避免超出 JavaScript 的安全整数范围。 */
+export interface Goal {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  status: Task['status'];
+}
+
 export interface Task {
   id: string;
   projectId: string;
+  goalId: string | null;
   kind: 'normal' | 'temp';
   title: string;
   description: string;
   status: 'open' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
+}
+
+/** 主动访问先回收入库；goal 保留回收前的状态，供会话了解原因。 */
+export interface ExpiredGoal {
+  kind: 'expired';
+  goal: Goal;
+  message: string;
 }
 
 /** 本次认领凭据，仅在认领成功及所属会话的工作上下文中提供。 */
@@ -24,6 +40,7 @@ export interface ClaimedTask extends Task {
 }
 
 export interface ClaimedProject extends Project {
+  goals: (Goal & { claimId?: string })[];
   tasks: ClaimedTask[];
 }
 
@@ -44,6 +61,7 @@ export type CreateTaskOptions =
   | { claimImmediately: true; owner: TaskOwner };
 
 interface TaskContent {
+  goalId?: string;
   projectId: string;
   title: string;
   description?: string;
@@ -56,8 +74,8 @@ export type CreateTaskInput =
 
 /** 已有单任务的统一操作入口；查看详情沿用原来的读取权限。 */
 export type TaskOperation =
-  | { action: 'get'; taskId: string }
-  | { action: 'update'; taskId: string; owner: TaskOwner; description: string; mode?: DescriptionWriteMode }
+  | { action: 'get'; taskId: string; owner?: TaskOwner }
+  | { action: 'update'; taskId: string; owner: TaskOwner; goalId?: string | null; description?: string; mode?: DescriptionWriteMode }
   | { action: 'claim' | 'release' | 'complete' | 'block' | 'cancel' | 'delete'; taskId: string; owner: TaskOwner };
 
 /** task 保存回收前的内容，owner 供接入层定位原认领会话。 */

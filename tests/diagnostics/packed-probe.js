@@ -57,16 +57,27 @@ export default class PackedProbe {
       assert.equal(current.task.status, 'in_progress');
       await call('task_complete', { taskId: state.taskId });
       assert.equal((await call('task_get', { taskId: state.taskId })).task.status, 'done');
+      if (state.goalId) assert.equal((await call('goal_complete', { goalId: state.goalId })).status, 'done');
       await call('project_delete', { projectId: state.projectId });
     } else {
       const project = await call('project_create', { name: '打包版本验收项目', description: '隔离测试' });
-      const task = await call('task_create', { projectId: project.id, kind: 'normal', title: '重启恢复验收', claimImmediately: true });
+      const toolName = names.includes('goal_list') ? 'goal_list' : 'project_list';
+      if (toolName === 'goal_list') {
+        const goal = await call('goal_create', { projectId: project.id, title: '打包版本验收目标', claimImmediately: true });
+        state.goalId = goal.id;
+      }
+      const input = { projectId: project.id, kind: 'normal', title: '重启恢复验收', claimImmediately: true };
+      if (state.goalId) input.goalId = state.goalId;
+      const task = await call('task_create', input);
       state.projectId = project.id;
       state.taskId = task.id;
       const context = await ctx.systemPrompt.assemble({ scope: agent, agent });
       assert.ok(JSON.stringify(context).includes('重启恢复验收'));
       if (process.env.SAGITTA_TEST_ENV_FILE) {
-        agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '这是一轮隔离验收。只调用 project_list 工具一次，简短报告项目名称即可。不要执行其他操作。' }] }));
+        const prompt = toolName === 'goal_list'
+          ? `这是隔离验收。只调用 goal_list 一次，projectId 为 ${project.id}，简短报告读到的目标标题。`
+          : '这是隔离验收。只调用 project_list 一次，简短报告项目名称。';
+        agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: prompt }] }));
         await agent.whenIdle();
         const events = Array.from({ length: agent.session.seq }, (
           _,
@@ -78,8 +89,8 @@ export default class PackedProbe {
         assert.equal(end?.data.reason.kind, 'completed', JSON.stringify(end));
         const toolCall = events.find((
           event,
-        ) => event.type === 'tool/call' && event.data.name === 'project_list');
-        assert.ok(toolCall, '模型应真实调用项目工具');
+        ) => event.type === 'tool/call' && event.data.name === toolName);
+        assert.ok(toolCall, `模型应真实调用 ${toolName}`);
         assert.ok(events.some((
           event,
         ) => event.type === 'tool/result' && event.data.message.toolCallId === toolCall.data.callId

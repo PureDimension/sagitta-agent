@@ -1,132 +1,135 @@
 import type { Database } from '@sagitta/runtime/database';
-import type { ClaimedTask, Project, TaskClaim, TaskOwner } from '../contracts.js';
+import type { TaskClaim, TaskOwner } from '../contracts.js';
 
-// 正式认领与临时任务寿命均固定为 20 分钟；临时任务不续租。
 const claimLeaseMinutes = 20;
+
+// SQL 标识符只取自这两套固定的表结构。目标号与任务号可以相同。
+const tables = {
+  task: { claims: 'task_claims', items: 'tasks', key: 'task_id' },
+  goal: { claims: 'goal_claims', items: 'goals', key: 'goal_id' },
+} as const;
+type ClaimKind = keyof typeof tables;
 
 export class ClaimRepository {
   constructor(
-    private readonly database: Pick<Database, 'query'>
+    private readonly database: Pick<Database, 'query'>,
   ) {}
 
-  /** 在事务内先锁任务，再锁认领；取得认领行锁后按数据库时间判断到期。 */
+  /** 周期回收只取候选 ID；锁定任务或目标后还需复查有效期。 */
+  async listExpiredIds(
+    kind: ClaimKind,
+  ): Promise<string[]> {
+    const sql = kind === 'goal'
+      ? 'SELECT goal_id AS id FROM goal_claims WHERE expires_at <= clock_timestamp() ORDER BY goal_id'
+      : `SELECT t.id FROM task_claims c
+         JOIN tasks t ON t.id = c.task_id JOIN projects p ON p.id = t.project_id
+         WHERE c.expires_at <= clock_timestamp() AND t.deleted_at IS NULL AND p.deleted_at IS NULL
+         ORDER BY t.id`;
+    const { rows } = await this.database.query<{ id: string }>(sql);
+    return rows.map((
+      row,
+    ) => row.id);
+  }
+
+  /** 在事务内先锁任务或目标，再锁认领；取得认领行锁后按数据库时间判断到期。 */
   async lockClaim(
-    taskId: string
+    kind: ClaimKind,
+    id: string
   ): Promise<TaskClaim | undefined> {
+    const { claims, key } = tables[kind];
     const { rows } = await this.database.query<TaskClaim>(`
       WITH target AS MATERIALIZED (
         SELECT owner_device_id, owner_session_id, expires_at
-        FROM task_claims WHERE task_id = $1 FOR UPDATE
+        FROM ${claims} WHERE ${key} = $1 FOR UPDATE
       )
       SELECT owner_device_id AS "deviceId", owner_session_id AS "sessionId",
         (expires_at <= clock_timestamp()) AS expired
       FROM target
-    `, [taskId]);
+    `, [id]);
 
     return rows[0];
   }
 
-  /** 先锁定任务再查询；过期但尚未回收的认领也算存在。 */
-  async hasClaim(
-    taskId: string
-  ): Promise<boolean> {
-    const { rows } = await this.database.query<{ exists: boolean }>(`
-      SELECT EXISTS (SELECT 1 FROM task_claims WHERE task_id = $1) AS exists
-    `, [taskId]);
-
-    return rows[0].exists;
-  }
-
   /** 与状态修改共用事务连接；唯一约束保证每个任务只有一条认领。 */
   async createClaim(
-    taskId: string,
+    kind: ClaimKind,
+    id: string,
     owner: TaskOwner
   ): Promise<string> {
+    const { claims, key } = tables[kind];
     const { rows } = await this.database.query<{ claimId: string }>(`
-      INSERT INTO task_claims (task_id, owner_device_id, owner_session_id, expires_at)
+      INSERT INTO ${claims} (${key}, owner_device_id, owner_session_id, expires_at)
       VALUES ($1, $2, $3, statement_timestamp() + $4::integer * interval '1 minute')
       RETURNING claim_id AS "claimId"
-    `, [taskId, owner.deviceId, owner.sessionId, claimLeaseMinutes]);
+    `, [id, owner.deviceId, owner.sessionId, claimLeaseMinutes]);
 
     return rows[0].claimId;
   }
 
-  /** 一次查询取得当前可用认领及项目；只读展示，不执行到期清理。 */
-  async listClaimedTasks(
-    owner: TaskOwner,
-  ): Promise<{ project: Project; task: ClaimedTask }[]> {
-    const { rows } = await this.database.query<{ project: Project; task: ClaimedTask }>(`
-      SELECT json_build_object('id', p.id, 'name', p.name, 'description', p.description) AS project,
-        json_build_object('id', t.id::text, 'projectId', t.project_id, 'kind', t.kind,
-          'title', t.title, 'description', t.description, 'status', t.status,
-          'claimId', c.claim_id) AS task
-      FROM task_claims c JOIN tasks t ON t.id = c.task_id
-      JOIN projects p ON p.id = t.project_id
-      WHERE c.owner_device_id = $1 AND c.owner_session_id = $2
-        AND c.expires_at > statement_timestamp() AND t.status = 'in_progress'
-        AND t.deleted_at IS NULL AND p.deleted_at IS NULL
-      ORDER BY p.id, t.id
-    `, [owner.deviceId, owner.sessionId]);
-
-    return rows;
-  }
-
-  /** 全库扫描仅用于周期回收；候选可能变化，调用方须锁定任务和认领后复查。 */
-  async listExpiredTaskIds(): Promise<string[]> {
-    const { rows } = await this.database.query<{ id: string }>(`
-      SELECT t.id FROM task_claims c
-      JOIN tasks t ON t.id = c.task_id
-      JOIN projects p ON p.id = t.project_id
-      WHERE c.expires_at <= clock_timestamp()
-        AND t.deleted_at IS NULL AND p.deleted_at IS NULL
-      ORDER BY t.id
-    `);
-
-    return rows.map((
-      row
-    ) => row.id);
-  }
-
-  /** 单条语句完成批量续租；锁定候选认领后再次检查有效期。 */
   async renewClaims(
     deviceId: string,
     sessionIds: readonly string[]
   ): Promise<number> {
-    const { rows } = await this.database.query<{ task_id: string }>(`
-      WITH candidates AS MATERIALIZED (
-        SELECT c.task_id, c.claim_id FROM task_claims c
-        JOIN tasks t ON t.id = c.task_id
-        JOIN projects p ON p.id = t.project_id
-        WHERE c.owner_device_id = $1 AND c.owner_session_id = ANY($2::text[])
-          AND t.kind = 'normal' AND t.status = 'in_progress'
-          AND t.deleted_at IS NULL AND p.deleted_at IS NULL
+    let renewed = 0;
+    for (const kind of ['task', 'goal'] as const) {
+      const { claims, items, key } = tables[kind];
+      const renewalFilter = kind === 'task' ? "AND t.kind = 'normal'" : '';
+      const { rows } = await this.database.query(`
+        WITH candidates AS MATERIALIZED (
+          SELECT c.${key}, c.claim_id FROM ${claims} c
+          JOIN ${items} t ON t.id = c.${key}
+          JOIN projects p ON p.id = t.project_id
+          WHERE c.owner_device_id = $1 AND c.owner_session_id = ANY($2::text[])
+            ${renewalFilter} AND t.status = 'in_progress'
+            AND t.deleted_at IS NULL AND p.deleted_at IS NULL
+            AND c.expires_at > clock_timestamp()
+          ORDER BY c.${key} FOR UPDATE OF c
+        )
+        UPDATE ${claims} c
+        SET expires_at = clock_timestamp() + $3::integer * interval '1 minute'
+        FROM candidates
+        WHERE c.${key} = candidates.${key} AND c.claim_id = candidates.claim_id
           AND c.expires_at > clock_timestamp()
-        ORDER BY c.task_id FOR UPDATE OF c
-      )
-      UPDATE task_claims c
-      SET expires_at = clock_timestamp() + $3::integer * interval '1 minute'
-      FROM candidates
-      WHERE c.task_id = candidates.task_id AND c.claim_id = candidates.claim_id
-        AND c.expires_at > clock_timestamp()
-      RETURNING c.task_id
-    `, [deviceId, sessionIds, claimLeaseMinutes]);
-
-    return rows.length;
+        RETURNING c.${key}
+      `, [deviceId, sessionIds, claimLeaseMinutes]);
+      renewed += rows.length;
+    }
+    return renewed;
   }
 
   async deleteClaim(
-    taskId: string
+    kind: ClaimKind,
+    id: string
   ): Promise<void> {
-    await this.database.query('DELETE FROM task_claims WHERE task_id = $1', [taskId]);
+    const { claims, key } = tables[kind];
+    await this.database.query(`DELETE FROM ${claims} WHERE ${key} = $1`, [id]);
+  }
+
+  /** 调用方须在同一事务内先取得项目排他锁。 */
+  async deleteGoalTaskClaims(
+    goalId: string,
+  ): Promise<void> {
+    await this.database.query(`
+      WITH locked AS MATERIALIZED (
+        SELECT c.task_id FROM task_claims c JOIN tasks t ON t.id = c.task_id
+        WHERE t.goal_id = $1 ORDER BY c.task_id FOR UPDATE OF c
+      )
+      DELETE FROM task_claims c USING locked WHERE c.task_id = locked.task_id
+    `, [goalId]);
   }
 
   /** 调用方须在同一事务内先取得项目排他锁。 */
   async deleteProjectClaims(
     projectId: string
   ): Promise<void> {
-    await this.database.query(`
-      DELETE FROM task_claims c USING tasks t
-      WHERE c.task_id = t.id AND t.project_id = $1
-    `, [projectId]);
+    for (const { claims, items, key } of Object.values(tables)) {
+      await this.database.query(`
+        WITH locked AS MATERIALIZED (
+          SELECT c.${key} FROM ${claims} c JOIN ${items} t ON t.id = c.${key}
+          WHERE t.project_id = $1 ORDER BY c.${key} FOR UPDATE OF c
+        )
+        DELETE FROM ${claims} c USING locked WHERE c.${key} = locked.${key}
+      `, [projectId]);
+    }
   }
 }

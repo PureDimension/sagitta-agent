@@ -53,6 +53,7 @@ export class ProjectOperations {
       await repository.claims.deleteProjectClaims(projectId);
       await repository.tasks.deleteProjectTemporaryTasks(projectId);
       await repository.tasks.archiveProjectTasks(projectId);
+      await repository.goals.archiveProjectGoals(projectId);
       await repository.projects.archiveProject(projectId);
     });
   }

@@ -26,14 +26,14 @@ test('续租接入：已有和新建会话、作用域隔离、卸载及原会�
   const notices = [];
   let failing = false;
   const reclamation = new TaskReclamation(async () => []);
-  const renewal = new TaskRenewal({ claims: { renewClaims: async (
+  const renewal = new TaskRenewal({ renewClaims: async (
     device,
     sessions,
   ) => {
     calls.push({ device, sessions });
     if (failing) throw new Error('续租测试断连');
     return 1;
-  } } });
+  } });
   const existing = { id: 'existing', session: { id: 'existing' }, send: (
     message,
     target,
@@ -49,7 +49,7 @@ test('续租接入：已有和新建会话、作用域隔离、卸载及原会�
     await ctx.agents.register(outside);
     await scope.ctx.inject(['agents', 'timer'], function* (
       context,
-    ) { yield* registerTaskMaintenance(context, renewal, reclamation); });
+    ) { yield* registerTaskMaintenance(context, renewal, reclamation, async () => {}); });
     await flush();
     assert.deepEqual(calls.map((
       call,
@@ -122,14 +122,14 @@ test('周期清理通知：首次静默、连续在线满 20 分钟、临时任�
     pending = [];
     return result;
   });
-  const renewal = new TaskRenewal({ claims: { renewClaims: async () => 0 } });
+  const renewal = new TaskRenewal({ renewClaims: async () => 0 });
   const tick = async () => { t.mock.timers.tick(5 * 60_000); await flush(); };
 
   try {
     let removeAgent = await ctx.agents.register(agent);
     await scope.ctx.inject(['agents', 'timer'], function* (
       context,
-    ) { yield* registerTaskMaintenance(context, renewal, reclamation); });
+    ) { yield* registerTaskMaintenance(context, renewal, reclamation, async () => {}); });
     await flush();
     assert.equal(scans, 1);
     assert.equal(notices.length, 0);

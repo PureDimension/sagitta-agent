@@ -1,7 +1,8 @@
-import type { ClaimedProject, ClaimedTask, CreateTaskInput, DescriptionWriteMode, Task, TaskClaim, TaskOperation, TaskOperationResult, TaskOwner } from '../../contracts.js';
+import type { ClaimedTask, CreateTaskInput, Task, TaskClaim, TaskOperation, TaskOperationResult, TaskOwner } from '../../contracts.js';
 import type { TaskRepositories } from '../../repository/index.js';
 import type { TransactionRunner } from '../../transaction.js';
 import { reclaimExpiredTask } from '../reclaim-expired-task.js';
+import { isClaimOwner, recoveredClaim, requiresActiveClaim, withClaimRecovery } from '../claim-recovery.js';
 import { requireFound } from '../require-found.js';
 import { requireTaskWriteAccess } from '../require-task-write-access.js';
 
@@ -19,39 +20,28 @@ export class TaskOperations {
   ) {}
 
   listTasks(
-    projectId: string
+    projectId: string,
+    goalId?: string,
   ): Promise<Task[]> {
-    return this.repository.tasks.listTasks(projectId);
-  }
-
-  async listClaimedProjects(
-    owner: TaskOwner,
-  ): Promise<ClaimedProject[]> {
-    const rows = await this.repository.claims.listClaimedTasks(owner);
-    const projects = new Map<string, ClaimedProject>();
-
-    for (const { project, task } of rows) {
-      let group = projects.get(project.id);
-      if (!group) {
-        group = { ...project, tasks: [] };
-        projects.set(project.id, group);
-      }
-      group.tasks.push(task);
-    }
-
-    return [...projects.values()];
+    return this.repository.tasks.listTasks(projectId, goalId);
   }
 
   execute(
     input: TaskOperation,
   ): Promise<TaskOperationResult> {
-    return this.transaction(async (
+    return withClaimRecovery<TaskOperationResult>(this.transaction, async (
       repository
     ) => {
       const task = requireFound(await repository.tasks.lockTask(input.taskId), '任务');
-      const claim = await repository.claims.lockClaim(task.id);
+      const claim = await repository.claims.lockClaim('task', task.id);
       const expired = await reclaimExpiredTask(repository, task, claim);
-      if (expired) return { ...expired, message: `${expired.message}，本次操作未执行` };
+      if (expired) {
+        if (task.kind === 'temp' && input.action === 'delete') return { kind: 'success', value: undefined };
+        if (isClaimOwner(input.owner, expired.owner) && (task.kind === 'temp' || requiresActiveClaim(input.action))) {
+          return { ...expired, message: `${expired.message}，本次操作未执行` };
+        }
+        return recoveredClaim;
+      }
 
       const value = await this.dispatch(input, { repository, task, claim });
       return { kind: 'success', value };
@@ -67,7 +57,8 @@ export class TaskOperations {
       repository
     ) => {
       const result = await repository.tasks.createTask(input.projectId, input.title, input.description ?? '', input.kind);
-      const task = requireFound(result, '项目');
+      let task = requireFound(result, '项目');
+      if (input.goalId !== undefined) task = await this.setGoal(repository, task, input.goalId);
 
       if (input.kind === 'temp' || input.claimImmediately) {
         return this.claimTask({ repository, task, claim: undefined }, input.owner);
@@ -86,12 +77,12 @@ export class TaskOperations {
 
     // 写入权限与需要有效认领的动作在分发处统一检查。
     requireTaskWriteAccess(context.claim, input.owner);
-    if (['release', 'complete', 'block'].includes(input.action) && !context.claim) {
+    if (requiresActiveClaim(input.action) && !context.claim) {
       throw new Error('任务尚未认领');
     }
 
     switch (input.action) {
-      case 'update': return this.updateTask(context, input.description, input.mode);
+      case 'update': return this.updateTask(context, input);
       case 'delete': return this.deleteTask(context);
       case 'release': return this.releaseTask(context);
       case 'complete': return this.completeTask(context);
@@ -100,18 +91,37 @@ export class TaskOperations {
     }
   }
 
-  private updateTask(
+  private async updateTask(
     { repository, task }: TaskContext,
-    description: string,
-    mode?: DescriptionWriteMode,
+    input: Extract<TaskOperation, { action: 'update' }>,
   ): Promise<Task> {
-    return repository.tasks.updateTaskDescription(task.id, description, mode);
+    if (input.goalId === undefined && input.description === undefined) {
+      throw new Error('请提供任务说明或目标');
+    }
+    if (input.goalId !== undefined) task = await this.setGoal(repository, task, input.goalId);
+    if (input.description === undefined) return task;
+    return repository.tasks.updateTaskDescription(task.id, input.description, input.mode);
+  }
+
+  private async setGoal(
+    repository: TaskRepositories,
+    task: Task,
+    goalId: string | null,
+  ): Promise<Task> {
+    if (goalId !== null) {
+      const goal = requireFound(await repository.goals.get(goalId), '目标');
+      if (goal.projectId !== task.projectId) throw new Error('任务与目标须属于同一个项目');
+      if (goal.id !== task.goalId && (goal.status === 'done' || goal.status === 'cancelled')) {
+        throw new Error('目标已结束，无法挂入任务');
+      }
+    }
+    return repository.tasks.setGoal(task.id, goalId);
   }
 
   private async deleteTask(
     { repository, task }: TaskContext,
   ): Promise<void> {
-    await repository.claims.deleteClaim(task.id);
+    await repository.claims.deleteClaim('task', task.id);
     if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
     else await repository.tasks.archiveTask(task.id);
   }
@@ -121,7 +131,7 @@ export class TaskOperations {
   ): Promise<void> {
     if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许释放`);
 
-    await repository.claims.deleteClaim(task.id);
+    await repository.claims.deleteClaim('task', task.id);
     if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
     else await repository.tasks.updateTaskStatus(task.id, 'open');
   }
@@ -131,7 +141,7 @@ export class TaskOperations {
   ): Promise<void> {
     if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许完成`);
 
-    await repository.claims.deleteClaim(task.id);
+    await repository.claims.deleteClaim('task', task.id);
     if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
     else await repository.tasks.updateTaskStatus(task.id, 'done');
   }
@@ -142,7 +152,7 @@ export class TaskOperations {
     if (task.kind === 'temp') throw new Error('临时任务不允许阻塞');
     if (task.status !== 'in_progress') throw new Error(`当前状态 ${task.status} 不允许阻塞`);
 
-    await repository.claims.deleteClaim(task.id);
+    await repository.claims.deleteClaim('task', task.id);
     await repository.tasks.updateTaskStatus(task.id, 'blocked');
   }
 
@@ -153,7 +163,7 @@ export class TaskOperations {
       || (task.kind === 'normal' && (task.status === 'open' || task.status === 'blocked'));
     if (!canCancel) throw new Error(`当前状态 ${task.status} 不允许取消`);
 
-    await repository.claims.deleteClaim(task.id);
+    await repository.claims.deleteClaim('task', task.id);
     if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
     else await repository.tasks.updateTaskStatus(task.id, 'cancelled');
   }
@@ -167,7 +177,7 @@ export class TaskOperations {
     const canClaim = task.status === 'open' || (task.kind === 'normal' && task.status === 'blocked');
     if (!canClaim) throw new Error(`当前状态 ${task.status} 不允许认领`);
 
-    const claimId = await repository.claims.createClaim(task.id, owner);
+    const claimId = await repository.claims.createClaim('task', task.id, owner);
     const claimed = await repository.tasks.updateTaskStatus(task.id, 'in_progress');
     return { ...claimed, claimId };
   }

@@ -16,6 +16,7 @@ export const taskSchema = {
     id: { type: 'string', required: true },
     projectId: { type: 'string', required: true },
     claimId: { type: 'string', description: '本次认领凭据；认领成功时返回，供跨模块资源访问使用。' },
+    goalId: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
     kind: { type: 'string', enum: ['normal', 'temp'], required: true },
     title: { type: 'string', required: true },
     description: { type: 'string', required: true },
@@ -23,9 +24,30 @@ export const taskSchema = {
   },
 } as const satisfies ValueSchemaSpec;
 
+export const goalSchema = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    id: taskSchema.properties.id,
+    projectId: taskSchema.properties.projectId,
+    title: taskSchema.properties.title,
+    description: taskSchema.properties.description,
+    status: taskSchema.properties.status,
+    claimId: { type: 'string', description: '本次目标认领的凭据。' },
+  },
+} as const satisfies ValueSchemaSpec;
+
 export const messageSchema = {
   type: 'object', additionalProperties: false,
   properties: { message: { type: 'string', required: true } },
+} as const satisfies ValueSchemaSpec;
+
+export const expiredGoalSchema = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    kind: { type: 'string', enum: ['expired'], required: true },
+    goal: { ...goalSchema, required: true },
+    message: messageSchema.properties.message,
+  },
 } as const satisfies ValueSchemaSpec;
 
 export const taskResultSchema = {

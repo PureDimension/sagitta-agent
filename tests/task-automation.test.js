@@ -19,16 +19,14 @@ test('注册按本会话续租、失败重试、间隔等待及注销', async (
   const results = [];
   let attempts = 0;
   const renewal = new TaskRenewal({
-    claims: {
-      renewClaims: async (
-        deviceId,
-        sessions
-      ) => {
-        assert.equal(deviceId, 'device');
-        assert.deepEqual(sessions, ['session']);
-        if (++attempts <= 3) throw failure;
-        return 2;
-      },
+    renewClaims: async (
+      deviceId,
+      sessions
+    ) => {
+      assert.equal(deviceId, 'device');
+      assert.deepEqual(sessions, ['session']);
+      if (++attempts <= 3) throw failure;
+      return 2;
     },
   });
   const unregister = renewal.register(manager, { deviceId: 'device', sessionId: 'session' }, {
@@ -70,23 +68,33 @@ test('回收注册立即执行、失败直接报告、下一周期继续，结�
     if (++attempts === 1) throw failure;
     return [];
   });
-  const unregister = reclamation.register(manager, {
+  let goalScans = 0;
+  const goalError = new Error('目标扫描失败');
+  const unregister = reclamation.register(manager, async () => {
+    if (++goalScans === 2) throw goalError;
+  }, {
     onSuccess: (
       expired
     ) => results.push(expired),
     onFailure: (
       error
     ) => results.push(error),
+    onGoalFailure: (
+      error,
+    ) => results.push(error),
   });
   await flush();
   assert.deepEqual(results, [failure]);
   assert.equal(attempts, 1);
+  assert.equal(goalScans, 1);
+  assert.equal(timers.size, 1);
   const [[next, delay]] = timers;
   assert.equal(delay, 300_000);
   timers.delete(next);
   next();
   await flush();
-  assert.deepEqual(results, [failure, []]);
+  assert.deepEqual(results, [failure, [], goalError]);
+  assert.equal(goalScans, 2);
   await unregister();
   assert.equal(timers.size, 0);
   await manager.dispose();

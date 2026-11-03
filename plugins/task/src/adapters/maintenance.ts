@@ -21,6 +21,7 @@ export function* registerTaskMaintenance(
   ctx: Context,
   renewal: TaskRenewal,
   reclamation: TaskReclamation,
+  reclaimGoals: () => Promise<void>,
 ) {
   const deviceId = getOrCreateAnonymousUserId();
   const registrations = new Map<Agent, { stop: UnregisterTask; startedAt: number }>();
@@ -33,7 +34,7 @@ export function* registerTaskMaintenance(
   yield () => periodicTasks.dispose();
 
   let initialScan = true;
-  yield reclamation.register(periodicTasks, {
+  yield reclamation.register(periodicTasks, reclaimGoals, {
     onSuccess: (
       expiredTasks,
     ) => {
@@ -65,6 +66,9 @@ ${JSON.stringify(tasks, null, 2)}
     onFailure: (
       error,
     ) => ctx.logger.error('任务周期回收失败', error),
+    onGoalFailure: (
+      error,
+    ) => ctx.logger.error('目标认领回收失败', error),
   });
 
   function start(
@@ -83,7 +87,7 @@ ${JSON.stringify(tasks, null, 2)}
         ctx.logger.error(`会话 ${agent.id} 的任务续租失败`, error);
         agent.send(createUserMessage({
           source: { kind: 'sagitta-task' },
-          content: [{ type: 'text', text: '正式任务自动续租重试后仍失败，认领可能到期。请检查任务状态；系统将在下一周期继续尝试。' }],
+          content: [{ type: 'text', text: '任务或目标自动续租重试后仍失败，认领可能到期。请检查当前认领；系统将在下一周期继续尝试。' }],
         }), 'next-step', false);
       },
     });

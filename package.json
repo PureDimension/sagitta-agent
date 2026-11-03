@@ -1,6 +1,6 @@
 {
   "name": "@sagitta/runtime",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "由 Sagitta Updater 加载的预设、提示词与业务插件",
   "type": "module",
@@ -34,7 +34,7 @@
     "build": "npm run build:shared && tsc -p plugins/memory/tsconfig.json && tsc -p plugins/task/tsconfig.json && npm run build:settings",
     "build:settings": "tsc -p plugins/settings/tsconfig.json && node scripts/build-settings.js",
     "check": "npm run build:shared && tsc -p plugins/memory/tsconfig.json --noEmit && tsc -p plugins/task/tsconfig.json --noEmit && tsc -p plugins/settings/tsconfig.json",
-    "test:database": "npm run build && node --test tests/database.test.js tests/task-repository.test.js tests/task-expiry.test.js",
+    "test:database": "npm run build && node --test tests/database.test.js tests/task-repository.test.js tests/task-expiry.test.js tests/task-goal-migration.test.js",
     "test:periodic-task": "npm run build && node --test tests/periodic-task.test.js tests/task-automation.test.js",
     "test:task-init": "npm run build && node --test tests/task-init.test.js tests/task-renewal-adapter.test.js",
     "test:task-tools": "npm run build && node --test tests/task-tools.test.js"

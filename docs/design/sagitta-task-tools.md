@@ -1,6 +1,6 @@
 # 任务主动工具接入
 
-2026-10-25。当前提供 15 个主动工具，使用本机 DSH 0.2.1-rc.2。
+2026-11-02。当前提供 25 个主动工具，使用本机 DSH 0.2.1-rc.2。
 原先统一的状态工具已按用户要求在接入层拆为五个动作工具；业务规则继续复用已有 Operations。
 
 ## 初始化与文件关系
@@ -8,9 +8,9 @@
 `index.ts` 等待 DSH 的 tools、systemPrompt、agents 和 timer 服务，按以下顺序初始化：
 
 1. 根据配置连接 PostgreSQL，保存最近连接检查结果。
-2. 检查 schema_migrations 是否符合现有版本 1。
-3. 创建 TaskRepositories、事务执行器、ProjectOperations 和 TaskOperations。
-4. 调用两个工具注册生成器，把每个工具的注销函数交给 Cordis。
+2. 本地模式顺序执行迁移；两种模式均检查 schema_migrations 包含版本 1、2。
+3. 创建 TaskRepositories、事务执行器、ProjectOperations、GoalOperations 和 TaskOperations。
+4. 调用三个工具注册生成器，把每个工具的注销函数交给 Cordis。
 5. 调用 registerTaskGuidance，将项目与任务总体说明注册为固定系统 section，并交付注销函数。
 
 初始化使用原生 ctx.effect。数据库关闭函数和工具注销函数都显式 yield；
@@ -23,6 +23,7 @@ connection-status.json 仍然只表示数据库连通性：schema 检查失败�
 | adapters/tools/parameters.ts | 共用项目 ID、任务号和说明的参数定义 |
 | adapters/tools/results.ts | 共用输出 schema、JSON 展示、到期结果投影 |
 | adapters/tools/project.ts | 五个项目工具的定义及注册 |
+| adapters/tools/goal.ts | 十个目标工具的定义及注册 |
 | adapters/tools/task.ts | 十个任务工具的定义及注册 |
 | adapters/guidance.ts | 项目/任务概念、状态含义与总体使用流程的固定系统说明 |
 
@@ -42,10 +43,16 @@ connection-status.json 仍然只表示数据库连通性：schema 检查失败�
 | project_create | name, description? | 创建并返回项目；说明默认空字符串 |
 | project_update | projectId, description, mode? | replace 替换、append 原子追加说明，返回项目 |
 | project_delete | projectId | 归档项目与正式任务、删除临时任务、撤销全部认领；返回完成说明 |
-| task_list | projectId | 返回该项目的任务列表，沿用存储状态 |
+| goal_list / goal_get | projectId / goalId | 列出项目的目标或查看指定目标 |
+| goal_create | projectId, title, description?, claimImmediately? | 创建目标，可在同一事务认领 |
+| goal_update | goalId, description, mode? | 替换或追加目标说明 |
+| goal_claim / goal_release / goal_block / goal_cancel | goalId | 目标沿用正式任务的状态与认领规则；下属任务独立推进 |
+| goal_complete | goalId | 所属会话核对结果后完成目标。若仍有未结束的下属任务，返回任务号、标题和状态；已完成、已取消及归档任务均不阻止完成 |
+| goal_delete | goalId | 归档目标及下属正式任务、物理删除下属临时任务，在同一事务撤销目标及下属任务的全部认领 |
+| task_list | projectId, goalId? | 列出项目任务，选填目标号可缩小范围 |
 | task_get | taskId | 经统一单任务入口读取，可能先回收过期任务 |
-| task_create | projectId, kind, title, description?, claimImmediately? | kind 为 normal/temp，返回创建的任务 |
-| task_update | taskId, description, mode? | replace 替换、append 原子追加说明；经统一权限与到期检查 |
+| task_create | projectId, kind, title, description?, claimImmediately?, goalId? | kind 为 normal/temp，返回创建的任务 |
+| task_update | taskId, description?, mode?, goalId? | 修改说明、目标归属或两者。省略 goalId 保留原归属，null 移出目标 |
 | task_delete | taskId | 正式任务归档，临时任务物理删除；经统一权限与到期检查 |
 | task_claim | taskId | 正式任务 open/blocked → in_progress，本会话取得认领 |
 | task_release | taskId | 正式任务 in_progress → open；临时任务清除 |
@@ -65,7 +72,7 @@ connection-status.json 仍然只表示数据库连通性：schema 检查失败�
 整体替换仍按调用方提交的完整说明覆盖，没有版本冲突检查。追加沿用原有归档、权限和到期处理。
 description 使用 PostgreSQL text，应用与表结构均未添加长度上限；本次增加更新方式无需迁移。
 
-项目返回 id/name/description；任务返回 id/projectId/kind/title/description/status。
+项目返回 id/name/description；任务返回 id/projectId/goalId/kind/title/description/status。
 task_create 立即认领成功以及 task_claim 成功时，任务对象额外提供 claimId（数据库 claim_id），用于其他模块的资源访问校验。
 续租保持 claimId；释放/到期后失效，重新认领生成新值。任务管理工具仍使用 taskId 参数。
 task_get/update/delete 与五个状态动作共用结果结构：
@@ -75,11 +82,12 @@ task_get/update/delete 与五个状态动作共用结果结构：
 ```
 
 读取、编辑或认领成功时 task 含任务内容，其余动作成功时为 null。
-到期返回 kind=expired、回收前的 task 和到期说明，说明包含“本次操作未执行”。
-回收已提交，调用方可据说明决定后续动作；expired 属于显式业务结果。
+主动访问发现到期时，先提交回收，再按当前状态执行请求。正式任务和目标恢复 open，查看、认领、编辑、取消、删除均沿用正常规则。原会话尝试完成、阻塞或释放时，本次发现的到期认领用 expired 和回收前的快照说明原因。其他会话只收到当前状态的正常结果或错误。
+临时任务到期即清除，本次删除直接成功；其他请求仅向原会话返回到期与原内容，其余调用方看到“任务不存在”。后台已经回收的认领按当前记录处理，不保存历史用于追溯提示。列表只读。
+创建或移动任务时，目标必须在同一项目且未结束。已有关联的任务可以编辑说明，也可以移出已结束的目标。
 owner、expires_at 保持内部使用；普通列表、详情及到期结果不提供认领凭据。
 
-每次 system-prompt/assemble 通过一次查询取得本设备、本会话的有效正式/临时认领，按项目分组。
+每次 system-prompt/assemble 读取本会话的有效任务认领，再查询本会话认领的目标及这些任务所属的目标。按项目分组，同一目标只展示一次，其他会话的目标认领凭据不可见。
 项目展示 id/name/description，任务展示完整任务字段和 claimId；结果放在 TOOL_WORKFLOW 后的“本会话当前工作”。
 各次组装独立读取，不共享查询缓存。查询过滤到期认领和归档记录，但不执行清理；普通列表行为保持原样。
 查询失败沿用 DSH 组装错误传播，当前没有错误降级或旧数据回退。

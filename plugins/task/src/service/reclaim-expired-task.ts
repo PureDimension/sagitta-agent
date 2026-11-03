@@ -9,7 +9,7 @@ export async function reclaimExpiredTask(
 ): Promise<ExpiredTask | undefined> {
   if (!claim?.expired) return undefined;
 
-  await repository.claims.deleteClaim(task.id);
+  await repository.claims.deleteClaim('task', task.id);
   if (task.kind === 'temp') await repository.tasks.deleteTaskRecord(task.id);
   else await repository.tasks.updateTaskStatus(task.id, 'open');
 

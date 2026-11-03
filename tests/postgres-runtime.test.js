@@ -145,7 +145,7 @@ test('任务插件本地初始化建表，重复挂载保留数据，切换自�
   const config = { mode: 'local', directory: databaseDirectory };
   const fiber = ctx.plugin(TaskPlugin, config);
   await fiber.await();
-  assert.equal(ctx.tools.schemas().length, 15);
+  assert.equal(ctx.tools.schemas().length, 25);
   const call = (
     name,
     args,
@@ -158,6 +158,6 @@ test('任务插件本地初始化建表，重复挂载保留数据，切换自�
   const connection = JSON.parse(await readFile(join(databaseDirectory, 'connection.json'), 'utf8'));
   fiber.update({ mode: 'custom', ...connection });
   await fiber.await();
-  assert.equal(ctx.tools.schemas().length, 15);
+  assert.equal(ctx.tools.schemas().length, 25);
   assert.deepEqual((await call('project_list', {})).value, [created.value]);
 });

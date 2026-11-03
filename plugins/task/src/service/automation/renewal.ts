@@ -1,6 +1,6 @@
 import type { PeriodicTasks, UnregisterTask } from '@sagitta/runtime/periodic-task';
 import type { TaskOwner } from '../../contracts.js';
-import type { TaskRepositories } from '../../repository/index.js';
+import type { ClaimRepository } from '../../repository/claim.js';
 
 const renewalIntervalMs = 5 * 60_000;
 const renewalRetry = { retries: 2, minTimeout: 5_000, factor: 1, maxRetryTime: 60_000 };
@@ -17,7 +17,7 @@ export interface RenewalCallbacks {
 /** 声明续租策略并提供单轮业务；身份与通知渠道由接入层传入。 */
 export class TaskRenewal {
   constructor(
-    private readonly repository: TaskRepositories
+    private readonly claims: Pick<ClaimRepository, 'renewClaims'>,
   ) {}
 
   register(
@@ -42,6 +42,6 @@ export class TaskRenewal {
   ): Promise<number> {
     if (sessionIds.length === 0) return 0;
 
-    return this.repository.claims.renewClaims(deviceId, sessionIds);
+    return this.claims.renewClaims(deviceId, sessionIds);
   }
 }

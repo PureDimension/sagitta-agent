@@ -12,12 +12,12 @@ export function* registerTaskTools(
   yield ctx.tools.register(defineTool({
     name: 'task_list',
     description: '查看指定项目的当前任务列表。',
-    parameters: { projectId: projectIdParameter },
+    parameters: { projectId: projectIdParameter, goalId: { type: 'string', description: '选填，只查看这个目标下的任务。' } },
     output: jsonOutput({ type: 'array', items: taskSchema }),
     async execute(
       args,
     ) {
-      return tasks.listTasks(args.projectId);
+      return tasks.listTasks(args.projectId, args.goalId);
     },
   }));
 
@@ -28,8 +28,10 @@ export function* registerTaskTools(
     output: jsonOutput(taskResultSchema),
     async execute(
       args,
+      exec,
     ) {
-      return formatTaskResult(await tasks.execute({ action: 'get', taskId: args.taskId }), '已取得任务详情');
+      const owner = exec.agent ? getTaskOwner(exec) : undefined;
+      return formatTaskResult(await tasks.execute({ action: 'get', taskId: args.taskId, owner }), '已取得任务详情');
     },
   }));
 
@@ -43,6 +45,7 @@ temp 用于勘查等临时工作，自动由本会话认领，有效期 20 分�
 `,
     parameters: {
       projectId: projectIdParameter,
+      goalId: { type: 'string', description: '选填，任务所属的目标号。' },
       kind: { type: 'string', enum: ['normal', 'temp'], required: true },
       title: { type: 'string', required: true, description: '简短且明确的任务标题。' },
       description: descriptionParameter,
@@ -57,7 +60,7 @@ temp：省略或 true 均立即认领；传入 false 会报错。
       args,
       exec,
     ) {
-      const content = { projectId: args.projectId, title: args.title, description: args.description };
+      const content = { goalId: args.goalId, projectId: args.projectId, title: args.title, description: args.description };
       if (args.kind === 'temp') {
         if (args.claimImmediately === false) throw new Error('临时任务必须立即认领，claimImmediately 请省略或设为 true');
         return tasks.createTask({ ...content, kind: 'temp', owner: getTaskOwner(exec) });
@@ -73,14 +76,15 @@ temp：省略或 true 均立即认领；传入 false 会报错。
   yield ctx.tools.register(defineTool({
     name: 'task_update',
     description: `
-更新任务说明。
+更新任务说明或调整所属目标。
 mode=replace 整体替换；
 mode=append 原子追加新增内容。
 已有认领时须由认领会话操作。
 `,
     parameters: {
       taskId: taskIdParameter,
-      description: { ...descriptionParameter, required: true },
+      goalId: { oneOf: [{ type: 'string' }, { type: 'null' }], description: '目标号，传 null 将任务移出目标。省略时保持原归属。' },
+      description: descriptionParameter,
       mode: descriptionModeParameter,
     },
     output: jsonOutput(taskResultSchema),
@@ -88,8 +92,8 @@ mode=append 原子追加新增内容。
       args,
       exec,
     ) {
-      const result = await tasks.execute({ action: 'update', taskId: args.taskId, description: args.description, mode: args.mode, owner: getTaskOwner(exec) });
-      return formatTaskResult(result, '任务说明已更新');
+      const result = await tasks.execute({ action: 'update', taskId: args.taskId, goalId: args.goalId, description: args.description, mode: args.mode, owner: getTaskOwner(exec) });
+      return formatTaskResult(result, '任务已更新');
     },
   }));
 

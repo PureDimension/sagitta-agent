@@ -8,6 +8,9 @@ import { checkTaskSchema, initializeTaskSchema } from './schema.js';
 import { TaskRepositories } from './repository/index.js';
 import { createTransactionRunner } from './transaction.js';
 import { ProjectOperations } from './service/operations/project.js';
+import { GoalOperations } from './service/operations/goal.js';
+import { WorkContext } from './service/operations/work-context.js';
+import { registerGoalTools } from './adapters/tools/goal.js';
 import { TaskOperations } from './service/operations/task.js';
 import { registerProjectTools } from './adapters/tools/project.js';
 import { registerTaskTools } from './adapters/tools/task.js';
@@ -54,12 +57,17 @@ export default class TaskPlugin {
         const transaction = createTransactionRunner(database);
         const projects = new ProjectOperations(repository, transaction);
         const tasks = new TaskOperations(repository, transaction);
+        const goals = new GoalOperations(repository, transaction);
 
         yield* registerProjectTools(ctx, projects);
+        yield* registerGoalTools(ctx, goals);
         yield* registerTaskTools(ctx, tasks);
         yield registerTaskGuidance(ctx);
-        yield* registerTaskWorkContext(ctx, tasks);
-        yield* registerTaskMaintenance(ctx, new TaskRenewal(repository), new TaskReclamation(transaction));
+        yield* registerTaskWorkContext(ctx, new WorkContext(createTransactionRunner(database, 'snapshot')));
+
+        const renewal = new TaskRenewal(repository.claims);
+        const reclamation = new TaskReclamation(transaction);
+        yield* registerTaskMaintenance(ctx, renewal, reclamation, () => goals.reclaimExpired());
       }, 'Sagitta task initialization');
 
       ctx.logger.info('Sagitta 任务数据库检查通过，主动工具已注册');

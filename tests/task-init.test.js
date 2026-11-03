@@ -30,10 +30,10 @@ beforeEach(async (
     await database.close();
   });
   await database.query(`CREATE SCHEMA ${schema}`);
-  for (const table of ['schema_migrations', 'projects', 'tasks', 'task_claims']) {
+  for (const table of ['schema_migrations', 'projects', 'tasks', 'task_claims', 'goals', 'goal_claims']) {
     await database.query(`CREATE TABLE ${schema}.${table} (LIKE public.${table} INCLUDING ALL)`);
   }
-  await database.query(`INSERT INTO ${schema}.schema_migrations(version) VALUES (1)`);
+  await database.query(`INSERT INTO ${schema}.schema_migrations(version) VALUES (1), (2)`);
   process.env.PGOPTIONS = `-c search_path=${schema}`;
 });
 
@@ -85,7 +85,7 @@ test('DSH 原生配置与生命周期：初始化、配置变更重连、失败�
 
   try {
     await fiber.await();
-    assert.equal(ctx.tools.schemas().length, 15);
+    assert.equal(ctx.tools.schemas().length, 25);
     assert.equal((await ctx.systemPrompt.assemble()).sections.filter((
       section,
     ) => section.name === 'sagitta:projects-and-tasks').length, 1);
@@ -109,7 +109,7 @@ test('DSH 原生配置与生命周期：初始化、配置变更重连、失败�
     record = JSON.parse(await readFile(stateFile, 'utf8'));
     assert.equal(record.status, 'connected');
     assert.equal(record.target.database, config.database);
-    assert.equal(ctx.tools.schemas().length, 15);
+    assert.equal(ctx.tools.schemas().length, 25);
     assert.equal((await ctx.systemPrompt.assemble()).sections.filter((
       section,
     ) => section.name === 'sagitta:projects-and-tasks').length, 1);
@@ -142,7 +142,7 @@ test('注册中途失败撤销本批工具，清除冲突后可重新初始化',
     removeConflict();
     fiber.update(config);
     await fiber.await();
-    assert.equal(ctx.tools.schemas().length, 15);
+    assert.equal(ctx.tools.schemas().length, 25);
   } finally {
     await fiber.dispose();
     await ctx.fiber.dispose();
@@ -196,10 +196,14 @@ test('schema 检查失败不注册工具，关闭连接池；修正版本后配�
     assert.equal((await database.query('SELECT count(*)::int AS count FROM pg_stat_activity WHERE application_name=$1', [schema])).rows[0].count, 0);
     assert.equal(JSON.parse(await readFile(join(directory, 'sagitta-task', 'connection-status.json'), 'utf8')).status, 'connected');
 
-    await database.query(`UPDATE ${schema}.schema_migrations SET version=1`);
+    await database.query(`DROP TABLE ${schema}.schema_migrations`);
+    for (const table of ['schema_migrations', 'projects', 'goals', 'goal_claims', 'tasks', 'task_claims']) {
+      await database.query(`CREATE TABLE ${schema}.${table} (LIKE public.${table} INCLUDING ALL)`);
+    }
+    await database.query(`INSERT INTO ${schema}.schema_migrations VALUES (1), (2)`);
     fiber.update(config);
     await fiber.await();
-    assert.equal(ctx.tools.schemas().length, 15);
+    assert.equal(ctx.tools.schemas().length, 25);
   } finally {
     await fiber?.dispose();
     await ctx.fiber.dispose();
